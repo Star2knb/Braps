@@ -2,6 +2,10 @@
 
 #include <iostream>
 #include <chrono>
+#include <algorithm>
+
+CaptureHook::CaptureHook(int fpsTarget)
+    : minFrameInterval_(1000.0 / std::max(1, fpsTarget)) {}
 
 bool CaptureHook::Initialize() {
     if (!channel_.OpenAsConsumer()) {
@@ -51,6 +55,22 @@ bool CaptureHook::CaptureFrame(const FrameCallback& onFrame, bool needsPixelData
         std::chrono::steady_clock::now() - drainStart).count();
     lastFramesDrained_ = framesDrained;
     if (!gotAny) return false;
+
+    // Throttle to fpsTarget: the channel is always drained above (so a
+    // fast-rendering game never backs up shared memory), but a "new"
+    // frame is only actually delivered to the caller often enough to
+    // match the target rate. Without this, frames arriving faster than
+    // requested still got through (Recorder's own pacing sleep is
+    // intentionally skipped for push-driven backends), which downstream
+    // FFmpeg's VFR encoder would then silently merge/drop as too-close-
+    // together — capture looked uncapped and part of it never reached
+    // the final video.
+    auto now = std::chrono::steady_clock::now();
+    if (haveDelivered_ && (now - lastDeliveredAt_) < minFrameInterval_) {
+        return false;
+    }
+    lastDeliveredAt_ = now;
+    haveDelivered_ = true;
 
     if (needsPixelData) {
         CapturedFrame frame{scratchBuffer_.data(), byteCount, static_cast<int>(width), static_cast<int>(height)};

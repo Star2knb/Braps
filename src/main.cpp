@@ -110,7 +110,7 @@ int main(int argc, char** argv) {
         // moment to create the D3D11 device and the shared memory section
         // before we try to open it as a consumer.
         std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-        initOk = recorder.InitializeWithCapture(std::make_unique<CaptureHook>());
+        initOk = recorder.InitializeWithCapture(std::make_unique<CaptureHook>(fpsTarget));
         if (!initOk) {
             std::cerr << "[Braps] Failed to attach to hook's shared memory channel. "
                          "Is the target process still running?\n";

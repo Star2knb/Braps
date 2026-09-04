@@ -277,7 +277,14 @@ void Recorder::CaptureLoop() {
         // DXGI only signals a new frame when the desktop actually changes.
         // While recording, a static screen must still produce output frames
         // at the target FPS, so repeat the last captured frame instead.
-        if (!gotFrame && recordingThisFrame) {
+        // Push-driven backends (the D3D11 hook) have a different meaning
+        // for "no frame this call" — it can mean a real frame arrived but
+        // was deliberately throttled to fpsTarget_ (see CaptureHook), not
+        // "nothing changed." Backfilling a duplicate there would push an
+        // extra frame at the exact moment the throttle meant to suppress
+        // one, defeating the throttle and adding irregular fake frames on
+        // top — so only poll-based backends get this behavior.
+        if (!gotFrame && recordingThisFrame && !capture_->IsPushDriven()) {
             std::lock_guard<std::mutex> lock(lastFrameMutex_);
             if (haveLastFrame_) {
                 uint64_t ts = NowMs();
