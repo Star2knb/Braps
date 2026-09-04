@@ -18,6 +18,14 @@ bool CaptureHook::Initialize() {
 }
 
 bool CaptureHook::CaptureFrame(const FrameCallback& onFrame, bool needsPixelData) {
+    // Tell the hook (running inside the game's process) whether we
+    // actually want frames right now, BEFORE it does any GPU readback
+    // work on its next Present call. Without this, the hook paid full
+    // CopyResource/Map cost on every single frame from the moment it was
+    // injected — a real, measured FPS cost to the game even while Braps
+    // was idle and not recording anything.
+    channel_.Header().consumerWantsFrames.store(needsPixelData, std::memory_order_release);
+
     // The hook is push-driven — frames arrive on the game's own Present()
     // schedule, not ours — so this wait IS the pacing mechanism (Recorder
     // skips its fixed sleep_for for push-driven backends; see

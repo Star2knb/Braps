@@ -18,7 +18,7 @@ namespace braps {
 // Bumped whenever the layout changes. Both sides check this on connect so
 // a stale/mismatched DLL and exe pairing fails loudly instead of reading
 // garbage frame data.
-constexpr uint32_t kSharedMemoryProtocolVersion = 1;
+constexpr uint32_t kSharedMemoryProtocolVersion = 2;
 
 constexpr wchar_t kSharedMemoryName[] = L"Local\\BrapsSharedFrameBuffer";
 constexpr wchar_t kNewFrameEventName[] = L"Local\\BrapsNewFrameEvent";
@@ -54,6 +54,14 @@ struct SharedHeader {
     std::atomic<uint32_t> tail{0}; // next slot Braps.exe (consumer) will read
     std::atomic<uint32_t> hookProcessId{0};
     std::atomic<bool> hookAttached{false};
+
+    // Set by Braps.exe (the consumer) to reflect Recorder::isRecording_,
+    // checked by the Present hook (the producer) BEFORE doing any GPU
+    // readback work (CopyResource/Map/row-copy). Without this, the hook
+    // was paying full readback cost on every single Present call from the
+    // moment it was injected — a real, measured FPS cost to the game even
+    // while Braps was just sitting idle, not recording anything at all.
+    std::atomic<bool> consumerWantsFrames{false};
 };
 
 struct SharedMemoryLayout {

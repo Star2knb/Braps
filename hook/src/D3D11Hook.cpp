@@ -229,7 +229,14 @@ void HandlePresent10(IDXGISwapChain* swapChain, ID3D10Device* device) {
 // possible — it executes on the game's own render thread, so any added
 // latency here is latency the game itself feels.
 HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* swapChain, UINT syncInterval, UINT flags) {
-    if (g_channel && g_channel->IsValid()) {
+    // Skip all GPU readback work (GetBuffer/CopyResource/Map/row-copy)
+    // entirely unless Braps.exe is actually recording right now. Checking
+    // this single atomic is essentially free; doing the full readback on
+    // every Present call regardless — which is what happened before this
+    // check existed — cost a measured ~10fps in the game just from being
+    // injected, even while idle and not recording anything.
+    if (g_channel && g_channel->IsValid() &&
+        g_channel->Header().consumerWantsFrames.load(std::memory_order_acquire)) {
         // Detect which API actually backs this swapchain by asking for
         // each device interface in turn — a swapchain only succeeds
         // QueryInterface-ing its own real device type, so exactly one of
