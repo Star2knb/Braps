@@ -3,6 +3,7 @@
 #include "ICapture.h"
 #include "RingBuffer.h"
 #include "Encoder.h"
+#include "AudioCapture.h"
 
 #include <memory>
 #include <atomic>
@@ -12,16 +13,21 @@
 #include <mutex>
 #include <chrono>
 
-// Orchestrates the three-thread pipeline described in the design doc:
-//   1. Capture thread: grabs frames at the target FPS via DXGI (or GDI
-//      fallback) and pushes them into the ring buffer. Never touches disk.
-//   2. Disk writer thread: drains the ring buffer to raw frame files on
-//      disk. Runs only while recording so idle preview costs nothing.
-//   3. Encoder (spawned on stop): converts the raw frame dump into a
-//      compressed MP4 via FFmpeg, off the hot path entirely.
+// Orchestrates the capture/encode pipeline:
+//   1. Capture thread: grabs frames at the target FPS via DXGI/GDI/hook
+//      and pushes them into the ring buffer. Never touches disk or ffmpeg.
+//   2. Encoder feed thread: drains the ring buffer and streams each frame
+//      directly into an already-running ffmpeg process's stdin — frames
+//      are compressed continuously as they arrive, never written to disk
+//      raw and never batch-encoded after the fact (see Encoder.h for why:
+//      Process Monitor showed Fraps itself writes one continuously-
+//      growing, already-compressed file from frame 1, never a folder of
+//      raw per-frame files stitched together afterward).
 class Recorder {
 public:
-    explicit Recorder(int fpsTarget = 30);
+    // micEnabled controls whether a microphone AudioCapture is started
+    // alongside the always-on system-audio loopback capture.
+    explicit Recorder(int fpsTarget = 30, bool micEnabled = false);
     ~Recorder();
 
     // Auto-selects DXGI Desktop Duplication, falling back to GDI BitBlt.
@@ -43,7 +49,7 @@ public:
 
 private:
     void CaptureLoop();
-    void DiskWriterLoop();
+    void EncoderFeedLoop();
     void StartRecording();
     void StopRecordingAndEncode();
 
@@ -51,7 +57,7 @@ private:
     FrameRingBuffer ringBuffer_;
 
     std::thread captureThread_;
-    std::thread diskWriterThread_;
+    std::thread encoderFeedThread_;
 
     std::atomic<bool> running_{true};
     std::atomic<bool> isRecording_{false};
@@ -75,31 +81,52 @@ private:
     bool haveLastFrame_ = false;
 
     // Wall-clock bounds of the current recording session. Used to log a
-    // human-readable summary on stop; actual encode timing now comes from
-    // per-frame timestamps (writtenFrameTimestampsMs_), not this average.
+    // human-readable summary on stop.
     std::chrono::steady_clock::time_point recordingStart_;
     std::atomic<uint64_t> recordedFrameCount_{0};
     std::atomic<uint64_t> droppedFrameCount_{0};
 
-    // Real capture timestamp of each frame as it's written to disk, indexed
-    // to match frame_<i>.raw. Populated by DiskWriterLoop (not CaptureLoop),
-    // since that's the thread that assigns each frame its file index — the
-    // two must stay in lockstep for the VFR concat file to point at the
-    // right duration for the right file. Encoder reads this to build a
-    // variable-frame-rate ffconcat file, so each frame holds the screen for
-    // exactly as long as it really did, instead of every frame getting an
-    // equal slice of one flat averaged fps.
-    std::mutex writtenTimestampsMutex_;
-    std::vector<uint64_t> writtenFrameTimestampsMs_;
+    // Sync-anchor mechanism for audio/video alignment (see StartRecording/
+    // StopRecordingAndEncode): both video's first real frame and each
+    // AudioCapture's first real WASAPI buffer are timestamped against the
+    // same steady_clock, so the two pipelines' independent startup
+    // latency (DXGI+ffmpeg spawn vs. WASAPI init) becomes a computable
+    // offset rather than an unknown drift. syncAnchor_ itself is only
+    // used for diagnostics (logging how long each pipeline took to
+    // produce its first sample) — the actual offset math only needs
+    // videoFirstFrameTime_ and each AudioCapture::FirstBufferTime().
+    std::chrono::steady_clock::time_point syncAnchor_;
+    std::atomic<bool> haveFirstFrameTime_{false};
+    std::chrono::steady_clock::time_point videoFirstFrameTime_;
 
-    // Set once by StartRecording (never by DiskWriterLoop itself) so a
-    // transient empty-buffer tick while the writer is still draining the
-    // tail end of a just-stopped recording can't reset it mid-drain and
-    // overwrite frame_0.bmp onward with frames that belong later in the
-    // sequence.
-    std::atomic<bool> resetFileCounter_{false};
+    // Lives for the duration of one recording session: StartRecording()
+    // spawns ffmpeg via StartStreamingEncode(), EncoderFeedLoop() streams
+    // frames into it via WriteFrame(), StopRecordingAndEncode() finishes
+    // it via FinishStreamingEncode() on a background thread. No per-frame
+    // timestamp manifest is needed anymore — ffmpeg's own
+    // -use_wallclock_as_timestamps derives VFR timing directly from when
+    // frames actually arrive at the pipe.
+    //
+    // encoderMutex_ guards every access to encoder_ itself (not calls into
+    // an already-obtained Encoder*, which only ever happens from the one
+    // feed thread) — StartRecording (main/hotkey thread), EncoderFeedLoop
+    // (feed thread), and StopRecordingAndEncode's background finish thread
+    // can all read or replace this pointer, and a rapid F9/F9/F9 could
+    // otherwise race a reset() against a fresh make_unique().
+    std::mutex encoderMutex_;
+    std::unique_ptr<Encoder> encoder_;
 
-    std::wstring tempDir_;
+    // System audio (WASAPI loopback) is always captured; mic only if
+    // micEnabled_ was set at construction. Each degrades independently to
+    // "proceed without this track" on failure (no default device, etc.),
+    // matching this codebase's existing DXGI-falls-back-to-GDI philosophy
+    // — never abort a recording because an enhancement isn't available.
+    bool micEnabled_;
+    std::unique_ptr<AudioCapture> sysAudioCapture_;
+    std::unique_ptr<AudioCapture> micCapture_;
+    std::wstring sysAudioWavPath_;
+    std::wstring micWavPath_;
+
     std::wstring outputDir_;
     std::wstring ffmpegPath_;
 

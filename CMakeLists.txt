@@ -30,6 +30,7 @@ if(NOT BRAPS_BUILDING_32BIT_HELPERS)
         src/CaptureDXGI.cpp
         src/CaptureGDI.cpp
         src/Encoder.cpp
+        src/AudioCapture.cpp
         src/Hotkeys.cpp
         src/Overlay.cpp
         hook/src/Injector.cpp
@@ -47,6 +48,7 @@ if(NOT BRAPS_BUILDING_32BIT_HELPERS)
         winmm
         windowscodecs
         ole32
+        Mmdevapi
     )
 
     target_compile_definitions(Braps PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)

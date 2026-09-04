@@ -93,8 +93,9 @@ int main(int argc, char** argv) {
 
     int fpsTarget = ParseFpsArg(argc, argv);
     DWORD injectPid = ParseInjectArg(argc, argv);
+    bool micEnabled = HasFlag(argc, argv, "--mic");
 
-    Recorder recorder(fpsTarget);
+    Recorder recorder(fpsTarget, micEnabled);
     bool initOk;
 
     if (injectPid != 0) {
@@ -136,7 +137,8 @@ int main(int argc, char** argv) {
     overlay.Start();
 
     std::cout << "================================\n";
-    std::cout << " BRAPS RECORDER RUNNING (target " << fpsTarget << " fps)\n";
+    std::cout << " BRAPS RECORDER RUNNING (target " << fpsTarget << " fps, mic: "
+               << (micEnabled ? "on" : "off") << ")\n";
     std::cout << " Press [F9]  to Start/Stop Recording\n";
     std::cout << " Press [F10] to Take a Screenshot\n";
     std::cout << " Press [Ctrl+C] to Exit\n";

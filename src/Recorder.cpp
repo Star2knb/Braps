@@ -30,60 +30,6 @@ std::wstring Timestamp() {
     return std::to_wstring(static_cast<uint64_t>(std::time(nullptr)));
 }
 
-#pragma pack(push, 1)
-struct BmpFileHeader {
-    uint16_t type = 0x4D42; // 'BM'
-    uint32_t fileSize;
-    uint16_t reserved1 = 0;
-    uint16_t reserved2 = 0;
-    uint32_t pixelDataOffset;
-};
-struct BmpInfoHeader {
-    uint32_t headerSize = 40;
-    int32_t width;
-    int32_t height;
-    uint16_t planes = 1;
-    uint16_t bitsPerPixel = 32;
-    uint32_t compression = 0;
-    uint32_t imageSize;
-    int32_t xPixelsPerMeter = 2835;
-    int32_t yPixelsPerMeter = 2835;
-    uint32_t colorsUsed = 0;
-    uint32_t colorsImportant = 0;
-};
-#pragma pack(pop)
-
-// Writes a frame as BMP: same top-down BGRA bytes our capture backends
-// already produce, just prepended with a fixed 54-byte header and stored
-// bottom-up per the BMP spec. Chosen over headerless .raw because ffmpeg's
-// concat demuxer (used for variable-frame-rate encoding) requires each
-// listed file to be self-describing — it probes every entry individually
-// rather than accepting a declared raw pixel format up front. BMP is
-// uncompressed, so this keeps the "zero compression during capture" design
-// intact while still satisfying that requirement.
-void WriteFrameAsBmp(const std::wstring& path, const uint8_t* bgraData, int width, int height) {
-    const size_t rowBytes = static_cast<size_t>(width) * 4;
-    const size_t imageSize = rowBytes * height;
-
-    BmpFileHeader fileHeader;
-    fileHeader.pixelDataOffset = sizeof(BmpFileHeader) + sizeof(BmpInfoHeader);
-    fileHeader.fileSize = static_cast<uint32_t>(fileHeader.pixelDataOffset + imageSize);
-
-    BmpInfoHeader infoHeader;
-    infoHeader.width = width;
-    infoHeader.height = height; // positive = bottom-up row order
-    infoHeader.imageSize = static_cast<uint32_t>(imageSize);
-
-    std::ofstream out(path, std::ios::binary);
-    out.write(reinterpret_cast<const char*>(&fileHeader), sizeof(fileHeader));
-    out.write(reinterpret_cast<const char*>(&infoHeader), sizeof(infoHeader));
-
-    // Our data is top-down; BMP rows are stored bottom-up.
-    for (int y = height - 1; y >= 0; --y) {
-        out.write(reinterpret_cast<const char*>(bgraData + static_cast<size_t>(y) * rowBytes), rowBytes);
-    }
-}
-
 // Encodes a top-down BGRA frame to PNG via WIC (Windows Imaging
 // Component) — a built-in Windows API, so this needs no external image
 // library. Used for screenshots specifically, so they're viewable in any
@@ -148,20 +94,19 @@ bool WriteFrameAsPng(const std::wstring& path, const uint8_t* bgraData, int widt
 }
 }
 
-Recorder::Recorder(int fpsTarget)
+Recorder::Recorder(int fpsTarget, bool micEnabled)
     : ringBuffer_(static_cast<size_t>(fpsTarget) * kRingBufferSecondsOfHeadroom),
-      fpsTarget_(fpsTarget) {
-    tempDir_ = L"C:\\TempRecordings";
+      fpsTarget_(fpsTarget),
+      micEnabled_(micEnabled) {
     outputDir_ = L"C:\\SavedRecordings";
     ffmpegPath_ = L"ffmpeg.exe"; // bundled next to the executable by CMake
-    fs::create_directories(tempDir_);
     fs::create_directories(outputDir_);
 }
 
 Recorder::~Recorder() {
     RequestExit();
     if (captureThread_.joinable()) captureThread_.join();
-    if (diskWriterThread_.joinable()) diskWriterThread_.join();
+    if (encoderFeedThread_.joinable()) encoderFeedThread_.join();
     if (capture_) capture_->Shutdown();
 }
 
@@ -188,7 +133,7 @@ bool Recorder::InitializeWithCapture(std::unique_ptr<ICapture> capture) {
 
 void Recorder::Run() {
     captureThread_ = std::thread(&Recorder::CaptureLoop, this);
-    diskWriterThread_ = std::thread(&Recorder::DiskWriterLoop, this);
+    encoderFeedThread_ = std::thread(&Recorder::EncoderFeedLoop, this);
 
     // On a low-core-count machine, the capture thread competes directly
     // with whatever's being recorded (a game, especially) for CPU time.
@@ -253,6 +198,18 @@ void Recorder::CaptureLoop() {
             uint64_t ts = NowMs();
             if (ringBuffer_.TryPush(frame.data, frame.byteCount, frame.width, frame.height, ts)) {
                 recordedFrameCount_.fetch_add(1, std::memory_order_relaxed);
+                // First genuinely recorded frame of this session — anchor
+                // for the audio/video sync-offset computation in
+                // StopRecordingAndEncode. Deliberately NOT set from the
+                // DXGI-timeout backfill push below (repeating the last
+                // cached frame): only a real, freshly captured frame
+                // should establish video's t=0, and the backfill path
+                // can't fire before a real push has happened anyway since
+                // lastFrameData_ doesn't exist yet at session start.
+                bool expectedFirstFrame = false;
+                if (haveFirstFrameTime_.compare_exchange_strong(expectedFirstFrame, true)) {
+                    videoFirstFrameTime_ = std::chrono::steady_clock::now();
+                }
                 std::lock_guard<std::mutex> logLock(frameLogMutex_);
                 frameTimestampsMs_.push_back(ts);
             } else {
@@ -357,45 +314,54 @@ void Recorder::CaptureLoop() {
     }
 }
 
-void Recorder::DiskWriterLoop() {
-    int fileCounter = 0;
-
+void Recorder::EncoderFeedLoop() {
     int diagWriteIters = 0;
     double diagWriteMsSum = 0, diagWriteMsMax = 0;
     auto diagWriteWindowStart = std::chrono::steady_clock::now();
 
     while (running_) {
-        if (resetFileCounter_.exchange(false)) {
-            fileCounter = 0;
-        }
-
         FrameRingBuffer::Frame frame;
         // Keep draining regardless of isRecording_: StopRecordingAndEncode
         // flips that flag the instant it's called, on a different thread,
         // while frames captured just before the stop may still be sitting
-        // in the ring buffer. Gating the pop on isRecording_ here left them
-        // stranded forever — the encoder's "wait until the buffer drains"
-        // check would then spin waiting for an empty buffer nothing was
-        // emptying, and EncodeSequenceToMp4 never got called at all.
+        // in the ring buffer. Gating the pop on isRecording_ here would
+        // strand them — FinishStreamingEncode() (called after this loop
+        // is told to stop feeding, see StopRecordingAndEncode) needs every
+        // already-queued frame to have actually reached ffmpeg's stdin
+        // first, or the video would be missing its last moments.
+        //
+        // encoderReady_ (rather than isRecording_) gates whether we
+        // actually try to write to encoder_: isRecording_ flips to false
+        // the instant StopRecordingAndEncode is called, but the encoder_
+        // object itself (and its pipe) stays alive and valid until
+        // FinishStreamingEncode() closes it — so frames queued right at
+        // the stop boundary still get written, they just don't get
+        // pushed to a null/finished encoder.
         if (ringBuffer_.TryPop(frame)) {
-            std::wstring filename = tempDir_ + L"\\frame_" + std::to_wstring(fileCounter++) + L".bmp";
-
             auto writeStart = std::chrono::steady_clock::now();
-            WriteFrameAsBmp(filename, frame.data.data(), frame.width, frame.height);
+            bool ok;
+            {
+                std::lock_guard<std::mutex> lock(encoderMutex_);
+                if (!encoder_) {
+                    continue; // dropped: no active encoder session to write into
+                }
+                ok = encoder_->WriteFrame(frame.data.data(), frame.data.size());
+            }
             double writeMs = std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - writeStart).count();
 
-            std::lock_guard<std::mutex> lock(writtenTimestampsMutex_);
-            writtenFrameTimestampsMs_.push_back(frame.timestampMs);
+            if (!ok) {
+                std::cerr << "[Recorder] WriteFrame to encoder failed — ffmpeg may have exited early.\n";
+            }
 
             if (writeMs > 20.0) {
-                std::cout << "[DiagWrite] SLOW WRITE: " << writeMs << "ms at ts=" << frame.timestampMs << "\n";
+                std::cout << "[EncoderFeed] SLOW WRITE: " << writeMs << "ms at ts=" << frame.timestampMs << "\n";
             }
             diagWriteMsSum += writeMs;
             diagWriteMsMax = std::max(diagWriteMsMax, writeMs);
             ++diagWriteIters;
             if (std::chrono::steady_clock::now() - diagWriteWindowStart >= std::chrono::seconds(1) && diagWriteIters > 0) {
-                std::cout << "[DiagWrite] avg=" << (diagWriteMsSum / diagWriteIters)
+                std::cout << "[EncoderFeed] avg=" << (diagWriteMsSum / diagWriteIters)
                            << "ms max=" << diagWriteMsMax << "ms over " << diagWriteIters << " writes\n";
                 diagWriteIters = 0;
                 diagWriteMsSum = 0;
@@ -409,19 +375,56 @@ void Recorder::DiskWriterLoop() {
 }
 
 void Recorder::StartRecording() {
+    syncAnchor_ = std::chrono::steady_clock::now();
     ringBuffer_.Clear();
     recordedFrameCount_ = 0;
     droppedFrameCount_ = 0;
+    haveFirstFrameTime_ = false;
     recordingStart_ = std::chrono::steady_clock::now();
-    resetFileCounter_ = true;
     {
         std::lock_guard<std::mutex> lock(frameLogMutex_);
         frameTimestampsMs_.clear();
     }
+
+    std::wstring stamp = Timestamp();
+
     {
-        std::lock_guard<std::mutex> lock(writtenTimestampsMutex_);
-        writtenFrameTimestampsMs_.clear();
+        std::lock_guard<std::mutex> lock(encoderMutex_);
+        encoder_ = std::make_unique<Encoder>(ffmpegPath_, outputDir_);
+        std::wstring outName = L"gameplay_" + stamp + L".mp4";
+        if (!encoder_->StartStreamingEncode(frameWidth_, frameHeight_, outName)) {
+            std::cerr << "[Recorder] Failed to start streaming encode — recording will not produce a video.\n";
+            encoder_.reset();
+            return;
+        }
     }
+
+    // Audio: system loopback is always attempted; mic only if requested.
+    // Each degrades independently to "proceed without this track" on
+    // failure (no default device, WASAPI unavailable, etc.) — matching
+    // the existing DXGI-falls-back-to-GDI philosophy of never aborting a
+    // recording because an enhancement isn't available. No live ffmpeg
+    // involvement here at all: each AudioCapture writes straight to its
+    // own WAV file, muxed in only after both it and the video encode have
+    // already finished (see StopRecordingAndEncode / Encoder::RemuxWithAudio).
+    sysAudioWavPath_ = outputDir_ + L"\\sysaudio_" + stamp + L".wav";
+    sysAudioCapture_ = std::make_unique<AudioCapture>(AudioSource::SystemLoopback);
+    if (!sysAudioCapture_->Start(sysAudioWavPath_)) {
+        std::cerr << "[Recorder] System audio capture unavailable — recording will have no system-audio track.\n";
+        sysAudioCapture_.reset();
+    }
+
+    micCapture_.reset();
+    if (micEnabled_) {
+        micWavPath_ = outputDir_ + L"\\mic_" + stamp + L".wav";
+        auto mic = std::make_unique<AudioCapture>(AudioSource::Microphone);
+        if (mic->Start(micWavPath_)) {
+            micCapture_ = std::move(mic);
+        } else {
+            std::cerr << "[Recorder] --mic was passed but no microphone capture is available — continuing without it.\n";
+        }
+    }
+
     isRecording_ = true;
     std::cout << "\n[REC] Recording started...\n";
 }
@@ -449,36 +452,122 @@ void Recorder::StopRecordingAndEncode() {
     uint64_t droppedCount = droppedFrameCount_.load(std::memory_order_relaxed);
     std::cout << "\n[REC] Recording stopped (" << frameCount << " frames over "
                << elapsed << "s, ~" << measuredFps << " fps, " << droppedCount
-               << " dropped from a full ring buffer). Encoding in background...\n";
+               << " dropped from a full ring buffer). Finishing encode...\n";
 
     std::wstring timingLogPath = outputDir_ + L"\\frame_timing_" + Timestamp() + L".csv";
     WriteFrameTimingLog(timingLogPath);
     std::wcout << L"[Recorder] Frame timing log: " << timingLogPath << L"\n";
 
-    // Deferred post-processing: encode on its own thread so the app (and
-    // any subsequent capture) never blocks on FFmpeg.
-    std::thread([this]() {
-        // The disk writer thread may still be flushing queued frames from
-        // the ring buffer to disk; wait for it to fully drain before
-        // invoking ffmpeg, otherwise we'd encode a partial frame set (and
-        // grab an incomplete timestamp list below).
+    // Stop audio capture threads now (not on the background finish
+    // thread below) so both WAV files' content ends at essentially the
+    // same moment video capture stops — Stop() joins the thread and
+    // patches the WAV header in place, so by the time this returns each
+    // file (if it produced any data) is already a complete, valid,
+    // playable WAV ready for the remux step.
+    bool haveSysAudio = false;
+    std::chrono::steady_clock::time_point sysAudioFirstBufferTime;
+    if (sysAudioCapture_) {
+        haveSysAudio = sysAudioCapture_->HasFirstBuffer();
+        if (haveSysAudio) sysAudioFirstBufferTime = sysAudioCapture_->FirstBufferTime();
+        sysAudioCapture_->Stop();
+    }
+    bool haveMic = false;
+    std::chrono::steady_clock::time_point micFirstBufferTime;
+    if (micCapture_) {
+        haveMic = micCapture_->HasFirstBuffer();
+        if (haveMic) micFirstBufferTime = micCapture_->FirstBufferTime();
+        micCapture_->Stop();
+    }
+
+    bool haveVideoFirstFrame = haveFirstFrameTime_.load(std::memory_order_relaxed);
+    std::chrono::steady_clock::time_point videoFirstFrameTime = videoFirstFrameTime_;
+    std::wstring sysWavPath = sysAudioWavPath_;
+    std::wstring micWavPath = micWavPath_;
+    std::wstring ffmpegPath = ffmpegPath_;
+    std::wstring outputDir = outputDir_;
+
+    // Finish on a background thread so the hotkey thread (which called
+    // this) never blocks on ffmpeg finalizing the MP4's container. encoder_
+    // itself stays alive (it's a Recorder member, not a local) until this
+    // thread is done with it — EncoderFeedLoop still checks it against
+    // nullptr on every pop, and won't race with FinishStreamingEncode()
+    // because we drain the ring buffer to empty first, below.
+    std::thread([this, haveSysAudio, sysAudioFirstBufferTime, sysWavPath,
+                 haveMic, micFirstBufferTime, micWavPath,
+                 haveVideoFirstFrame, videoFirstFrameTime, ffmpegPath, outputDir]() {
+        // The encoder feed thread may still be writing queued frames into
+        // ffmpeg's stdin; wait for the ring buffer to fully drain before
+        // closing the pipe, otherwise we'd cut off the last moments of
+        // the recording.
         while (!ringBuffer_.Empty()) {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
 
-        std::vector<uint64_t> timestamps;
+        std::wstring finishedVideoPath;
+        bool videoOk = false;
         {
-            std::lock_guard<std::mutex> lock(writtenTimestampsMutex_);
-            timestamps = writtenFrameTimestampsMs_;
+            std::lock_guard<std::mutex> lock(encoderMutex_);
+            if (encoder_) {
+                finishedVideoPath = encoder_->OutputPath();
+                videoOk = encoder_->FinishStreamingEncode();
+                encoder_.reset();
+            }
         }
 
-        Encoder encoder(ffmpegPath_, tempDir_, outputDir_);
-        std::wstring outName = L"gameplay_" + Timestamp() + L".mp4";
-        if (encoder.EncodeSequenceToMp4(timestamps, outName)) {
-            encoder.CleanupTempFrames();
+        if (!videoOk || finishedVideoPath.empty()) {
+            std::cerr << "[Recorder] Video encode failed; skipping audio remux.\n";
+            return;
+        }
+
+        // No audio track produced any data at all (e.g. WASAPI
+        // unavailable and no mic requested/found) — today's plain video
+        // file is already the final output, unchanged. Skip the remux
+        // pass entirely rather than running ffmpeg for no reason.
+        if (!haveSysAudio && !haveMic) {
+            return;
+        }
+
+        // Sync-anchor offset computation: normalize so the earliest of
+        // {video, all audio streams} sits at t=0 and everything else is
+        // delayed by its measured real gap relative to that earliest
+        // starter. Never apply a negative -itsoffset (ffmpeg doesn't
+        // reliably support shifting a stream earlier that way) — instead
+        // shift whichever stream(s) started first later, relative to
+        // whichever started last overall.
+        struct Track { std::wstring wavPath; double rawOffset; };
+        std::vector<Track> tracks;
+        if (haveSysAudio && haveVideoFirstFrame) {
+            tracks.push_back({sysWavPath, std::chrono::duration<double>(
+                sysAudioFirstBufferTime - videoFirstFrameTime).count()});
+        }
+        if (haveMic && haveVideoFirstFrame) {
+            tracks.push_back({micWavPath, std::chrono::duration<double>(
+                micFirstBufferTime - videoFirstFrameTime).count()});
+        }
+
+        double minRawOffset = 0.0;
+        for (const auto& t : tracks) minRawOffset = std::min(minRawOffset, t.rawOffset);
+        double videoItsOffset = -minRawOffset; // always >= 0
+
+        std::vector<AudioTrackInput> audioTracks;
+        for (const auto& t : tracks) {
+            audioTracks.push_back({t.wavPath, t.rawOffset - minRawOffset}); // always >= 0
+        }
+
+        std::wstring finalOutputPath = finishedVideoPath;
+        std::wstring remuxOutputPath =
+            finishedVideoPath.substr(0, finishedVideoPath.size() - 4) + L"_remux.mp4"; // strip ".mp4"
+
+        bool remuxOk = RemuxWithAudio(ffmpegPath, outputDir, finishedVideoPath, videoItsOffset,
+                                       audioTracks, remuxOutputPath);
+        if (remuxOk) {
+            DeleteFileW(finishedVideoPath.c_str());
+            if (haveSysAudio) DeleteFileW(sysWavPath.c_str());
+            if (haveMic) DeleteFileW(micWavPath.c_str());
+            MoveFileExW(remuxOutputPath.c_str(), finalOutputPath.c_str(), MOVEFILE_REPLACE_EXISTING);
         } else {
-            std::wcerr << L"[Recorder] Keeping raw frames in " << tempDir_
-                       << L" for inspection since encoding failed.\n";
+            std::wcerr << L"[Recorder] Audio remux failed; keeping intermediate files ("
+                       << finishedVideoPath << L", audio WAV(s)) for recovery.\n";
         }
     }).detach();
 }
