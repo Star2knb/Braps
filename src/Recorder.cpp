@@ -4,6 +4,8 @@
 #include "CaptureHook.h"
 
 #include <windows.h>
+#include <wincodec.h>
+#include <wrl/client.h>
 #include <filesystem>
 #include <fstream>
 #include <chrono>
@@ -12,6 +14,7 @@
 #include <algorithm>
 
 namespace fs = std::filesystem;
+using Microsoft::WRL::ComPtr;
 
 namespace {
 // Ring buffer sized to hold ~5 seconds of frames at the target rate, so a
@@ -79,6 +82,69 @@ void WriteFrameAsBmp(const std::wstring& path, const uint8_t* bgraData, int widt
     for (int y = height - 1; y >= 0; --y) {
         out.write(reinterpret_cast<const char*>(bgraData + static_cast<size_t>(y) * rowBytes), rowBytes);
     }
+}
+
+// Encodes a top-down BGRA frame to PNG via WIC (Windows Imaging
+// Component) — a built-in Windows API, so this needs no external image
+// library. Used for screenshots specifically, so they're viewable in any
+// normal image viewer instead of the raw BGRA dump used previously.
+bool WriteFrameAsPng(const std::wstring& path, const uint8_t* bgraData, int width, int height) {
+    // WIC needs COM initialized on the calling thread. Screenshots are
+    // infrequent (a manual F10 press), so scoping init/uninit to just
+    // this call is simpler than threading COM setup through Hotkeys'
+    // message-loop thread for a single consumer. CoInitializeEx is
+    // reference-counted per thread, so this is safe even if the caller
+    // (or something else on the same thread) already initialized COM.
+    HRESULT coHr = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    bool weInitializedCom = SUCCEEDED(coHr);
+    struct ComGuard {
+        bool active;
+        ~ComGuard() { if (active) CoUninitialize(); }
+    } comGuard{weInitializedCom};
+
+    ComPtr<IWICImagingFactory> factory;
+    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                   IID_PPV_ARGS(factory.GetAddressOf()));
+    if (FAILED(hr)) return false;
+
+    ComPtr<IWICStream> stream;
+    hr = factory->CreateStream(stream.GetAddressOf());
+    if (FAILED(hr)) return false;
+
+    hr = stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE);
+    if (FAILED(hr)) return false;
+
+    ComPtr<IWICBitmapEncoder> encoder;
+    hr = factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, encoder.GetAddressOf());
+    if (FAILED(hr)) return false;
+
+    hr = encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache);
+    if (FAILED(hr)) return false;
+
+    ComPtr<IWICBitmapFrameEncode> frame;
+    hr = encoder->CreateNewFrame(frame.GetAddressOf(), nullptr);
+    if (FAILED(hr)) return false;
+
+    hr = frame->Initialize(nullptr);
+    if (FAILED(hr)) return false;
+
+    hr = frame->SetSize(width, height);
+    if (FAILED(hr)) return false;
+
+    WICPixelFormatGUID format = GUID_WICPixelFormat32bppBGRA;
+    hr = frame->SetPixelFormat(&format);
+    if (FAILED(hr)) return false;
+
+    const UINT rowBytes = static_cast<UINT>(width) * 4;
+    hr = frame->WritePixels(height, rowBytes, rowBytes * height,
+                             const_cast<BYTE*>(reinterpret_cast<const BYTE*>(bgraData)));
+    if (FAILED(hr)) return false;
+
+    hr = frame->Commit();
+    if (FAILED(hr)) return false;
+
+    hr = encoder->Commit();
+    return SUCCEEDED(hr);
 }
 }
 
@@ -423,9 +489,11 @@ void Recorder::TakeScreenshot() {
     // Grab a fresh frame directly rather than relying on the recording queue,
     // so screenshots work even when not recording.
     capture_->CaptureFrame([this](const CapturedFrame& f) {
-        std::wstring path = outputDir_ + L"\\screenshot_" + Timestamp() + L".raw";
-        std::ofstream out(path, std::ios::binary);
-        out.write(reinterpret_cast<const char*>(f.data), f.byteCount);
-        std::wcout << L"[Screenshot] Saved " << path << L"\n";
+        std::wstring path = outputDir_ + L"\\screenshot_" + Timestamp() + L".png";
+        if (WriteFrameAsPng(path, f.data, f.width, f.height)) {
+            std::wcout << L"[Screenshot] Saved " << path << L"\n";
+        } else {
+            std::wcerr << L"[Screenshot] Failed to encode PNG: " << path << L"\n";
+        }
     });
 }

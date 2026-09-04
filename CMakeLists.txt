@@ -45,6 +45,8 @@ if(NOT BRAPS_BUILDING_32BIT_HELPERS)
         Gdi32
         Shcore
         winmm
+        windowscodecs
+        ole32
     )
 
     target_compile_definitions(Braps PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX)
