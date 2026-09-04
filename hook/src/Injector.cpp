@@ -53,6 +53,60 @@ std::vector<ProcessInfo> ListCandidateProcesses() {
     return result;
 }
 
+namespace {
+
+// Locates BrapsInjector32.exe next to the currently running executable.
+// Returns an empty string if it's not present (e.g. the 32-bit helper
+// build was never produced/copied alongside Braps.exe).
+std::wstring FindInjector32Path() {
+    wchar_t exePath[MAX_PATH];
+    GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+    std::wstring path(exePath);
+    size_t lastSlash = path.find_last_of(L"\\/");
+    std::wstring candidate = path.substr(0, lastSlash + 1) + L"BrapsInjector32.exe";
+    return (GetFileAttributesW(candidate.c_str()) != INVALID_FILE_ATTRIBUTES) ? candidate : L"";
+}
+
+// Cross-bitness injection: CreateRemoteThread + LoadLibraryW only works
+// when the calling process matches the target's pointer size, so a
+// 64-bit Braps.exe spawns this same-bitness helper and lets IT perform
+// the actual injection, rather than attempting it directly.
+bool InjectViaHelper32(DWORD targetPid, const std::wstring& dllPath, std::wstring& outError) {
+    std::wstring helperPath = FindInjector32Path();
+    if (helperPath.empty()) {
+        outError = L"Target is a 32-bit process, but BrapsInjector32.exe was not found next to "
+                   L"Braps.exe — build the 32-bit helper (see README.md) to support 32-bit games.";
+        return false;
+    }
+
+    std::wstring cmdLine = L"\"" + helperPath + L"\" " + std::to_wstring(targetPid) + L" \"" + dllPath + L"\"";
+
+    STARTUPINFOW si{};
+    si.cb = sizeof(si);
+    PROCESS_INFORMATION pi{};
+
+    std::wstring mutableCmd = cmdLine;
+    if (!CreateProcessW(nullptr, mutableCmd.data(), nullptr, nullptr, FALSE,
+                         CREATE_NO_WINDOW, nullptr, nullptr, &si, &pi)) {
+        outError = L"Failed to launch BrapsInjector32.exe (GetLastError=" + std::to_wstring(GetLastError()) + L").";
+        return false;
+    }
+
+    WaitForSingleObject(pi.hProcess, 10000);
+    DWORD exitCode = 1;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    if (exitCode != 0) {
+        outError = L"BrapsInjector32.exe reported a failure (exit code " + std::to_wstring(exitCode) + L").";
+        return false;
+    }
+    return true;
+}
+
+} // namespace
+
 bool InjectDll(DWORD targetPid, const std::wstring& dllPath, std::wstring& outError) {
     HANDLE process = OpenProcess(
         PROCESS_CREATE_THREAD | PROCESS_QUERY_INFORMATION | PROCESS_VM_OPERATION |
@@ -69,14 +123,20 @@ bool InjectDll(DWORD targetPid, const std::wstring& dllPath, std::wstring& outEr
     // address only works when both processes share the same pointer size
     // and the same LoadLibraryW address (true for same-bitness processes
     // since kernel32 loads at the same address system-wide, but not across
-    // bitness boundaries).
+    // bitness boundaries). When we're 64-bit and the target is 32-bit,
+    // delegate to the same-bitness BrapsInjector32.exe helper instead of
+    // failing outright.
     BOOL targetIsWow64 = FALSE, selfIsWow64 = FALSE;
     IsWow64Process(process, &targetIsWow64);
     IsWow64Process(GetCurrentProcess(), &selfIsWow64);
     if (targetIsWow64 != selfIsWow64) {
-        outError = L"Bitness mismatch between Braps.exe and the target process — "
-                   L"build/run the matching 32-bit or 64-bit variant.";
         CloseHandle(process);
+        if (!selfIsWow64 && targetIsWow64) {
+            // We're 64-bit (assuming a 64-bit OS build of Braps.exe), target is 32-bit.
+            return InjectViaHelper32(targetPid, dllPath, outError);
+        }
+        outError = L"Bitness mismatch between Braps.exe and the target process — "
+                   L"64-bit targets need the 64-bit Braps.exe build.";
         return false;
     }
 
@@ -123,6 +183,22 @@ bool InjectDll(DWORD targetPid, const std::wstring& dllPath, std::wstring& outEr
         return false;
     }
     return true;
+}
+
+bool Is32BitProcess(DWORD pid) {
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process) return false;
+
+    BOOL isWow64 = FALSE;
+    IsWow64Process(process, &isWow64);
+    CloseHandle(process);
+
+    // IsWow64Process reports TRUE only for a 32-bit process running under
+    // WOW64 on a 64-bit OS. On a native 32-bit OS every process would
+    // report FALSE here despite being 32-bit — not a concern for us since
+    // Braps.exe itself is 64-bit-only, so this function only ever runs on
+    // a 64-bit OS where WOW64 is exactly how 32-bit processes show up.
+    return isWow64 == TRUE;
 }
 
 } // namespace braps

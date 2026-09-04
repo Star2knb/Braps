@@ -27,6 +27,19 @@ std::vector<ProcessInfo> ListCandidateProcesses();
 // successfully — check SharedHeader::hookAttached via the shared channel
 // for that, since hook installation happens asynchronously on a thread
 // inside the target process after DllMain returns.
+//
+// When called from a 64-bit Braps.exe against a 32-bit target, this
+// transparently delegates to BrapsInjector32.exe (a same-bitness helper,
+// since CreateRemoteThread + LoadLibraryW requires matching pointer
+// sizes) — the caller doesn't need to handle that case specially, but see
+// Is32BitProcess() below if the caller needs to pick which hook DLL
+// (BrapsHook.dll vs BrapsHook32.dll) to pass in dllPath.
 bool InjectDll(DWORD targetPid, const std::wstring& dllPath, std::wstring& outError);
+
+// True if the given process is 32-bit (running under WOW64 on a 64-bit
+// OS, or natively 32-bit). Callers building a 64-bit Braps.exe use this
+// to decide whether to pass BrapsHook.dll or BrapsHook32.dll to
+// InjectDll(), since the DLL's own bitness must match the target's.
+bool Is32BitProcess(DWORD pid);
 
 } // namespace braps

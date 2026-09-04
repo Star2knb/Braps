@@ -50,12 +50,20 @@ bool HasFlag(int argc, char** argv, const char* flag) {
     return false;
 }
 
-std::wstring GetHookDllPath() {
+std::wstring GetHookDllPath(DWORD targetPid) {
     wchar_t exePath[MAX_PATH];
     GetModuleFileNameW(nullptr, exePath, MAX_PATH);
     std::wstring path(exePath);
     size_t lastSlash = path.find_last_of(L"\\/");
-    return path.substr(0, lastSlash + 1) + L"BrapsHook.dll";
+    std::wstring dir = path.substr(0, lastSlash + 1);
+
+    // Must match the target's bitness: BrapsHook.dll is 64-bit (built
+    // alongside this exe), BrapsHook32.dll is the separate 32-bit build
+    // (see README.md / CMakeLists.txt's BRAPS_BUILDING_32BIT_HELPERS path).
+    // InjectDll() itself transparently delegates to BrapsInjector32.exe
+    // for the actual cross-bitness injection call, but it still needs to
+    // be handed a DLL of the right bitness to load into the target.
+    return dir + (braps::Is32BitProcess(targetPid) ? L"BrapsHook32.dll" : L"BrapsHook.dll");
 }
 
 void PrintCandidateProcesses() {
@@ -90,7 +98,7 @@ int main(int argc, char** argv) {
     bool initOk;
 
     if (injectPid != 0) {
-        std::wstring dllPath = GetHookDllPath();
+        std::wstring dllPath = GetHookDllPath(injectPid);
         std::wstring error;
         std::wcout << L"[Braps] Injecting " << dllPath << L" into PID " << injectPid << L"...\n";
         if (!braps::InjectDll(injectPid, dllPath, error)) {
