@@ -37,16 +37,33 @@ PresentFn g_originalPresent = nullptr;
 void** g_swapChainVTable = nullptr;
 DWORD g_originalProtect = 0;
 
-// Separate staging texture + tracked size per API, since a process could
-// (in principle, if unusually) have swapchains of either type, and the
-// two APIs' texture types aren't interchangeable.
-ComPtr<ID3D11Texture2D> g_stagingTexture11;
+// Two staging textures per API, used as a ring rather than one texture
+// re-used every frame. A single staging texture forces Map() to stall the
+// CPU until the GPU finishes the CopyResource just issued a moment ago —
+// measured at ~0.7-1.9ms/frame on real hardware (see PresentTimingAccum
+// below), directly on the game's own render thread. With two textures,
+// each Present() call issues CopyResource into THIS frame's slot, then
+// Maps LAST frame's slot instead — by then the GPU has had a full frame's
+// worth of time (usually >10ms) to finish that earlier copy, so the Map
+// call typically returns immediately rather than blocking. This trades
+// one frame of latency (the pushed frame is always one Present() behind)
+// for removing the GPU-wait stall from the hot path — an acceptable
+// tradeoff for a recording tool, which has no reason to need zero-latency
+// capture. A process could (in principle, if unusually) have swapchains
+// of either D3D10 or D3D11, so each API gets its own independent ring.
+constexpr int kStagingRingSize = 2;
+
+ComPtr<ID3D11Texture2D> g_stagingTexture11[kStagingRingSize];
 UINT g_stagingWidth11 = 0;
 UINT g_stagingHeight11 = 0;
+int g_stagingWriteIndex11 = 0; // slot CopyResource targets THIS Present call
+bool g_stagingHasPending11 = false; // false until the ring has been through one full cycle
 
-ComPtr<ID3D10Texture2D> g_stagingTexture10;
+ComPtr<ID3D10Texture2D> g_stagingTexture10[kStagingRingSize];
 UINT g_stagingWidth10 = 0;
 UINT g_stagingHeight10 = 0;
+int g_stagingWriteIndex10 = 0;
+bool g_stagingHasPending10 = false;
 
 SharedFrameChannel* g_channel = nullptr;
 
@@ -103,7 +120,7 @@ void CopyRowsWithOptionalSwizzle(uint8_t* dst, const uint8_t* src, UINT width, U
 // backbuffer size changes (window resize, fullscreen toggle) so
 // CopyResource always targets a correctly-sized destination.
 bool EnsureStagingTexture11(ID3D11Device* device, UINT width, UINT height, DXGI_FORMAT format) {
-    if (g_stagingTexture11 && width == g_stagingWidth11 && height == g_stagingHeight11) {
+    if (g_stagingTexture11[0] && width == g_stagingWidth11 && height == g_stagingHeight11) {
         return true;
     }
 
@@ -117,19 +134,26 @@ bool EnsureStagingTexture11(ID3D11Device* device, UINT width, UINT height, DXGI_
     desc.Usage = D3D11_USAGE_STAGING;
     desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
 
-    g_stagingTexture11.Reset();
-    HRESULT hr = device->CreateTexture2D(&desc, nullptr, g_stagingTexture11.GetAddressOf());
-    if (FAILED(hr)) return false;
+    for (auto& tex : g_stagingTexture11) {
+        tex.Reset();
+        HRESULT hr = device->CreateTexture2D(&desc, nullptr, tex.GetAddressOf());
+        if (FAILED(hr)) return false;
+    }
 
     g_stagingWidth11 = width;
     g_stagingHeight11 = height;
+    // A resize invalidates any in-flight copy queued against the old-sized
+    // textures — restart the ring from empty rather than risk Mapping a
+    // slot whose CopyResource targeted a texture that no longer exists.
+    g_stagingWriteIndex11 = 0;
+    g_stagingHasPending11 = false;
     return true;
 }
 
 // D3D10 equivalent of EnsureStagingTexture11. D3D10 has no separate device
 // context — the device itself issues CopyResource/Map calls directly.
 bool EnsureStagingTexture10(ID3D10Device* device, UINT width, UINT height, DXGI_FORMAT format) {
-    if (g_stagingTexture10 && width == g_stagingWidth10 && height == g_stagingHeight10) {
+    if (g_stagingTexture10[0] && width == g_stagingWidth10 && height == g_stagingHeight10) {
         return true;
     }
 
@@ -143,18 +167,63 @@ bool EnsureStagingTexture10(ID3D10Device* device, UINT width, UINT height, DXGI_
     desc.Usage = D3D10_USAGE_STAGING;
     desc.CPUAccessFlags = D3D10_CPU_ACCESS_READ;
 
-    g_stagingTexture10.Reset();
-    HRESULT hr = device->CreateTexture2D(&desc, nullptr, g_stagingTexture10.GetAddressOf());
-    if (FAILED(hr)) return false;
+    for (auto& tex : g_stagingTexture10) {
+        tex.Reset();
+        HRESULT hr = device->CreateTexture2D(&desc, nullptr, tex.GetAddressOf());
+        if (FAILED(hr)) return false;
+    }
 
     g_stagingWidth10 = width;
     g_stagingHeight10 = height;
+    g_stagingWriteIndex10 = 0;
+    g_stagingHasPending10 = false;
     return true;
 }
 
+// Per-second accumulators for HandlePresent11's timing breakdown, flushed
+// to hook_log.txt roughly once a second — used to find where real time
+// goes on the game's own render thread during readback, since this call
+// executes inline inside the game's Present() and any cost here is cost
+// the game itself pays. Not thread-safe by design: Present is only ever
+// called from the game's single render thread, same as the rest of this
+// file's globals.
+struct PresentTimingAccum {
+    double getBufferMs = 0, copyResourceMs = 0, mapMs = 0, rowCopyMs = 0, unmapMs = 0, pushMs = 0, totalMs = 0;
+    int frames = 0;
+    // Counts DXGI_ERROR_WAS_STILL_DRAWING from the non-blocking Map — the
+    // ring's one-frame margin wasn't enough and this frame's capture was
+    // skipped rather than stalling the game. Expected to stay at/near 0;
+    // a consistently nonzero rate would mean the GPU is more than a full
+    // frame behind on this hardware and the ring may need a 3rd slot.
+    int mapStillDrawing = 0;
+    std::chrono::steady_clock::time_point windowStart = std::chrono::steady_clock::now();
+};
+PresentTimingAccum g_presentTiming;
+
+void FlushPresentTimingIfDue() {
+    auto now = std::chrono::steady_clock::now();
+    if (now - g_presentTiming.windowStart < std::chrono::seconds(1) || g_presentTiming.frames == 0) return;
+
+    auto& t = g_presentTiming;
+    LogHook("[PresentTiming] frames=" + std::to_string(t.frames) +
+            " getBuffer=" + std::to_string(t.getBufferMs / t.frames) +
+            "ms copyResource=" + std::to_string(t.copyResourceMs / t.frames) +
+            "ms map=" + std::to_string(t.mapMs / t.frames) +
+            "ms rowCopy=" + std::to_string(t.rowCopyMs / t.frames) +
+            "ms unmap=" + std::to_string(t.unmapMs / t.frames) +
+            "ms push=" + std::to_string(t.pushMs / t.frames) +
+            "ms total=" + std::to_string(t.totalMs / t.frames) +
+            "ms/frame stillDrawing=" + std::to_string(t.mapStillDrawing));
+
+    t = PresentTimingAccum{};
+}
+
 void HandlePresent11(IDXGISwapChain* swapChain, ID3D11Device* device) {
+    auto tStart = std::chrono::steady_clock::now();
+
     ComPtr<ID3D11Texture2D> backBuffer;
     if (FAILED(swapChain->GetBuffer(0, IID_PPV_ARGS(backBuffer.GetAddressOf())))) return;
+    auto tGetBuffer = std::chrono::steady_clock::now();
 
     D3D11_TEXTURE2D_DESC bbDesc{};
     backBuffer->GetDesc(&bbDesc);
@@ -174,18 +243,70 @@ void HandlePresent11(IDXGISwapChain* swapChain, ID3D11Device* device) {
     ComPtr<ID3D11DeviceContext> context;
     device->GetImmediateContext(context.GetAddressOf());
 
-    context->CopyResource(g_stagingTexture11.Get(), backBuffer.Get());
+    // Issue this frame's copy into the write slot — the GPU queues this
+    // and returns essentially immediately; it does NOT wait for the copy
+    // to finish. The result won't be read back until NEXT Present(), by
+    // which point the GPU has had a full frame's worth of time to finish it.
+    const int writeIndex = g_stagingWriteIndex11;
+    const int readIndex = (writeIndex + 1) % kStagingRingSize; // slot copied last Present()
+    context->CopyResource(g_stagingTexture11[writeIndex].Get(), backBuffer.Get());
+    auto tCopyResource = std::chrono::steady_clock::now();
 
+    g_stagingWriteIndex11 = readIndex;
+
+    // First frame after (re)creating the ring: only one copy has ever been
+    // issued, so readIndex's texture has never been written — skip capture
+    // for this one frame rather than reading undefined staging memory.
+    if (!g_stagingHasPending11) {
+        g_stagingHasPending11 = true;
+        return;
+    }
+
+    // Try the non-blocking Map first — the expected/fast path once the
+    // ring has warmed up, since the GPU has had a full frame's time to
+    // finish the copy. Measured on real hardware: this alone dropped the
+    // vast majority of frames on one test (Minecraft, GPU evidently still
+    // behind by more than one frame under that load) — DXGI_ERROR_WAS_
+    // STILL_DRAWING is not the rare edge case a "whole extra frame of
+    // margin" was expected to make it; it can be the common case under
+    // real load. So this is a fast-path attempt, not a skip-on-failure:
+    // falling back to a blocking Map (identical cost to the pre-rework
+    // synchronous path) on WAS_STILL_DRAWING still guarantees every frame
+    // gets delivered, same as before this rework, while frames that DO
+    // win the race pay near-zero Map cost instead of the old ~1-2ms stall.
     D3D11_MAPPED_SUBRESOURCE mapped{};
-    if (FAILED(context->Map(g_stagingTexture11.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return;
+    HRESULT mapHr = context->Map(g_stagingTexture11[readIndex].Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+    if (mapHr == DXGI_ERROR_WAS_STILL_DRAWING) {
+        g_presentTiming.mapStillDrawing++;
+        mapHr = context->Map(g_stagingTexture11[readIndex].Get(), 0, D3D11_MAP_READ, 0, &mapped);
+    }
+    auto tMap = std::chrono::steady_clock::now();
+    if (FAILED(mapHr)) return;
 
     uint8_t* dst = RowContiguousScratch();
     CopyRowsWithOptionalSwizzle(dst, static_cast<const uint8_t*>(mapped.pData),
                                  bbDesc.Width, bbDesc.Height, mapped.RowPitch, NeedsSwizzle(bbDesc.Format));
-    context->Unmap(g_stagingTexture11.Get(), 0);
+    auto tRowCopy = std::chrono::steady_clock::now();
+
+    context->Unmap(g_stagingTexture11[readIndex].Get(), 0);
+    auto tUnmap = std::chrono::steady_clock::now();
 
     const size_t rowBytes = static_cast<size_t>(bbDesc.Width) * 4;
     g_channel->TryPush(dst, rowBytes * bbDesc.Height, bbDesc.Width, bbDesc.Height, NowMs());
+    auto tPush = std::chrono::steady_clock::now();
+
+    auto ms = [](std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b) {
+        return std::chrono::duration<double, std::milli>(b - a).count();
+    };
+    g_presentTiming.getBufferMs += ms(tStart, tGetBuffer);
+    g_presentTiming.copyResourceMs += ms(tGetBuffer, tCopyResource);
+    g_presentTiming.mapMs += ms(tCopyResource, tMap);
+    g_presentTiming.rowCopyMs += ms(tMap, tRowCopy);
+    g_presentTiming.unmapMs += ms(tRowCopy, tUnmap);
+    g_presentTiming.pushMs += ms(tUnmap, tPush);
+    g_presentTiming.totalMs += ms(tStart, tPush);
+    ++g_presentTiming.frames;
+    FlushPresentTimingIfDue();
 }
 
 // D3D10 equivalent of HandlePresent11 — same shape, but every call goes
@@ -210,15 +331,35 @@ void HandlePresent10(IDXGISwapChain* swapChain, ID3D10Device* device) {
         return;
     }
 
-    device->CopyResource(g_stagingTexture10.Get(), backBuffer.Get());
+    // Same double-buffered ring as HandlePresent11 — see the comment on
+    // g_stagingTexture11's declaration for why. D3D10 has no separate
+    // D3D10_MAP_FLAG_DO_NOT_WAIT-style async check on this SDK's Map, but
+    // D3D10_MAP_FLAG_DO_NOT_WAIT itself exists (device10.h), so the same
+    // non-blocking safety net applies.
+    const int writeIndex = g_stagingWriteIndex10;
+    const int readIndex = (writeIndex + 1) % kStagingRingSize;
+    device->CopyResource(g_stagingTexture10[writeIndex].Get(), backBuffer.Get());
+    g_stagingWriteIndex10 = readIndex;
 
+    if (!g_stagingHasPending10) {
+        g_stagingHasPending10 = true;
+        return;
+    }
+
+    // Fast-path attempt, falls back to blocking Map on WAS_STILL_DRAWING —
+    // see the matching comment in HandlePresent11 for why this isn't a
+    // skip-on-failure (dropped nearly every frame in real testing).
     D3D10_MAPPED_TEXTURE2D mapped{};
-    if (FAILED(g_stagingTexture10->Map(0, D3D10_MAP_READ, 0, &mapped))) return;
+    HRESULT mapHr = g_stagingTexture10[readIndex]->Map(0, D3D10_MAP_READ, D3D10_MAP_FLAG_DO_NOT_WAIT, &mapped);
+    if (mapHr == DXGI_ERROR_WAS_STILL_DRAWING) {
+        mapHr = g_stagingTexture10[readIndex]->Map(0, D3D10_MAP_READ, 0, &mapped);
+    }
+    if (FAILED(mapHr)) return;
 
     uint8_t* dst = RowContiguousScratch();
     CopyRowsWithOptionalSwizzle(dst, static_cast<const uint8_t*>(mapped.pData),
                                  bbDesc.Width, bbDesc.Height, mapped.RowPitch, NeedsSwizzle(bbDesc.Format));
-    g_stagingTexture10->Unmap(0);
+    g_stagingTexture10[readIndex]->Unmap(0);
 
     const size_t rowBytes = static_cast<size_t>(bbDesc.Width) * 4;
     g_channel->TryPush(dst, rowBytes * bbDesc.Height, bbDesc.Width, bbDesc.Height, NowMs());
@@ -361,8 +502,8 @@ void RemoveD3D11Hook() {
         g_channel = nullptr;
     }
 
-    g_stagingTexture11.Reset();
-    g_stagingTexture10.Reset();
+    for (auto& tex : g_stagingTexture11) tex.Reset();
+    for (auto& tex : g_stagingTexture10) tex.Reset();
 }
 
 } // namespace braps

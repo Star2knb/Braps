@@ -50,6 +50,18 @@ private:
     std::vector<uint8_t> scratchBuffer_;
 
     std::chrono::duration<double, std::milli> minFrameInterval_;
-    std::chrono::steady_clock::time_point lastDeliveredAt_;
+    // The throttle's next allowed delivery time, advanced by a fixed
+    // minFrameInterval_ on every ACCEPTED delivery (not set to "now") —
+    // this is a fixed schedule, not "time since the last frame we let
+    // through". Using "now" as the baseline created a self-reinforcing
+    // reject/accept alternation whenever the real source rate was close
+    // to fpsTarget (exactly the common case: game and target both near
+    // 60fps): each accepted frame nudged the baseline forward by however
+    // late that delivery happened to run, making the very next check more
+    // likely to reject, and a rejection (which didn't move the baseline)
+    // made the one after THAT more likely to accept — measured on real
+    // hardware to roughly halve throughput (~60fps in, ~39fps delivered)
+    // instead of passing a same-rate source through cleanly.
+    std::chrono::steady_clock::time_point nextAllowedDeliveryAt_;
     bool haveDelivered_ = false;
 };

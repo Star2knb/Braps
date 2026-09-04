@@ -73,11 +73,27 @@ bool CaptureHook::CaptureFrame(const FrameCallback& onFrame, bool needsPixelData
     // FFmpeg's VFR encoder would then silently merge/drop as too-close-
     // together — capture looked uncapped and part of it never reached
     // the final video.
+    //
+    // Compares against a fixed schedule (nextAllowedDeliveryAt_, advanced
+    // by exactly minFrameInterval_ on every accepted delivery) rather than
+    // "time since the last accepted delivery" — the latter measured "now"
+    // AFTER this call's own wait+drain latency, so an accepted delivery's
+    // timestamp silently included whatever jitter that call happened to
+    // take, making the next check's baseline drift. When the real source
+    // rate is close to fpsTarget (the common case), that drift produced a
+    // self-reinforcing reject/accept alternation that roughly halved
+    // throughput instead of passing a same-rate source through cleanly.
     auto now = std::chrono::steady_clock::now();
-    if (haveDelivered_ && (now - lastDeliveredAt_) < minFrameInterval_) {
+    if (haveDelivered_ && now < nextAllowedDeliveryAt_) {
         return false;
     }
-    lastDeliveredAt_ = now;
+    // Schedule from the target time, not from "now": if this delivery ran
+    // a little late, the next slot is still minFrameInterval_ after the
+    // slot we just filled, not shifted later by that lateness — otherwise
+    // occasional scheduling delays compound instead of self-correcting.
+    nextAllowedDeliveryAt_ = haveDelivered_
+        ? nextAllowedDeliveryAt_ + std::chrono::duration_cast<std::chrono::steady_clock::duration>(minFrameInterval_)
+        : now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(minFrameInterval_);
     haveDelivered_ = true;
 
     if (needsPixelData) {
