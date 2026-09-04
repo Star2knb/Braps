@@ -1,6 +1,7 @@
 #include "D3D11Hook.h"
 #include "SharedFrameChannel.h"
 
+#include <d3d10_1.h>
 #include <d3d11.h>
 #include <dxgi.h>
 #include <wrl/client.h>
@@ -24,7 +25,10 @@ void LogHook(const std::string& message) {
 // IDXGISwapChain::Present is vtable slot 8 (after the 3 IUnknown +
 // 5 IDXGIObject/IDXGIDeviceSubObject... actually: QueryInterface, AddRef,
 // Release, SetPrivateData, SetPrivateDataInterface, GetPrivateData,
-// GetParent, GetDevice, Present). Present is index 8, 0-based.
+// GetParent, GetDevice, Present). Present is index 8, 0-based. This slot
+// is identical for a swapchain regardless of whether the device behind it
+// is D3D10 or D3D11 — both go through the same IDXGISwapChain interface,
+// so one hook covers both APIs; only the backbuffer readback differs.
 constexpr int kPresentVTableIndex = 8;
 
 using PresentFn = HRESULT(STDMETHODCALLTYPE*)(IDXGISwapChain*, UINT, UINT);
@@ -33,11 +37,16 @@ PresentFn g_originalPresent = nullptr;
 void** g_swapChainVTable = nullptr;
 DWORD g_originalProtect = 0;
 
-ComPtr<ID3D11Device> g_capturedDevice;
-ComPtr<ID3D11DeviceContext> g_capturedContext;
-ComPtr<ID3D11Texture2D> g_stagingTexture;
-UINT g_stagingWidth = 0;
-UINT g_stagingHeight = 0;
+// Separate staging texture + tracked size per API, since a process could
+// (in principle, if unusually) have swapchains of either type, and the
+// two APIs' texture types aren't interchangeable.
+ComPtr<ID3D11Texture2D> g_stagingTexture11;
+UINT g_stagingWidth11 = 0;
+UINT g_stagingHeight11 = 0;
+
+ComPtr<ID3D10Texture2D> g_stagingTexture10;
+UINT g_stagingWidth10 = 0;
+UINT g_stagingHeight10 = 0;
 
 SharedFrameChannel* g_channel = nullptr;
 
@@ -46,11 +55,55 @@ uint64_t NowMs() {
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-// Lazily (re)creates the staging texture when the swapchain's backbuffer
-// size changes (window resize, fullscreen toggle) so CopyResource always
-// targets a correctly-sized destination.
-bool EnsureStagingTexture(ID3D11Device* device, UINT width, UINT height, DXGI_FORMAT format) {
-    if (g_stagingTexture && width == g_stagingWidth && height == g_stagingHeight) {
+bool NeedsSwizzle(DXGI_FORMAT format) {
+    return format == DXGI_FORMAT_R8G8B8A8_UNORM || format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+}
+
+bool IsSupportedFormat(DXGI_FORMAT format) {
+    return NeedsSwizzle(format) ||
+           format == DXGI_FORMAT_B8G8R8A8_UNORM || format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+}
+
+// Row-major scratch buffer used to de-stride mapped GPU memory before
+// handing it to shared memory, and optionally swizzle R/B along the way.
+// Shared between the D3D10 and D3D11 paths since only one is ever active
+// for a given swapchain at a time.
+uint8_t* RowContiguousScratch() {
+    static std::vector<uint8_t> buffer(kMaxFrameBytes);
+    return buffer.data();
+}
+
+// The shared memory contract (and everything downstream: Encoder, the
+// DXGI/GDI capture paths) assumes BGRA byte order, matching what DXGI
+// Desktop Duplication and GDI both produce natively. A game's actual
+// swapchain format is commonly RGBA (DXGI_FORMAT_R8G8B8A8_UNORM) instead,
+// which is byte-identical except red and blue are swapped — left
+// unhandled, this reads as "colors are off" while everything else
+// (shapes, motion, brightness) looks correct.
+void CopyRowsWithOptionalSwizzle(uint8_t* dst, const uint8_t* src, UINT width, UINT height,
+                                  UINT rowPitch, bool needsSwizzle) {
+    const size_t rowBytes = static_cast<size_t>(width) * 4;
+    for (UINT y = 0; y < height; ++y) {
+        uint8_t* dstRow = dst + static_cast<size_t>(y) * rowBytes;
+        const uint8_t* srcRow = src + static_cast<size_t>(y) * rowPitch;
+        if (needsSwizzle) {
+            for (UINT x = 0; x < width; ++x) {
+                dstRow[x * 4 + 0] = srcRow[x * 4 + 2]; // B <- R
+                dstRow[x * 4 + 1] = srcRow[x * 4 + 1]; // G
+                dstRow[x * 4 + 2] = srcRow[x * 4 + 0]; // R <- B
+                dstRow[x * 4 + 3] = srcRow[x * 4 + 3]; // A
+            }
+        } else {
+            memcpy(dstRow, srcRow, rowBytes);
+        }
+    }
+}
+
+// Lazily (re)creates the D3D11 staging texture when the swapchain's
+// backbuffer size changes (window resize, fullscreen toggle) so
+// CopyResource always targets a correctly-sized destination.
+bool EnsureStagingTexture11(ID3D11Device* device, UINT width, UINT height, DXGI_FORMAT format) {
+    if (g_stagingTexture11 && width == g_stagingWidth11 && height == g_stagingHeight11) {
         return true;
     }
 
@@ -64,13 +117,111 @@ bool EnsureStagingTexture(ID3D11Device* device, UINT width, UINT height, DXGI_FO
     desc.Usage = D3D11_USAGE_STAGING;
     desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
 
-    g_stagingTexture.Reset();
-    HRESULT hr = device->CreateTexture2D(&desc, nullptr, g_stagingTexture.GetAddressOf());
+    g_stagingTexture11.Reset();
+    HRESULT hr = device->CreateTexture2D(&desc, nullptr, g_stagingTexture11.GetAddressOf());
     if (FAILED(hr)) return false;
 
-    g_stagingWidth = width;
-    g_stagingHeight = height;
+    g_stagingWidth11 = width;
+    g_stagingHeight11 = height;
     return true;
+}
+
+// D3D10 equivalent of EnsureStagingTexture11. D3D10 has no separate device
+// context — the device itself issues CopyResource/Map calls directly.
+bool EnsureStagingTexture10(ID3D10Device* device, UINT width, UINT height, DXGI_FORMAT format) {
+    if (g_stagingTexture10 && width == g_stagingWidth10 && height == g_stagingHeight10) {
+        return true;
+    }
+
+    D3D10_TEXTURE2D_DESC desc{};
+    desc.Width = width;
+    desc.Height = height;
+    desc.MipLevels = 1;
+    desc.ArraySize = 1;
+    desc.Format = format;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D10_USAGE_STAGING;
+    desc.CPUAccessFlags = D3D10_CPU_ACCESS_READ;
+
+    g_stagingTexture10.Reset();
+    HRESULT hr = device->CreateTexture2D(&desc, nullptr, g_stagingTexture10.GetAddressOf());
+    if (FAILED(hr)) return false;
+
+    g_stagingWidth10 = width;
+    g_stagingHeight10 = height;
+    return true;
+}
+
+void HandlePresent11(IDXGISwapChain* swapChain, ID3D11Device* device) {
+    ComPtr<ID3D11Texture2D> backBuffer;
+    if (FAILED(swapChain->GetBuffer(0, IID_PPV_ARGS(backBuffer.GetAddressOf())))) return;
+
+    D3D11_TEXTURE2D_DESC bbDesc{};
+    backBuffer->GetDesc(&bbDesc);
+
+    static bool loggedFormat = false;
+    if (!loggedFormat) {
+        loggedFormat = true;
+        LogHook("[PresentHook/D3D11] Backbuffer format=" + std::to_string(bbDesc.Format) +
+                " size=" + std::to_string(bbDesc.Width) + "x" + std::to_string(bbDesc.Height));
+    }
+
+    if (!IsSupportedFormat(bbDesc.Format) || bbDesc.Width > kMaxWidth || bbDesc.Height > kMaxHeight ||
+        !EnsureStagingTexture11(device, bbDesc.Width, bbDesc.Height, bbDesc.Format)) {
+        return;
+    }
+
+    ComPtr<ID3D11DeviceContext> context;
+    device->GetImmediateContext(context.GetAddressOf());
+
+    context->CopyResource(g_stagingTexture11.Get(), backBuffer.Get());
+
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (FAILED(context->Map(g_stagingTexture11.Get(), 0, D3D11_MAP_READ, 0, &mapped))) return;
+
+    uint8_t* dst = RowContiguousScratch();
+    CopyRowsWithOptionalSwizzle(dst, static_cast<const uint8_t*>(mapped.pData),
+                                 bbDesc.Width, bbDesc.Height, mapped.RowPitch, NeedsSwizzle(bbDesc.Format));
+    context->Unmap(g_stagingTexture11.Get(), 0);
+
+    const size_t rowBytes = static_cast<size_t>(bbDesc.Width) * 4;
+    g_channel->TryPush(dst, rowBytes * bbDesc.Height, bbDesc.Width, bbDesc.Height, NowMs());
+}
+
+// D3D10 equivalent of HandlePresent11 — same shape, but every call goes
+// straight to the device (no ID3D10DeviceContext exists; the device IS
+// the immediate context in D3D10's model).
+void HandlePresent10(IDXGISwapChain* swapChain, ID3D10Device* device) {
+    ComPtr<ID3D10Texture2D> backBuffer;
+    if (FAILED(swapChain->GetBuffer(0, IID_PPV_ARGS(backBuffer.GetAddressOf())))) return;
+
+    D3D10_TEXTURE2D_DESC bbDesc{};
+    backBuffer->GetDesc(&bbDesc);
+
+    static bool loggedFormat = false;
+    if (!loggedFormat) {
+        loggedFormat = true;
+        LogHook("[PresentHook/D3D10] Backbuffer format=" + std::to_string(bbDesc.Format) +
+                " size=" + std::to_string(bbDesc.Width) + "x" + std::to_string(bbDesc.Height));
+    }
+
+    if (!IsSupportedFormat(bbDesc.Format) || bbDesc.Width > kMaxWidth || bbDesc.Height > kMaxHeight ||
+        !EnsureStagingTexture10(device, bbDesc.Width, bbDesc.Height, bbDesc.Format)) {
+        return;
+    }
+
+    device->CopyResource(g_stagingTexture10.Get(), backBuffer.Get());
+
+    D3D10_MAPPED_TEXTURE2D mapped{};
+    if (FAILED(g_stagingTexture10->Map(0, D3D10_MAP_READ, 0, &mapped))) return;
+
+    uint8_t* dst = RowContiguousScratch();
+    CopyRowsWithOptionalSwizzle(dst, static_cast<const uint8_t*>(mapped.pData),
+                                 bbDesc.Width, bbDesc.Height, mapped.RowPitch, NeedsSwizzle(bbDesc.Format));
+    g_stagingTexture10->Unmap(0);
+
+    const size_t rowBytes = static_cast<size_t>(bbDesc.Width) * 4;
+    g_channel->TryPush(dst, rowBytes * bbDesc.Height, bbDesc.Width, bbDesc.Height, NowMs());
 }
 
 // The detour: runs on every real Present() call from the game, before
@@ -79,92 +230,17 @@ bool EnsureStagingTexture(ID3D11Device* device, UINT width, UINT height, DXGI_FO
 // latency here is latency the game itself feels.
 HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* swapChain, UINT syncInterval, UINT flags) {
     if (g_channel && g_channel->IsValid()) {
-        ComPtr<ID3D11Texture2D> backBuffer;
-        if (SUCCEEDED(swapChain->GetBuffer(0, IID_PPV_ARGS(backBuffer.GetAddressOf())))) {
-            ComPtr<ID3D11Device> device;
-            backBuffer->GetDevice(device.GetAddressOf());
-
-            D3D11_TEXTURE2D_DESC bbDesc{};
-            backBuffer->GetDesc(&bbDesc);
-
-            // The shared memory contract (and everything downstream:
-            // Encoder, the DXGI/GDI capture paths) assumes BGRA byte
-            // order, matching what DXGI Desktop Duplication and GDI both
-            // produce natively. A game's actual swapchain format is
-            // commonly RGBA (DXGI_FORMAT_R8G8B8A8_UNORM) instead, which is
-            // byte-identical except red and blue are swapped — left
-            // unhandled, this reads as "colors are off" while everything
-            // else (shapes, motion, brightness) looks correct.
-            const bool needsSwizzle =
-                bbDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM ||
-                bbDesc.Format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
-            const bool isSupportedFormat = needsSwizzle ||
-                bbDesc.Format == DXGI_FORMAT_B8G8R8A8_UNORM ||
-                bbDesc.Format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
-
-            static bool loggedFormat = false;
-            if (!loggedFormat) {
-                loggedFormat = true;
-                LogHook("[D3D11Hook] Backbuffer format=" + std::to_string(bbDesc.Format) +
-                        " size=" + std::to_string(bbDesc.Width) + "x" + std::to_string(bbDesc.Height) +
-                        " swizzle=" + (needsSwizzle ? "yes" : "no") +
-                        " supported=" + (isSupportedFormat ? "yes" : "no"));
-            }
-
-            if (isSupportedFormat && bbDesc.Width <= kMaxWidth && bbDesc.Height <= kMaxHeight &&
-                EnsureStagingTexture(device.Get(), bbDesc.Width, bbDesc.Height, bbDesc.Format)) {
-                ComPtr<ID3D11DeviceContext> context;
-                device->GetImmediateContext(context.GetAddressOf());
-
-                auto copyStart = std::chrono::steady_clock::now();
-                context->CopyResource(g_stagingTexture.Get(), backBuffer.Get());
-                double copyMs = std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - copyStart).count();
-
-                auto mapStart = std::chrono::steady_clock::now();
-                D3D11_MAPPED_SUBRESOURCE mapped{};
-                HRESULT mapHr = context->Map(g_stagingTexture.Get(), 0, D3D11_MAP_READ, 0, &mapped);
-                double mapMs = std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - mapStart).count();
-
-                if (SUCCEEDED(mapHr)) {
-                    // Row-major scratch buffer to de-stride the mapped GPU
-                    // memory before handing it to shared memory. Heap
-                    // allocated once (not thread_local/stack) since ~8MB
-                    // is too large for either safely, and Present() always
-                    // runs on the game's own render thread anyway.
-                    static std::vector<uint8_t> rowContiguous(kMaxFrameBytes);
-                    const size_t rowBytes = static_cast<size_t>(bbDesc.Width) * 4;
-                    uint8_t* dst = rowContiguous.data();
-                    const uint8_t* src = static_cast<const uint8_t*>(mapped.pData);
-
-                    auto copyLoopStart = std::chrono::steady_clock::now();
-                    for (UINT y = 0; y < bbDesc.Height; ++y) {
-                        uint8_t* dstRow = dst + static_cast<size_t>(y) * rowBytes;
-                        const uint8_t* srcRow = src + static_cast<size_t>(y) * mapped.RowPitch;
-                        if (needsSwizzle) {
-                            for (UINT x = 0; x < bbDesc.Width; ++x) {
-                                dstRow[x * 4 + 0] = srcRow[x * 4 + 2]; // B <- R
-                                dstRow[x * 4 + 1] = srcRow[x * 4 + 1]; // G
-                                dstRow[x * 4 + 2] = srcRow[x * 4 + 0]; // R <- B
-                                dstRow[x * 4 + 3] = srcRow[x * 4 + 3]; // A
-                            }
-                        } else {
-                            memcpy(dstRow, srcRow, rowBytes);
-                        }
-                    }
-                    double copyLoopMs = std::chrono::duration<double, std::milli>(
-                        std::chrono::steady_clock::now() - copyLoopStart).count();
-                    context->Unmap(g_stagingTexture.Get(), 0);
-
-                    g_channel->TryPush(rowContiguous.data(), rowBytes * bbDesc.Height, bbDesc.Width, bbDesc.Height, NowMs());
-
-                    static int frameCounter = 0;
-                    if (++frameCounter % 60 == 0) {
-                        LogHook("[D3D11Hook] copy=" + std::to_string(copyMs) + "ms map=" + std::to_string(mapMs) +
-                                "ms copyLoop=" + std::to_string(copyLoopMs) + "ms (frame " + std::to_string(frameCounter) + ")");
-                    }
-                }
+        // Detect which API actually backs this swapchain by asking for
+        // each device interface in turn — a swapchain only succeeds
+        // QueryInterface-ing its own real device type, so exactly one of
+        // these two branches ever does real work for a given process.
+        ComPtr<ID3D11Device> device11;
+        if (SUCCEEDED(swapChain->GetDevice(IID_PPV_ARGS(device11.GetAddressOf())))) {
+            HandlePresent11(swapChain, device11.Get());
+        } else {
+            ComPtr<ID3D10Device> device10;
+            if (SUCCEEDED(swapChain->GetDevice(IID_PPV_ARGS(device10.GetAddressOf())))) {
+                HandlePresent10(swapChain, device10.Get());
             }
         }
     }
@@ -172,12 +248,15 @@ HRESULT STDMETHODCALLTYPE HookedPresent(IDXGISwapChain* swapChain, UINT syncInte
     return g_originalPresent(swapChain, syncInterval, flags);
 }
 
-// Creates a throwaway device+swapchain solely to read the real Present
-// function pointer out of its vtable, then destroys it. This is the
-// standard technique: you can't get a swapchain's vtable without first
-// creating one, but any swapchain instance (even a dummy hidden window's)
-// shares the same vtable as the game's real one, since it's determined by
-// the D3D11/DXGI runtime implementation, not the specific instance.
+// Creates a throwaway D3D11 device+swapchain solely to read the real
+// Present function pointer out of its vtable, then destroys it. This is
+// the standard technique: you can't get a swapchain's vtable without
+// first creating one, but any swapchain instance (even a dummy hidden
+// window's) shares the same vtable as the game's real one, since it's
+// determined by the DXGI runtime implementation, not the specific
+// instance — and critically, IDXGISwapChain::Present's vtable slot is
+// identical whether the backing device is D3D10 or D3D11, so a D3D11
+// dummy device is sufficient to find the hook point for both APIs.
 bool GetRealPresentAddress(void** outVTable, PresentFn* outOriginal) {
     WNDCLASSEXW wc{};
     wc.cbSize = sizeof(wc);
@@ -275,9 +354,8 @@ void RemoveD3D11Hook() {
         g_channel = nullptr;
     }
 
-    g_capturedDevice.Reset();
-    g_capturedContext.Reset();
-    g_stagingTexture.Reset();
+    g_stagingTexture11.Reset();
+    g_stagingTexture10.Reset();
 }
 
 } // namespace braps
