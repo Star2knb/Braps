@@ -1,0 +1,444 @@
+<title>Frame Pacing Analyzer</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&family=Inter:wght@400;500&display=swap">
+<style>
+:root {
+  --bg: #f6f7f9;
+  --surface: #ffffff;
+  --border: #d8dce2;
+  --text: #1c2128;
+  --text-dim: #57606a;
+  --accent: #1f6feb;
+  --good: #1a7f37;
+  --warn: #bc4c00;
+  --crit: #cf222e;
+  --grid: #e3e6ea;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0d1117;
+    --surface: #12181f;
+    --border: #30363d;
+    --text: #c9d1d9;
+    --text-dim: #8b949e;
+    --accent: #58a6ff;
+    --good: #7ee787;
+    --warn: #f0883e;
+    --crit: #ff7b72;
+    --grid: #21262d;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0d1117;
+  --surface: #12181f;
+  --border: #30363d;
+  --text: #c9d1d9;
+  --text-dim: #8b949e;
+  --accent: #58a6ff;
+  --good: #7ee787;
+  --warn: #f0883e;
+  --crit: #ff7b72;
+  --grid: #21262d;
+}
+
+* { box-sizing: border-box; }
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'Inter', system-ui, sans-serif;
+  margin: 0;
+  padding: 2.5rem 1.5rem 4rem;
+}
+.wrap { max-width: 920px; margin: 0 auto; }
+
+h1 {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 1.5rem;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  margin: 0 0 0.35rem;
+  text-wrap: balance;
+}
+.subtitle {
+  color: var(--text-dim);
+  font-size: 0.9rem;
+  max-width: 62ch;
+  line-height: 1.55;
+  margin: 0 0 1.75rem;
+}
+.subtitle code {
+  font-family: 'JetBrains Mono', monospace;
+  background: var(--grid);
+  padding: 0.1em 0.4em;
+  border-radius: 4px;
+  font-size: 0.85em;
+}
+
+.dropzone {
+  border: 1.5px dashed var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+  padding: 2rem 1.5rem;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+.dropzone:hover, .dropzone.drag {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 6%, var(--surface));
+}
+.dropzone input { display: none; }
+.dropzone .label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.95rem;
+  font-weight: 500;
+}
+.dropzone .hint {
+  color: var(--text-dim);
+  font-size: 0.8rem;
+  margin-top: 0.35rem;
+}
+
+#results { display: none; margin-top: 2rem; }
+#results.show { display: block; }
+
+.stats-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 1px;
+  background: var(--border);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  margin-bottom: 1.75rem;
+}
+.stat {
+  background: var(--surface);
+  padding: 1rem 1.1rem;
+}
+.stat .stat-label {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-dim);
+  font-weight: 500;
+}
+.stat .stat-value {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 1.4rem;
+  font-weight: 700;
+  margin-top: 0.25rem;
+  font-variant-numeric: tabular-nums;
+}
+.stat .stat-value.good { color: var(--good); }
+.stat .stat-value.warn { color: var(--warn); }
+.stat .stat-value.crit { color: var(--crit); }
+
+.verdict {
+  border-radius: 10px;
+  border: 1px solid var(--border);
+  background: var(--surface);
+  padding: 1rem 1.25rem;
+  margin-bottom: 1.75rem;
+  font-size: 0.9rem;
+  line-height: 1.6;
+  display: flex;
+  gap: 0.75rem;
+  align-items: flex-start;
+}
+.verdict .dot {
+  width: 10px; height: 10px; border-radius: 50%;
+  margin-top: 0.35rem;
+  flex-shrink: 0;
+}
+.verdict .dot.good { background: var(--good); }
+.verdict .dot.warn { background: var(--warn); }
+.verdict .dot.crit { background: var(--crit); }
+.verdict strong { font-family: 'JetBrains Mono', monospace; }
+
+.chart-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 1.25rem 1.25rem 1rem;
+  margin-bottom: 1.75rem;
+}
+.chart-card h2 {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.85rem;
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-dim);
+  margin: 0 0 1rem;
+}
+.chart-scroll { overflow-x: auto; }
+svg text { font-family: 'JetBrains Mono', monospace; }
+
+.legend {
+  display: flex;
+  gap: 1.25rem;
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  margin-top: 0.75rem;
+  flex-wrap: wrap;
+}
+.legend .item { display: flex; align-items: center; gap: 0.4rem; }
+.legend .swatch { width: 10px; height: 10px; border-radius: 2px; }
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.8rem;
+}
+th, td {
+  text-align: right;
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid var(--grid);
+  font-variant-numeric: tabular-nums;
+}
+th:first-child, td:first-child { text-align: left; }
+th {
+  color: var(--text-dim);
+  font-weight: 500;
+  text-transform: uppercase;
+  font-size: 0.68rem;
+  letter-spacing: 0.05em;
+}
+tr.spike td { color: var(--crit); font-weight: 700; }
+.table-scroll { max-height: 320px; overflow-y: auto; overflow-x: auto; border: 1px solid var(--border); border-radius: 10px; }
+.table-scroll table { margin: 0; }
+.table-scroll thead th { position: sticky; top: 0; background: var(--surface); }
+
+.reset-link {
+  display: inline-block;
+  margin-top: 1.5rem;
+  color: var(--accent);
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.8rem;
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+</style>
+
+<div class="wrap">
+  <h1>Frame Pacing Analyzer</h1>
+  <p class="subtitle">
+    Drop a <code>frame_timing_*.csv</code> from Braps (written to <code>C:\SavedRecordings</code> each time you stop a recording).
+    Total clip duration can be correct while individual frames are still spaced unevenly &mdash; this reads the actual
+    millisecond gap between every consecutive frame that was queued for encoding, so uneven pacing shows up directly
+    instead of being hidden inside an averaged frame rate.
+  </p>
+
+  <label class="dropzone" id="dropzone">
+    <input type="file" id="fileInput" accept=".csv">
+    <div class="label" id="dropLabel">Choose file or drag CSV here</div>
+    <div class="hint">frame_index, timestamp_ms, interval_ms</div>
+  </label>
+
+  <div id="results">
+    <div class="stats-row" id="statsRow"></div>
+    <div class="verdict" id="verdict"></div>
+
+    <div class="chart-card">
+      <h2>Inter-frame interval over time</h2>
+      <div class="chart-scroll"><svg id="chart" width="100%"></svg></div>
+      <div class="legend">
+        <div class="item"><span class="swatch" style="background:var(--good)"></span> within target &plusmn;15%</div>
+        <div class="item"><span class="swatch" style="background:var(--warn)"></span> drifting (15&ndash;50% over)</div>
+        <div class="item"><span class="swatch" style="background:var(--crit)"></span> spike (&gt;50% over target, or a drop)</div>
+      </div>
+    </div>
+
+    <div class="chart-card">
+      <h2>Worst frame-to-frame gaps</h2>
+      <div class="table-scroll">
+        <table id="spikeTable">
+          <thead><tr><th>Frame #</th><th>Timestamp (ms)</th><th>Interval (ms)</th><th>vs target</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </div>
+
+    <span class="reset-link" id="resetLink">&larr; load a different file</span>
+  </div>
+</div>
+
+<script>
+const dropzone = document.getElementById('dropzone');
+const fileInput = document.getElementById('fileInput');
+const dropLabel = document.getElementById('dropLabel');
+const results = document.getElementById('results');
+const statsRow = document.getElementById('statsRow');
+const verdict = document.getElementById('verdict');
+const resetLink = document.getElementById('resetLink');
+
+dropzone.addEventListener('click', () => fileInput.click());
+dropzone.addEventListener('dragover', e => { e.preventDefault(); dropzone.classList.add('drag'); });
+dropzone.addEventListener('dragleave', () => dropzone.classList.remove('drag'));
+dropzone.addEventListener('drop', e => {
+  e.preventDefault();
+  dropzone.classList.remove('drag');
+  if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+});
+fileInput.addEventListener('change', e => {
+  if (e.target.files.length) handleFile(e.target.files[0]);
+});
+resetLink.addEventListener('click', () => {
+  results.classList.remove('show');
+  dropLabel.textContent = 'Choose file or drag CSV here';
+  fileInput.value = '';
+});
+
+function handleFile(file) {
+  dropLabel.textContent = file.name;
+  const reader = new FileReader();
+  reader.onload = e => parseAndRender(e.target.result);
+  reader.readAsText(file);
+}
+
+function parseAndRender(text) {
+  const lines = text.trim().split(/\r?\n/);
+  const rows = lines.slice(1).map(line => {
+    const [idx, ts, interval] = line.split(',');
+    return { idx: +idx, ts: +ts, interval: +interval };
+  }).filter(r => !Number.isNaN(r.ts));
+
+  const intervals = rows.slice(1).map(r => r.interval);
+  if (intervals.length < 2) {
+    alert('Not enough frames in this log to analyze pacing.');
+    return;
+  }
+
+  const n = intervals.length;
+  const mean = intervals.reduce((a, b) => a + b, 0) / n;
+  const variance = intervals.reduce((a, b) => a + (b - mean) ** 2, 0) / n;
+  const stddev = Math.sqrt(variance);
+  const min = Math.min(...intervals);
+  const max = Math.max(...intervals);
+  const impliedFps = 1000 / mean;
+  const targetInterval = 1000 / Math.round(impliedFps);
+  const cov = stddev / mean; // coefficient of variation
+
+  renderStats({ mean, stddev, min, max, impliedFps, cov, n });
+  renderVerdict({ cov, max, targetInterval });
+  renderChart(rows, targetInterval);
+  renderSpikeTable(rows, targetInterval);
+
+  results.classList.add('show');
+}
+
+function sevClass(cov) {
+  if (cov < 0.15) return 'good';
+  if (cov < 0.40) return 'warn';
+  return 'crit';
+}
+
+function renderStats({ mean, stddev, min, max, impliedFps, cov, n }) {
+  const sev = sevClass(cov);
+  statsRow.innerHTML = `
+    <div class="stat"><div class="stat-label">Frames logged</div><div class="stat-value">${n + 1}</div></div>
+    <div class="stat"><div class="stat-label">Avg interval</div><div class="stat-value">${mean.toFixed(1)} ms</div></div>
+    <div class="stat"><div class="stat-label">Implied fps</div><div class="stat-value">${impliedFps.toFixed(1)}</div></div>
+    <div class="stat"><div class="stat-label">Min &rarr; max gap</div><div class="stat-value">${min}&ndash;${max} ms</div></div>
+    <div class="stat"><div class="stat-label">Jitter (stddev)</div><div class="stat-value ${sev}">&plusmn;${stddev.toFixed(1)} ms</div></div>
+    <div class="stat"><div class="stat-label">Variation coeff.</div><div class="stat-value ${sev}">${(cov * 100).toFixed(0)}%</div></div>
+  `;
+}
+
+function renderVerdict({ cov, max, targetInterval }) {
+  const sev = sevClass(cov);
+  const messages = {
+    good: `<strong>Pacing looks steady.</strong> Frame-to-frame gaps vary by less than 15% of the average &mdash; the choppiness you noticed likely isn't coming from capture cadence. Worth checking the encode step (CRF/preset) or the source content itself next.`,
+    warn: `<strong>Moderate jitter detected.</strong> Gaps between frames vary noticeably (15&ndash;40% coefficient of variation), with a worst gap of ${max} ms against a ${targetInterval.toFixed(1)} ms target. This is enough irregularity to read as stutter even though total duration matches wall-clock time.`,
+    crit: `<strong>Significant jitter detected.</strong> Frame spacing is highly irregular (&gt;40% coefficient of variation), worst gap ${max} ms vs a ${targetInterval.toFixed(1)} ms target. Encoding at one flat average fps compresses fast bursts and stretches slow ones into equal-length output frames &mdash; that mismatch is very likely what reads as choppy.`
+  };
+  verdict.innerHTML = `<span class="dot ${sev}"></span><span>${messages[sev]}</span>`;
+}
+
+function renderChart(rows, targetInterval) {
+  const svg = document.getElementById('chart');
+  const data = rows.slice(1);
+  const w = Math.max(700, data.length * 4);
+  const h = 220;
+  const padL = 50, padR = 16, padT = 12, padB = 28;
+  const plotW = w - padL - padR;
+  const plotH = h - padT - padB;
+
+  const maxVal = Math.max(...data.map(r => r.interval), targetInterval * 1.5);
+  const yScale = v => padT + plotH - (v / maxVal) * plotH;
+  const xScale = i => padL + (i / (data.length - 1)) * plotW;
+
+  const rootStyles = getComputedStyle(document.documentElement);
+  const gridColor = rootStyles.getPropertyValue('--grid').trim();
+  const textColor = rootStyles.getPropertyValue('--text-dim').trim();
+  const goodColor = rootStyles.getPropertyValue('--good').trim();
+  const warnColor = rootStyles.getPropertyValue('--warn').trim();
+  const critColor = rootStyles.getPropertyValue('--crit').trim();
+  const accentColor = rootStyles.getPropertyValue('--accent').trim();
+
+  let gridLines = '';
+  let yLabels = '';
+  const ySteps = 4;
+  for (let s = 0; s <= ySteps; s++) {
+    const val = (maxVal / ySteps) * s;
+    const y = yScale(val);
+    gridLines += `<line x1="${padL}" y1="${y}" x2="${w - padR}" y2="${y}" stroke="${gridColor}" stroke-width="1"/>`;
+    yLabels += `<text x="${padL - 8}" y="${y + 3}" fill="${textColor}" font-size="10" text-anchor="end">${val.toFixed(0)}</text>`;
+  }
+
+  const targetY = yScale(targetInterval);
+  const targetLine = `<line x1="${padL}" y1="${targetY}" x2="${w - padR}" y2="${targetY}" stroke="${accentColor}" stroke-width="1.5" stroke-dasharray="4,3"/>`;
+
+  let bars = '';
+  const barW = Math.max(1, plotW / data.length - 1);
+  data.forEach((r, i) => {
+    const ratio = r.interval / targetInterval;
+    let color = goodColor;
+    if (ratio > 1.5) color = critColor;
+    else if (ratio > 1.15) color = warnColor;
+    const x = xScale(i) - barW / 2;
+    const y = yScale(r.interval);
+    const barH = padT + plotH - y;
+    bars += `<rect x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${barW.toFixed(1)}" height="${Math.max(0.5, barH).toFixed(1)}" fill="${color}"><title>frame ${r.idx}: ${r.interval}ms</title></rect>`;
+  });
+
+  const xLabelCount = Math.min(8, data.length);
+  let xLabels = '';
+  for (let i = 0; i < xLabelCount; i++) {
+    const idx = Math.round((i / (xLabelCount - 1)) * (data.length - 1));
+    const x = xScale(idx);
+    xLabels += `<text x="${x}" y="${h - 8}" fill="${textColor}" font-size="10" text-anchor="middle">#${data[idx].idx}</text>`;
+  }
+
+  svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
+  svg.setAttribute('height', h);
+  svg.style.minWidth = w + 'px';
+  svg.innerHTML = `
+    ${gridLines}
+    ${targetLine}
+    ${bars}
+    ${yLabels}
+    ${xLabels}
+    <text x="${w - padR}" y="${targetY - 6}" fill="${accentColor}" font-size="10" text-anchor="end">target ${targetInterval.toFixed(1)}ms</text>
+  `;
+}
+
+function renderSpikeTable(rows, targetInterval) {
+  const data = rows.slice(1)
+    .map(r => ({ ...r, ratio: r.interval / targetInterval }))
+    .sort((a, b) => b.interval - a.interval)
+    .slice(0, 25);
+
+  const tbody = document.querySelector('#spikeTable tbody');
+  tbody.innerHTML = data.map(r => `
+    <tr class="${r.ratio > 1.5 ? 'spike' : ''}">
+      <td>${r.idx}</td>
+      <td>${r.ts}</td>
+      <td>${r.interval}</td>
+      <td>${r.ratio.toFixed(2)}&times;</td>
+    </tr>
+  `).join('');
+}
+</script>

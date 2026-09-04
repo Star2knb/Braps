@@ -1,0 +1,14 @@
+# Build output
+build/
+out/
+.vs/
+
+# Vendored FFmpeg binary (bundled locally; see README.md for setup)
+third_party/ffmpeg/
+
+# Original downloaded archive
+ffmpeg-2026-09-02-git-9fc8c785e2-full_build.7z
+
+# Runtime output directories (created next to the exe, not part of the project)
+/TempRecordings/
+/SavedRecordings/
