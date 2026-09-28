@@ -12,7 +12,8 @@ unchanged in [legacy/](legacy/) for reference; it is not part of the V2 build.
 |---|---|---|
 | RCV1 codec | M1 — scalar lossless YUV420 I-frame encoder/decoder, CLI, tests | done |
 | RCV1 codec | M2 — benchmark harness, compression report vs FRAPS | done — [report](docs/reports/M2-compression.md) |
-| RCV1 codec | M3 — SSE4.1/AVX2 kernels, faster Huffman | next |
+| RCV1 codec | M3 — SSE4.1/AVX2 kernels, faster Huffman | done — [report](docs/reports/M3-speed.md): encode 3.18 ms, decode 5.26 ms (1 thread) |
+| RCV1 codec | M4 — thread pool, slice-parallel encode/decode | next |
 | Recorder | M0 | not started |
 
 ## Build

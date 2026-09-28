@@ -60,7 +60,7 @@ format and BGRA output (M6), P-frames (M5), near-lossless (M7). `num_threads`, `
 `enable_skip` are accepted and ignored until M3–M5.
 
 **D-012 — Two-pass decode in M1.** Each chunk is entropy-decoded into a symbol buffer, then
-reconstructed. Simpler to validate; fusing the passes is an M3 optimisation.
+reconstructed. Simpler to validate; fusing the passes is an M3 optimisation. *(Superseded by D-023.)*
 
 **D-013 — `rcv_cli verify` compares bytes directly** (reports differing frames and max error per plane)
 instead of computing MD5s; it is a strictly stronger check for a round trip.
@@ -98,3 +98,35 @@ are run by FFmpeg with `-threads 1` on the raw corpus declared as `yuv420p` (no 
 NUT into ffprobe to collect per-frame packet sizes (`codec/bench/compare_baselines.ps1`). Their
 encode time is FFmpeg's user CPU time divided by frames, so it includes small demux/mux overhead
 and is approximate.
+
+## M3
+
+**D-019 — ISA levels and detection.** `rcv_encoder_create` resolves the level once: AUTO picks the
+best supported; an explicit level the machine can't run returns `RCV_ERR_UNSUPPORTED`. The AVX2
+level also requires BMI1/BMI2 (the AVX2-built Huffman writer emits `shrx`) and OS-saved YMM state
+(XGETBV). Addition to the API: `rcv_cpu_isa()`. `RCV_FORCE_ISA=scalar|sse41|avx2` is read only by
+the tests (whole suite re-runs at that level) and `rcv_cli` (when `--isa` is absent).
+
+**D-020 — ISA-specific code has internal linkage.** An inline function or template instantiated in a
+`/arch:AVX2` file can be picked by the linker (COMDAT folding) for baseline code and crash a
+non-AVX2 CPU. So SIMD files use only file-local helpers, and code compiled at two levels
+(`huff_write_impl.inl`) is included into each file inside an anonymous namespace. Kernels are only
+reached through function pointers chosen after CPUID.
+
+**D-021 — Encoder may scribble inside a chunk's RAW bound.** The fast writer stores 8 bytes at a
+time. It may write anywhere in `[chunk, chunk + 4 + align4(samples))` - a range that always lies in
+the packet buffer because every earlier chunk is at most its RAW bound - but never past it. Packet
+bytes are unaffected (identical to the reference writer); bytes of `out` beyond `packet_size` are
+unspecified.
+
+**D-022 — Huffman length limiting: same algorithm, faster.** The halving procedure of plan §5.6 /
+Appendix A.3 is unchanged and produces the same lengths; the keys are sorted once and retries
+re-order with an insertion sort.
+
+**D-023 — Decoder: fused, paired, deferred bounds check.** Entropy decoding and reconstruction run in
+one pass into the reference frame; neighbouring HUFFMAN chunks of a plane are decoded in lockstep
+(two independent dependency chains per core). MED is computed as
+`clamp(a + b - c, min(a,b), max(a,b))`, tested equal to the plan's select form for all 2^24 inputs.
+Past the end of a chunk the bit reader supplies zeros and its bit count goes negative - possible
+only after every byte has been loaded - and that is checked once per chunk, so the per-symbol path
+has no bounds branch. The reader never reads past the chunk; invalid streams are still rejected.
