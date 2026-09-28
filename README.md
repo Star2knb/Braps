@@ -13,7 +13,8 @@ unchanged in [legacy/](legacy/) for reference; it is not part of the V2 build.
 | RCV1 codec | M1 — scalar lossless YUV420 I-frame encoder/decoder, CLI, tests | done |
 | RCV1 codec | M2 — benchmark harness, compression report vs FRAPS | done — [report](docs/reports/M2-compression.md) |
 | RCV1 codec | M3 — SSE4.1/AVX2 kernels, faster Huffman | done — [report](docs/reports/M3-speed.md): encode 3.18 ms, decode 5.26 ms (1 thread) |
-| RCV1 codec | M4 — thread pool, slice-parallel encode/decode | next |
+| RCV1 codec | M4 — thread pool, slice-parallel encode/decode | done — [report](docs/reports/M4-threads.md): encode 1.60 ms, decode 2.87 ms (2 threads) |
+| RCV1 codec | M5 — temporal skip (P-frames), auto-DUP, keyframe logic | next |
 | Recorder | M0 | not started |
 
 ## Build
@@ -37,7 +38,7 @@ Raw input is planar I420 (`ffmpeg ... -pix_fmt yuv420p -f rawvideo out.yuv`).
 Test corpora live in `corpus/` (git-ignored). From a FRAPS recording:
 ```
 ffmpeg -i "Minecraft ....avi" -an -f rawvideo -pix_fmt yuvj420p corpus\minecraft_1360x744.yuv
-build\release\codec\rcv_bench.exe -i corpus\minecraft_1360x744.yuv -s 1360x744 --predictor both
+build\release\codec\rcv_bench.exe -i corpus\minecraft_1360x744.yuv -s 1360x744 --predictor both --threads 1,2
 powershell -File codec\bench\compare_baselines.ps1 -Yuv corpus\minecraft_1360x744.yuv -Size 1360x744 -Fraps "Minecraft ....avi"
 ```
 `rcv_bench` pins itself to one CPU and prints the machine's power state; run on AC power.

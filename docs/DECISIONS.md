@@ -130,3 +130,38 @@ one pass into the reference frame; neighbouring HUFFMAN chunks of a plane are de
 Past the end of a chunk the bit reader supplies zeros and its bit count goes negative - possible
 only after every byte has been loaded - and that is checked once per chunk, so the per-symbol path
 has no bounds branch. The reader never reads past the chunk; invalid streams are still rejected.
+
+## M4
+
+**D-024 — Thread pool.** `num_threads - 1` persistent workers per encoder/decoder plus the calling
+thread (plan §8). A dispatch is published as one 64-bit state word: generation (32 bits), job count
+(16), next index (16); a job is claimed by compare-exchange on that word, and the index is checked
+against the count *from the same word*. Workers spin ~2 µs, then sleep with C++20 `atomic::wait`;
+the caller waits only for jobs to finish, never for idle workers, so a worker the game has pushed
+off the CPU cannot stall a frame. No allocation per dispatch.
+*Bug found and fixed during M4:* the first version kept the job count in a separate atomic. A worker
+late for dispatch g could read g's final state word, then the *next* dispatch's larger count
+(published just before its state word), and successfully claim a non-existent index of g - running
+a bogus job and decrementing the next dispatch's `remaining`, which then never reached zero
+(deadlock). It surfaced only in a repeated run at lower priority; the pool test now alternates
+tiny/large dispatches 20,000 times per thread count with jobs that yield, and ctest has a timeout.
+
+**D-025 — Encoder jobs.** One job per (plane, slice), luma first: it copies its own input rows into
+the reference, predicts and entropy-codes into a private scratch buffer the size of its RAW bound,
+using a per-worker residual buffer. The caller then writes the directory and copies the chunks in
+fixed order, so packets are identical for any thread count (A3). With a stage profiler attached,
+stage times are CPU time summed over workers; `total` is wall time.
+
+**D-026 — Decoder jobs.** One job per pair of neighbouring HUFFMAN chunks (M3's lockstep decode), or
+per single chunk otherwise, luma first; two decode tables per worker. If several jobs fail, the
+first failure in job order is reported, so errors don't depend on scheduling either.
+
+**D-027 — Thread counts.** 0 = auto: 2 if the machine has >= 4 logical CPUs, else 1 (plan §7); capped
+at 32. Applies to both `rcv_encoder_config::num_threads` and `rcv_decoder_create`. The codec never
+changes thread priority or affinity itself; `on_worker_start` lets the caller do it (encoder only).
+`RCV_FORCE_THREADS=N` re-runs the test suite with N encoder threads.
+
+**D-028 — Second corpus: Warframe.** FRAPS recording, 1280x720 `yuvj420p`, 60 fps, 791 packets
+(446 real, 345 duplicate). Noisy, detailed content (FRAPS 1.58:1), as plan §11.2 asks. FFmpeg
+decodes 790 frames (it drops one trailing duplicate). The comparison script now names its output
+files per corpus (`<corpus>.sizes_*.txt`).
