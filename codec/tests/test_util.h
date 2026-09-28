@@ -88,10 +88,23 @@ inline rcv_isa forced_isa() {
     return isa;
 }
 
+// RCV_FORCE_THREADS=N re-runs the whole suite with N encoder threads (default: auto).
+inline uint8_t forced_threads() {
+    char* v = nullptr;
+    size_t len = 0;
+    int n = 0;
+    if (_dupenv_s(&v, &len, "RCV_FORCE_THREADS") == 0 && v) {
+        n = std::atoi(v);
+        std::free(v);
+    }
+    return uint8_t(n < 0 ? 0 : n > 32 ? 32 : n);
+}
+
 inline rcv_encoder_config config_for(int w, int h, int predictor = 1, int slices = 0) {
     rcv_encoder_config c;
     rcv_encoder_config_init(&c);
     c.isa = forced_isa();
+    c.num_threads = forced_threads();
     c.coded_width = uint16_t(w);
     c.coded_height = uint16_t(h);
     c.predictor = uint8_t(predictor);

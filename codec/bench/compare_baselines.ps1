@@ -40,6 +40,7 @@ $ffprobe = Find-Tool 'ffprobe'
 
 $Yuv = (Resolve-Path $Yuv).Path
 $work = Split-Path -Parent $Yuv
+$tag = [IO.Path]::GetFileNameWithoutExtension($Yuv)  # per-corpus file names, so runs don't overwrite each other
 $w, $h = $Size.Split('x') | ForEach-Object { [int]$_ }
 $frameBytes = $w * $h * 3 / 2
 $frames = [long]((Get-Item $Yuv).Length / $frameBytes)
@@ -76,22 +77,22 @@ function Get-FfmpegSizes([string] $label, [string] $codecArgs, [string] $file) {
 $compare = @()
 if ($Fraps) {
     $Fraps = (Resolve-Path $Fraps).Path
-    $file = Join-Path $work 'sizes_fraps.txt'
+    $file = Join-Path $work "$tag.sizes_fraps.txt"
     & $ffprobe -v error -select_streams v:0 -show_entries packet=size -of csv=p=0 $Fraps |
         Set-Content -Path $file -Encoding ASCII
     $compare += "FRAPS=$file"
 }
-$ut = Join-Path $work 'sizes_utvideo.txt'
+$ut = Join-Path $work "$tag.sizes_utvideo.txt"
 Get-FfmpegSizes 'Ut Video' '-c:v utvideo -pred median' $ut
 $compare += "Ut Video (median, 1 thread)=$ut"
-$ffv1 = Join-Path $work 'sizes_ffv1.txt'
+$ffv1 = Join-Path $work "$tag.sizes_ffv1.txt"
 Get-FfmpegSizes 'FFV1' '-c:v ffv1 -level 3' $ffv1
 $compare += "FFV1 level 3 (1 thread)=$ffv1"
 
 Write-Host "Running rcv_bench ..."
 $benchArgList = @('-i', $Yuv, '-s', $Size, '-r', "$Fps") + $BenchArgs.Split(' ', [StringSplitOptions]::RemoveEmptyEntries)
 foreach ($c in $compare) { $benchArgList += @('--compare', $c) }
-$csv = Join-Path $work 'bench_frames.csv'
+$csv = Join-Path $work "$tag.bench_frames.csv"
 $benchArgList += @('--csv', $csv)
 # rcv_bench prints progress on stderr. In Windows PowerShell 5.1, with 'Stop' in effect and stderr
 # redirected by the caller, those lines would become terminating errors - so relax it for this call

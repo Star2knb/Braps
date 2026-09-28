@@ -9,6 +9,7 @@ set(RCV_SOURCES
     src/predict_sse41.cpp
     src/predict_avx2.cpp
     src/crc32c.cpp
+    src/threadpool.cpp
     src/encoder.cpp
     src/decoder.cpp
 )
@@ -44,9 +45,11 @@ add_executable(rcv_tests
     tests/test_errors.cpp
     tests/test_windows_h.cpp
     tests/test_simd.cpp
+    tests/test_threads.cpp
 )
 # Tests exercise internal kernels too, so they see the private headers.
 target_include_directories(rcv_tests PRIVATE src)
 target_link_libraries(rcv_tests PRIVATE rcv)
 
 add_test(NAME rcv_tests COMMAND rcv_tests)
+set_tests_properties(rcv_tests PROPERTIES TIMEOUT 600)  # a threading deadlock fails instead of hanging

@@ -35,7 +35,7 @@ void usage() {
     std::fprintf(stderr,
                  "usage: rcv_bench -i corpus.yuv -s WxH [-r FPS] [--frames N]\n"
                  "                 [--predictor med|left|both] [--slices 8[,1,...]] (0 = auto)\n"
-                 "                 [--isa auto|scalar|sse41|avx2|all[,...]]\n"
+                 "                 [--isa auto|scalar|sse41|avx2|all[,...]] [--threads 1[,2,...]]\n"
                  "                 [--cpu N | --cpu -1] [--no-verify] [--csv frames.csv]\n"
                  "                 [--compare NAME=sizes.txt]...\n"
                  "sizes.txt: one packet size per line, in frame order ('# enc_ms=X' line optional).\n");
@@ -49,6 +49,7 @@ struct Options {
     std::vector<int> predictors{1};
     std::vector<int> slices{8};
     std::vector<rcv_isa> isas{RCV_ISA_AUTO};
+    std::vector<int> threads{1};
     int cpu = -2;  // -2: last logical CPU, -1: no pinning
     bool verify = true;
     std::vector<std::pair<std::string, std::string>> compare;
@@ -87,6 +88,7 @@ bool parse_options(int argc, char** argv, Options* o) {
             else if (v == "both") o->predictors = {1, 0};
             else return false;
         } else if (k == "--slices") o->slices = parse_int_list(v);
+        else if (k == "--threads") o->threads = parse_int_list(v);
         else if (k == "--isa") {
             o->isas.clear();
             size_t pos = 0;
@@ -279,9 +281,38 @@ bool load_sizes(const std::string& name, const std::string& path, Series* s) {
 
 // ---------------------------------------------------------------- RCV1 runs
 
+// Logical CPUs for the bench thread (worker 0) and encoder workers 1..n-1: the bench CPU first,
+// then one per other physical core (Windows numbers hyper-thread siblings adjacently, so stepping
+// by 2 changes core), then the siblings. On a 2C/4T CPU with the bench on 3: 3, 1, 2, 0.
+struct PinPlan {
+    int cpus[64];
+    int count = 0;
+};
+
+PinPlan make_pin_plan(int first, int logical) {
+    PinPlan plan;
+    if (first < 0) return plan;
+    for (int parity = 0; parity < 2; ++parity)
+        for (int k = 0; k < logical && plan.count < 64; k += 2) {
+            const int c = ((first - parity - k) % logical + logical) % logical;
+            bool seen = false;
+            for (int i = 0; i < plan.count; ++i) seen |= plan.cpus[i] == c;
+            if (!seen) plan.cpus[plan.count++] = c;
+        }
+    return plan;
+}
+
+// rcv_encoder_config::on_worker_start: pin encoder worker `worker` like the bench thread.
+void pin_worker(void* user, int worker) {
+    const PinPlan* plan = static_cast<const PinPlan*>(user);
+    if (worker < plan->count) SetThreadAffinityMask(GetCurrentThread(), DWORD_PTR(1) << plan->cpus[worker]);
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+}
+
 class RcvRun {
 public:
-    RcvRun(int w, int h, double fps, int predictor, int slices, rcv_isa isa) : w_(w), h_(h) {
+    RcvRun(int w, int h, double fps, int predictor, int slices, rcv_isa isa, int threads, const PinPlan* pins)
+        : w_(w), h_(h), threads_(threads) {
         rcv_encoder_config_init(&cfg_);
         cfg_.coded_width = uint16_t(w);
         cfg_.coded_height = uint16_t(h);
@@ -290,11 +321,18 @@ public:
         cfg_.predictor = uint8_t(predictor);
         cfg_.num_slices = uint8_t(slices);
         cfg_.isa = isa;
+        cfg_.num_threads = uint8_t(threads);
+        if (pins && pins->count) {
+            cfg_.on_worker_start = pin_worker;
+            cfg_.user = const_cast<PinPlan*>(pins);
+        }
         static const char* kIsa[] = {"auto", "scalar", "SSE4.1", "AVX2"};
         const rcv_isa shown = isa == RCV_ISA_AUTO ? rcv_cpu_isa() : isa;
         series.name = std::string("RCV1 ") + (predictor ? "MED" : "LEFT") +
-                      (slices ? " S=" + std::to_string(slices) : std::string(" S=auto")) + " " + kIsa[shown];
+                      (slices ? " S=" + std::to_string(slices) : std::string(" S=auto")) + " " + kIsa[shown] +
+                      " T=" + std::to_string(threads);
     }
+    int threads() const { return threads_; }
     ~RcvRun() {
         rcv_encoder_destroy(enc_);
         rcv_decoder_destroy(dec_);
@@ -307,7 +345,7 @@ public:
         if (st != RCV_OK) return st;
         uint8_t seq[32];
         rcv_write_sequence_header(&cfg_, seq);
-        st = rcv_decoder_create(seq, 1, &dec_);
+        st = rcv_decoder_create(seq, uint8_t(threads_), &dec_);  // decoder workers are not pinned
         if (st != RCV_OK) return st;
         rcv::set_stage_profile(enc_, &series.stages);
         pkt_.resize(rcv_max_packet_size(&cfg_));
@@ -355,7 +393,7 @@ public:
     Series series;
 
 private:
-    int w_, h_;
+    int w_, h_, threads_;
     rcv_encoder_config cfg_{};
     rcv_encoder* enc_ = nullptr;
     rcv_decoder* dec_ = nullptr;
@@ -363,12 +401,12 @@ private:
 };
 
 void print_stage_table(const std::vector<std::unique_ptr<RcvRun>>& runs) {
-    std::printf("\nEncoder stage breakdown (mean ms per coded frame, single thread):\n\n");
+    std::printf("\nEncoder stage breakdown (mean ms per coded frame, single-thread runs only):\n\n");
     std::printf("| Config | load | predict + histogram | table build | entropy write | other | total |\n");
     std::printf("|---|---|---|---|---|---|---|\n");
     for (const auto& r : runs) {
         const rcv::StageTimes& t = r->series.stages;
-        if (!t.frames) continue;
+        if (!t.frames || r->threads() != 1) continue;  // with threads, stage times are summed CPU time
         const double k = 1e-6 / double(t.frames);
         const double other = double(t.total_ns - t.load_ns - t.predict_ns - t.table_ns - t.entropy_ns);
         std::printf("| %s | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f |\n", r->series.name.c_str(), t.load_ns * k,
@@ -396,18 +434,20 @@ int main(int argc, char** argv) {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
     const CpuClock clk_before = cpu_clock();
 
+    const PinPlan pins = make_pin_plan(cpu, int(logical));
     std::vector<std::unique_ptr<RcvRun>> runs;
     for (int p : opt.predictors)
         for (int s : opt.slices)
-            for (rcv_isa isa : opt.isas) {
-                auto r = std::make_unique<RcvRun>(opt.w, opt.h, opt.fps, p, s, isa);
-                const rcv_status st = r->init();
-                if (st != RCV_OK) {
-                    std::fprintf(stderr, "%s: init failed: %s\n", r->series.name.c_str(), rcv_status_string(st));
-                    return 1;
+            for (rcv_isa isa : opt.isas)
+                for (int t : opt.threads) {
+                    auto r = std::make_unique<RcvRun>(opt.w, opt.h, opt.fps, p, s, isa, t, &pins);
+                    const rcv_status st = r->init();
+                    if (st != RCV_OK) {
+                        std::fprintf(stderr, "%s: init failed: %s\n", r->series.name.c_str(), rcv_status_string(st));
+                        return 1;
+                    }
+                    runs.push_back(std::move(r));
                 }
-                runs.push_back(std::move(r));
-            }
     std::vector<Series> externals(opt.compare.size());
     for (size_t i = 0; i < opt.compare.size(); ++i)
         if (!load_sizes(opt.compare[i].first, opt.compare[i].second, &externals[i])) return 1;
@@ -455,7 +495,8 @@ int main(int argc, char** argv) {
     std::printf("- Machine: %s, %lu logical CPUs, %s; Windows-reported clock %lu/%lu MHz before, %lu MHz after\n",
                 cpu_brand().c_str(), logical, power_state().c_str(), clk_before.current, clk_before.max,
                 clk_after.current);
-    std::printf("- Build: %s, MSVC %d; bench thread %s, priority HIGHEST; RCV1 uses 1 thread\n",
+    std::printf("- Build: %s, MSVC %d; bench thread %s, priority HIGHEST; encoder workers pinned to further "
+                "physical cores first (T = encoder and decoder threads)\n",
 #ifdef NDEBUG
                 "Release",
 #else

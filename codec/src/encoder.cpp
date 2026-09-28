@@ -1,6 +1,7 @@
-// RCV1 encoder (codec plan §5, §6, §7).
-// Scope so far: single-threaded, lossless YUV420 I-frames plus DUP packets; residual kernels
-// dispatched by CPU (scalar / SSE4.1 / AVX2, all byte-identical).
+// RCV1 encoder (codec plan §5, §6, §7, §8).
+// Scope so far: lossless YUV420 I-frames plus DUP packets. Each (plane, slice) chunk is one job on
+// the thread pool; residual kernels are dispatched by CPU (scalar / SSE4.1 / AVX2). Output is
+// byte-identical for every thread count and kernel level.
 #include <chrono>
 #include <cstring>
 #include <new>
@@ -13,17 +14,17 @@
 #include "predict.h"
 #include "profile.h"
 #include "rcv/rcv.h"
+#include "threadpool.h"
 
 using namespace rcv;
 
 struct rcv_encoder {
-    rcv_encoder_config cfg;   // with defaults resolved
+    rcv_encoder_config cfg;   // with defaults resolved (num_threads = actual count)
     Geometry geo;
     uint8_t colour;
     uint8_t* ref_mem;         // reference frame = last reconstructed frame (§5.7)
     uint8_t* ref_plane[3];
     ptrdiff_t ref_stride[3];
-    uint8_t* resid;           // residual symbols of one chunk
     size_t max_packet;
     uint32_t frame_number;
     uint32_t frames_since_i;
@@ -32,6 +33,16 @@ struct rcv_encoder {
     ResidualFn residuals;
     HuffWriteFn huff_write;
     StageTimes* prof;         // optional, rcv_bench only
+
+    // Threading (§8). Every buffer below is allocated in rcv_encoder_create.
+    ThreadPool pool;
+    uint8_t* resid_mem;
+    uint8_t* resid[kMaxThreads];          // per worker: residual symbols of the chunk being coded
+    uint8_t* chunk_mem;
+    uint8_t* chunk_buf[3 * kMaxSlices];   // per job: the coded chunk, sized for its RAW bound
+    size_t chunk_size[3 * kMaxSlices];
+    StageTimes worker_prof[kMaxThreads];  // per worker, merged into *prof after each frame
+    const rcv_frame_in* job_in;           // input of the frame being encoded
 };
 
 void rcv::set_stage_profile(rcv_encoder* enc, StageTimes* sink) {
@@ -70,34 +81,38 @@ rcv_encoder_config resolve_defaults(const rcv_encoder_config& c) {
     return r;
 }
 
-// Copies the input into the reference buffer (source == reconstruction when lossless).
-rcv_status load_input(rcv_encoder* e, const rcv_frame_in* in) {
+// Checked on the calling thread before any job runs.
+rcv_status validate_input(const rcv_encoder* e, const rcv_frame_in* in) {
     const Geometry& g = e->geo;
     if (e->cfg.input_layout == RCV_IN_I420) {
         for (int p = 0; p < 3; ++p)
             if (!in->plane[p] || in->stride[p] < g.plane_w[p]) return RCV_ERR_INVALID_ARG;
-        for (int p = 0; p < 3; ++p)
-            for (int y = 0; y < g.plane_h[p]; ++y)
-                std::memcpy(e->ref_plane[p] + y * e->ref_stride[p],
-                            in->plane[p] + ptrdiff_t(y) * in->stride[p], size_t(g.plane_w[p]));
         return RCV_OK;
     }
     // NV12: Y plane + interleaved CbCr plane (width bytes per chroma row).
     if (!in->plane[0] || !in->plane[1] || in->stride[0] < g.width || in->stride[1] < g.width)
         return RCV_ERR_INVALID_ARG;
-    for (int y = 0; y < g.plane_h[0]; ++y)
-        std::memcpy(e->ref_plane[0] + y * e->ref_stride[0], in->plane[0] + ptrdiff_t(y) * in->stride[0],
-                    size_t(g.plane_w[0]));
-    for (int y = 0; y < g.plane_h[1]; ++y) {
-        const uint8_t* uv = in->plane[1] + ptrdiff_t(y) * in->stride[1];
-        uint8_t* u = e->ref_plane[1] + y * e->ref_stride[1];
-        uint8_t* v = e->ref_plane[2] + y * e->ref_stride[2];
-        for (int x = 0; x < g.plane_w[1]; ++x) {
-            u[x] = uv[2 * x];
-            v[x] = uv[2 * x + 1];
-        }
-    }
     return RCV_OK;
+}
+
+// Copies rows [r0, r1) of plane p from the input into the reference buffer (source ==
+// reconstruction when lossless). Each job copies only its own slice's rows.
+void copy_rows(rcv_encoder* e, const rcv_frame_in* in, int p, int r0, int r1) {
+    const int w = e->geo.plane_w[p];
+    uint8_t* dst = e->ref_plane[p];
+    const ptrdiff_t ds = e->ref_stride[p];
+    if (e->cfg.input_layout == RCV_IN_I420 || p == 0) {
+        const uint8_t* src = in->plane[p];
+        for (int y = r0; y < r1; ++y) std::memcpy(dst + y * ds, src + ptrdiff_t(y) * in->stride[p], size_t(w));
+        return;
+    }
+    // NV12 chroma: Cb = even bytes, Cr = odd bytes of the interleaved plane.
+    const int k = p - 1;
+    for (int y = r0; y < r1; ++y) {
+        const uint8_t* uv = in->plane[1] + ptrdiff_t(y) * in->stride[1];
+        uint8_t* d = dst + y * ds;
+        for (int x = 0; x < w; ++x) d[x] = uv[2 * x + k];
+    }
 }
 
 ResidualFn residual_kernel(rcv_isa isa) {
@@ -108,10 +123,9 @@ ResidualFn residual_kernel(rcv_isa isa) {
     }
 }
 
-// Writes one chunk (§6.4) and returns its size (a multiple of 4).
-// The whole RAW bound [out, out + 4 + align4(count)) belongs to this chunk: chunks are written in
-// order and each is at most its RAW bound, so this range always lies inside the packet buffer.
-// Bytes past the returned size may be scribbled on; the next chunk overwrites them.
+// Writes one chunk (§6.4) into `out` and returns its size (a multiple of 4).
+// `out` is the job's own scratch buffer of the chunk's RAW bound, 4 + align4(count) bytes; bytes
+// past the returned size may be scribbled on (they are never copied into the packet).
 size_t encode_chunk(uint8_t* out, const uint8_t* syms, size_t count, const uint32_t hist[256], HuffWriteFn write,
                     StageTimer& timer) {
     std::memset(out, 0, kChunkHeaderSize);
@@ -161,6 +175,24 @@ size_t encode_chunk(uint8_t* out, const uint8_t* syms, size_t count, const uint3
     std::memset(bitstream + n, 0, align4(n) - n);
     timer.lap(&StageTimes::entropy_ns);
     return huff_size;
+}
+
+// One job = one (plane, slice) chunk: copy its rows, predict, entropy-code into its own scratch
+// buffer. Job j is plane j / S, slice j % S, so the big luma chunks are claimed first (§8).
+// Jobs touch disjoint rows of the reference and never read another slice's rows (§4.6).
+void encode_job(void* ctx, int job, int worker) {
+    rcv_encoder* e = static_cast<rcv_encoder*>(ctx);
+    const Geometry& g = e->geo;
+    const int S = g.num_slices, pl = job / S, s = job % S;
+    const int r0 = g.slice_row(pl, s), r1 = g.slice_row(pl, s + 1);
+    StageTimer timer(e->prof ? &e->worker_prof[worker] : nullptr);
+    copy_rows(e, e->job_in, pl, r0, r1);
+    timer.lap(&StageTimes::load_ns);
+    uint32_t hist[256] = {};
+    const size_t n = e->residuals(e->ref_plane[pl], e->ref_stride[pl], g.plane_w[pl], r0, r1, e->cfg.predictor,
+                                  e->resid[worker], hist);
+    timer.lap(&StageTimes::predict_ns);
+    e->chunk_size[job] = encode_chunk(e->chunk_buf[job], e->resid[worker], n, hist, e->huff_write, timer);
 }
 
 void fill_info(rcv_frame_info* info, uint32_t size, uint8_t type, uint32_t blocks_total,
@@ -230,10 +262,12 @@ rcv_status rcv_encoder_create(const rcv_encoder_config* cfg, rcv_encoder** out) 
 
     rcv_encoder* e = new (std::nothrow) rcv_encoder{};
     if (!e) return RCV_ERR_OUT_OF_MEMORY;
+    const int threads = resolve_thread_count(cfg->num_threads);
     e->isa = isa;
     e->residuals = residual_kernel(isa);
     e->huff_write = isa == RCV_ISA_AVX2 ? huff_write_avx2 : huff_write_scalar;
     e->cfg = resolve_defaults(*cfg);
+    e->cfg.num_threads = uint8_t(threads);
     e->geo = g;
     e->colour = pack_colour(e->cfg.colour_matrix, e->cfg.full_range, 0);
     e->max_packet = max_packet_size(g);
@@ -243,9 +277,15 @@ rcv_status rcv_encoder_create(const rcv_encoder_config* cfg, rcv_encoder** out) 
         e->ref_stride[p] = ptrdiff_t(align64(size_t(g.plane_w[p])));
         total += size_t(e->ref_stride[p]) * size_t(g.plane_h[p]);
     }
+    const size_t resid_each = align64(max_chunk_samples(g));
+    const int jobs = 3 * g.num_slices;
+    size_t chunk_total = 0;
+    for (int j = 0; j < jobs; ++j)
+        chunk_total += align64(kChunkHeaderSize + align4(g.chunk_samples(j / g.num_slices, j % g.num_slices)));
     e->ref_mem = static_cast<uint8_t*>(aligned_alloc64(total));
-    e->resid = static_cast<uint8_t*>(aligned_alloc64(align64(max_chunk_samples(g))));
-    if (!e->ref_mem || !e->resid) {
+    e->resid_mem = static_cast<uint8_t*>(aligned_alloc64(resid_each * size_t(threads)));
+    e->chunk_mem = static_cast<uint8_t*>(aligned_alloc64(chunk_total));
+    if (!e->ref_mem || !e->resid_mem || !e->chunk_mem) {
         rcv_encoder_destroy(e);
         return RCV_ERR_OUT_OF_MEMORY;
     }
@@ -255,14 +295,26 @@ rcv_status rcv_encoder_create(const rcv_encoder_config* cfg, rcv_encoder** out) 
         e->ref_plane[i] = p;
         p += size_t(e->ref_stride[i]) * size_t(g.plane_h[i]);
     }
+    for (int w = 0; w < threads; ++w) e->resid[w] = e->resid_mem + resid_each * size_t(w);
+    uint8_t* c = e->chunk_mem;
+    for (int j = 0; j < jobs; ++j) {
+        e->chunk_buf[j] = c;
+        c += align64(kChunkHeaderSize + align4(g.chunk_samples(j / g.num_slices, j % g.num_slices)));
+    }
+    if (!e->pool.start(threads, cfg->on_worker_start, cfg->user)) {
+        rcv_encoder_destroy(e);
+        return RCV_ERR_OUT_OF_MEMORY;
+    }
     *out = e;
     return RCV_OK;
 }
 
 void rcv_encoder_destroy(rcv_encoder* e) {
     if (!e) return;
+    e->pool.stop();
     aligned_free64(e->ref_mem);
-    aligned_free64(e->resid);
+    aligned_free64(e->resid_mem);
+    aligned_free64(e->chunk_mem);
     delete e;
 }
 
@@ -275,27 +327,26 @@ rcv_status rcv_encode_frame(rcv_encoder* e, const rcv_frame_in* in, const rcv_en
     if (near_level > 3) return RCV_ERR_INVALID_ARG;
     if (near_level != 0) return RCV_ERR_UNSUPPORTED;  // M7
 
-    StageTimer timer(e->prof);
-    rcv_status st = load_input(e, in);
+    const rcv_status st = validate_input(e, in);
     if (st != RCV_OK) return st;
-    timer.lap(&StageTimes::load_ns);
 
-    // M1: every coded frame is an I-frame (temporal skip / P-frames arrive in M5).
+    // Phase B (§5.1): every chunk in parallel, each into its own scratch buffer.
+    // Temporal skip (phase A) and P-frames arrive in M5; for now every coded frame is an I-frame.
     const Geometry& g = e->geo;
     const int S = g.num_slices;
+    const int jobs = 3 * S;
+    e->job_in = in;
+    e->pool.run(encode_job, e, jobs);
+    e->job_in = nullptr;
+
+    // Assembly in fixed order, so the packet never depends on scheduling (A3).
     uint8_t* payload = out + kFrameHeaderSize;
     uint8_t* dir = payload;
-    uint8_t* p = dir + size_t(3) * size_t(S) * 4;
-    for (int pl = 0; pl < 3; ++pl) {
-        for (int s = 0; s < S; ++s) {
-            uint32_t hist[256] = {};
-            const size_t n = e->residuals(e->ref_plane[pl], e->ref_stride[pl], g.plane_w[pl], g.slice_row(pl, s),
-                                          g.slice_row(pl, s + 1), e->cfg.predictor, e->resid, hist);
-            timer.lap(&StageTimes::predict_ns);
-            const size_t cs = encode_chunk(p, e->resid, n, hist, e->huff_write, timer);
-            put_u32(dir + 4 * (size_t(pl) * size_t(S) + size_t(s)), uint32_t(cs));
-            p += cs;
-        }
+    uint8_t* p = dir + size_t(jobs) * 4;
+    for (int j = 0; j < jobs; ++j) {
+        put_u32(dir + 4 * size_t(j), uint32_t(e->chunk_size[j]));
+        std::memcpy(p, e->chunk_buf[j], e->chunk_size[j]);
+        p += e->chunk_size[j];
     }
     const size_t payload_size = size_t(p - payload);
 
@@ -319,6 +370,15 @@ rcv_status rcv_encode_frame(rcv_encoder* e, const rcv_frame_in* in, const rcv_en
     e->frame_number++;
 
     if (e->prof) {
+        // Stage times are CPU time summed over workers; total is wall-clock time.
+        for (int w = 0; w < e->pool.threads(); ++w) {
+            StageTimes& wp = e->worker_prof[w];
+            e->prof->load_ns += wp.load_ns;
+            e->prof->predict_ns += wp.predict_ns;
+            e->prof->table_ns += wp.table_ns;
+            e->prof->entropy_ns += wp.entropy_ns;
+            wp = StageTimes{};
+        }
         e->prof->total_ns +=
             uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0).count());
         e->prof->frames++;

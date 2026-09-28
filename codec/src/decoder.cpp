@@ -1,7 +1,7 @@
-// RCV1 decoder (codec plan §5.7, §6, Appendix A.2).
-// Scope so far: single-threaded; I-frames and DUP; I420 / NV12 output.
-// Entropy decoding and reconstruction run fused in one serial pass per chunk (the decoder is
-// inherently serial along a row, §5.4).
+// RCV1 decoder (codec plan §5.7, §6, §8, Appendix A.2).
+// Scope so far: I-frames and DUP; I420 / NV12 output. Chunks are decoded in parallel on the thread
+// pool; within a chunk, entropy decoding and reconstruction run fused in one serial pass (the
+// decoder is inherently serial along a row, §5.4).
 // The decoder must never crash on bad input: every length is checked before use (§6.5).
 #include <stdlib.h>  // _byteswap_uint64
 
@@ -15,8 +15,23 @@
 #include "huffman.h"
 #include "predict.h"
 #include "rcv/rcv.h"
+#include "threadpool.h"
 
 using namespace rcv;
+
+namespace {
+
+// One unit of decoder work: a single chunk, or two neighbouring HUFFMAN chunks of a plane decoded
+// in lockstep. `chunk` points at the first chunk; the second (if any) follows it directly.
+struct DecodeJob {
+    const uint8_t* chunk;
+    uint32_t size[2];
+    int plane;
+    int slice;
+    int count;  // 1 or 2
+};
+
+}  // namespace
 
 struct rcv_decoder {
     SeqHeader seq;
@@ -24,8 +39,15 @@ struct rcv_decoder {
     uint8_t* ref_mem;
     uint8_t* ref_plane[3];
     ptrdiff_t ref_stride[3];
-    HuffDecTable lut[2];       // two, for decoding a pair of chunks in lockstep
     bool has_ref;
+
+    // Threading (§8). Allocated in rcv_decoder_create.
+    ThreadPool pool;
+    HuffDecTable* luts;        // two per worker (a pair of chunks in lockstep)
+    DecodeJob jobs[3 * kMaxSlices];
+    rcv_status job_status[3 * kMaxSlices];
+    Geometry frame_geo;        // geometry of the frame being decoded (slice count from its header)
+    int frame_predictor;
 };
 
 namespace {
@@ -211,13 +233,13 @@ rcv_status close_huffman(const HuffSource& src, size_t size) {
 }
 
 // Decodes two neighbouring HUFFMAN chunks (slices s and s+1 of one plane) in lockstep.
-rcv_status decode_huffman_pair(rcv_decoder* d, const uint8_t* ca, size_t size_a, const uint8_t* cb, size_t size_b,
-                               int plane, const Geometry& g, int s, int predictor) {
+rcv_status decode_huffman_pair(rcv_decoder* d, HuffDecTable* luts, const uint8_t* ca, size_t size_a,
+                               const uint8_t* cb, size_t size_b, int plane, const Geometry& g, int s, int predictor) {
     if (!chunk_header_ok(ca, size_a) || !chunk_header_ok(cb, size_b)) return RCV_ERR_BITSTREAM;
     HuffSource a, b;
-    rcv_status st = open_huffman(ca, size_a, g.chunk_samples(plane, s), &d->lut[0], &a);
+    rcv_status st = open_huffman(ca, size_a, g.chunk_samples(plane, s), &luts[0], &a);
     if (st != RCV_OK) return st;
-    st = open_huffman(cb, size_b, g.chunk_samples(plane, s + 1), &d->lut[1], &b);
+    st = open_huffman(cb, size_b, g.chunk_samples(plane, s + 1), &luts[1], &b);
     if (st != RCV_OK) return st;
     reconstruct_pair(d->ref_plane[plane], d->ref_stride[plane], g.plane_w[plane], g.slice_row(plane, s),
                      g.slice_row(plane, s + 1), g.slice_row(plane, s + 1), g.slice_row(plane, s + 2), predictor, a, b);
@@ -228,8 +250,8 @@ rcv_status decode_huffman_pair(rcv_decoder* d, const uint8_t* ca, size_t size_a,
 
 // Decodes one chunk straight into the reference plane. The sample count comes from geometry,
 // never from the packet.
-rcv_status decode_chunk(rcv_decoder* d, const uint8_t* c, size_t size, int plane, const Geometry& g, int slice,
-                        int predictor) {
+rcv_status decode_chunk(rcv_decoder* d, HuffDecTable* lut, const uint8_t* c, size_t size, int plane,
+                        const Geometry& g, int slice, int predictor) {
     if (!chunk_header_ok(c, size)) return RCV_ERR_BITSTREAM;
     const size_t count = g.chunk_samples(plane, slice);
     uint8_t* dst = d->ref_plane[plane];
@@ -238,7 +260,7 @@ rcv_status decode_chunk(rcv_decoder* d, const uint8_t* c, size_t size, int plane
     switch (c[0]) {
     case kChunkHuffman: {
         HuffSource src;
-        const rcv_status st = open_huffman(c, size, count, &d->lut[0], &src);
+        const rcv_status st = open_huffman(c, size, count, lut, &src);
         if (st != RCV_OK) return st;
         reconstruct(dst, stride, w, r0, r1, predictor, src);
         return close_huffman(src, size);
@@ -261,6 +283,18 @@ rcv_status decode_chunk(rcv_decoder* d, const uint8_t* c, size_t size, int plane
     default:
         return RCV_ERR_BITSTREAM;
     }
+}
+
+// Pool job: jobs touch disjoint rows of the reference and never read another slice's rows.
+void decode_job(void* ctx, int j, int worker) {
+    rcv_decoder* d = static_cast<rcv_decoder*>(ctx);
+    const DecodeJob& job = d->jobs[j];
+    HuffDecTable* luts = d->luts + 2 * size_t(worker);
+    d->job_status[j] = job.count == 2
+                           ? decode_huffman_pair(d, luts, job.chunk, job.size[0], job.chunk + job.size[0], job.size[1],
+                                                 job.plane, d->frame_geo, job.slice, d->frame_predictor)
+                           : decode_chunk(d, luts, job.chunk, job.size[0], job.plane, d->frame_geo, job.slice,
+                                          d->frame_predictor);
 }
 
 rcv_status decode_i_frame(rcv_decoder* d, const uint8_t* pkt, size_t size) {
@@ -305,27 +339,37 @@ rcv_status decode_i_frame(rcv_decoder* d, const uint8_t* pkt, size_t size) {
     }
     if (sum != payload_size - dir_size) return RCV_ERR_BITSTREAM;
 
-    // From here on the reference is overwritten; it is only valid again on success.
-    d->has_ref = false;
+    // Job list, in plane order (big luma jobs first). Neighbouring HUFFMAN chunks are paired.
+    int njobs = 0;
     const uint8_t* chunk = payload + dir_size;
     for (int pl = 0; pl < 3; ++pl) {
-        auto chunk_size = [&](int s) { return size_t(get_u32(payload + 4 * (size_t(pl) * slices + size_t(s)))); };
+        auto chunk_size = [&](int s) { return get_u32(payload + 4 * (size_t(pl) * slices + size_t(s))); };
         for (int s = 0; s < slices;) {
-            const size_t cs = chunk_size(s);
-            rcv_status st;
-            if (s + 1 < slices && chunk[0] == kChunkHuffman && chunk[cs] == kChunkHuffman) {
-                const size_t cs2 = chunk_size(s + 1);  // sizes are >= 4 (checked above)
-                st = decode_huffman_pair(d, chunk, cs, chunk + cs, cs2, pl, g, s, predictor);
-                chunk += cs + cs2;
-                s += 2;
+            DecodeJob& job = d->jobs[njobs++];
+            job.chunk = chunk;
+            job.plane = pl;
+            job.slice = s;
+            job.size[0] = chunk_size(s);
+            // Sizes are >= 4 (checked above), so both mode bytes are inside the payload.
+            if (s + 1 < slices && chunk[0] == kChunkHuffman && chunk[job.size[0]] == kChunkHuffman) {
+                job.size[1] = chunk_size(s + 1);
+                job.count = 2;
             } else {
-                st = decode_chunk(d, chunk, cs, pl, g, s, predictor);
-                chunk += cs;
-                s += 1;
+                job.size[1] = 0;
+                job.count = 1;
             }
-            if (st != RCV_OK) return st;
+            chunk += job.size[0] + job.size[1];
+            s += job.count;
         }
     }
+
+    // From here on the reference is overwritten; it is only valid again on success.
+    d->has_ref = false;
+    d->frame_geo = g;
+    d->frame_predictor = predictor;
+    d->pool.run(decode_job, d, njobs);
+    for (int j = 0; j < njobs; ++j)  // first failure in job order, independent of scheduling
+        if (d->job_status[j] != RCV_OK) return d->job_status[j];
     d->has_ref = true;
     return RCV_OK;
 }
@@ -412,7 +456,6 @@ rcv_status rcv_parse_sequence_header(const uint8_t seq_header[32], rcv_sequence_
 }
 
 rcv_status rcv_decoder_create(const uint8_t seq_header[32], uint8_t num_threads, rcv_decoder** out) {
-    (void)num_threads;  // M4
     if (!seq_header || !out) return RCV_ERR_INVALID_ARG;
     *out = nullptr;
     SeqHeader h;
@@ -429,8 +472,10 @@ rcv_status rcv_decoder_create(const uint8_t seq_header[32], uint8_t num_threads,
         d->ref_stride[p] = ptrdiff_t(align64(size_t(d->geo.plane_w[p])));
         total += size_t(d->ref_stride[p]) * size_t(d->geo.plane_h[p]);
     }
+    const int threads = resolve_thread_count(num_threads);
     d->ref_mem = static_cast<uint8_t*>(aligned_alloc64(total));
-    if (!d->ref_mem) {
+    d->luts = static_cast<HuffDecTable*>(aligned_alloc64(sizeof(HuffDecTable) * 2 * size_t(threads)));
+    if (!d->ref_mem || !d->luts) {
         rcv_decoder_destroy(d);
         return RCV_ERR_OUT_OF_MEMORY;
     }
@@ -440,13 +485,19 @@ rcv_status rcv_decoder_create(const uint8_t seq_header[32], uint8_t num_threads,
         d->ref_plane[i] = p;
         p += size_t(d->ref_stride[i]) * size_t(d->geo.plane_h[i]);
     }
+    if (!d->pool.start(threads, nullptr, nullptr)) {
+        rcv_decoder_destroy(d);
+        return RCV_ERR_OUT_OF_MEMORY;
+    }
     *out = d;
     return RCV_OK;
 }
 
 void rcv_decoder_destroy(rcv_decoder* d) {
     if (!d) return;
+    d->pool.stop();
     aligned_free64(d->ref_mem);
+    aligned_free64(d->luts);
     delete d;
 }
 
