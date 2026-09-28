@@ -1,0 +1,673 @@
+# `rec` — Frame-Buffer-Hook Screen Recorder
+## Implementation Plan (v1.1, for AI-assisted implementation)
+
+> **Changes in v1.1:** function-address discovery for D3D9/10/11/12 now uses the **kiero2** library (MIT, `github.com/kirchesz/kiero2`) instead of hand-written dummy-device code. MinHook still installs the hooks. Affected sections: §2, §4.1, §4.4, new §4.6, §10.4 (codes I1103, E1105, W1106), §14.2, §16 (M1, M8, M10), §18. Vulkan keeps the implicit-layer design; OpenGL keeps plain `GetProcAddress`.
+
+> **Companion document:** `RCV1_Codec_Plan.md` (the codec spec). This plan covers everything around the codec: injection and hooking, GPU capture, frame pacing, inter-process transport, encoding pipeline, rate control, disk writing and container, audio, hotkeys, the CLI, logging/telemetry, robustness, testing and milestones.
+>
+> `rec` is a working name for the executable and can be renamed.
+
+---
+
+## 0. Instructions for the AI builder
+
+1. Read this document **and** `RCV1_Codec_Plan.md` fully before writing code. Where this plan changes something in the codec plan's §12 interface table, this plan wins (changes are listed in §1.4).
+2. **The game must never wait for the recorder** (except the deliberate frame-rate lock in §6). No blocking calls, file I/O, allocation, or locks shared with other threads on the game's render thread. If something isn't ready, skip it and log it.
+3. **The recorder must never crash the game.** All hook code runs inside a structured-exception guard (§13.2). On any failure, capture disables itself and the game continues.
+4. Every warning/error condition in the event catalogue (§10.4) must be logged with its code, and must be triggerable by a test or a debug flag (§14.3).
+5. Build in milestone order (§16). Each milestone has acceptance checks; do not move on until they pass.
+6. **Performance figures in this plan are targets, not measurements.** Report measured values; never claim a target is met without a benchmark showing it.
+7. When the spec is ambiguous, stop and ask; record decisions in `docs/DECISIONS.md`.
+
+---
+
+## 1. Requirements
+
+### 1.1 User requirements (must have)
+| # | Requirement |
+|---|---|
+| R1 | Record from a hooked application's frame buffer, before it reaches the display |
+| R2 | Negligible impact on the recorded application (FRAPS/Dxtory-class) on an i5-7200U laptop |
+| R3 | No jitter in the output (constant frame rate, evenly spaced frames) |
+| R4 | Output resolution: user-selectable (default 1280×720), capped at the application's back-buffer size |
+| R5 | Frame rate: user-selectable (30, 50, 60 or custom), capped at the display's refresh rate |
+| R6 | Must work without an SSD: adapt instead of stalling (rate control, §9) |
+| R7 | **F9 starts and stops recording** (configurable) |
+| R8 | **CLI-based** for now |
+| R9 | **Logging** good enough to diagnose problems: errors, frame times, slow writes and other useful telemetry |
+
+### 1.2 Added by this plan (important things not in the original list)
+| # | Addition | Why it matters |
+|---|---|---|
+| X1 | **Out-of-process encoding** (hook only captures; encoding/writing happen in `rec.exe`) | An encoder bug can't crash the game; 32-bit games work without a 32-bit codec; no memory pressure inside the game |
+| X2 | **32-bit and 64-bit games** (two hook DLLs + a 32-bit injector helper) | Many older games are 32-bit |
+| X3 | **Audio recording** (game or system audio, optional microphone) with A/V sync | A screen recorder without sound is rarely useful |
+| X4 | **Audible start/stop cue** | In fullscreen you can't see the console, so F9 needs feedback |
+| X5 | **Crash-safe recordings** plus `rec repair` | A crash or power loss shouldn't cost the whole recording |
+| X6 | **Anti-cheat safety block** | Injecting into games protected by anti-cheat can get an account banned |
+| X7 | **Disk-space guard, FAT32 file splitting, disk benchmark** | Prevents corrupt or truncated files and bad surprises on slow drives |
+| X8 | **Window resize / alt-tab / device-lost handling** | Common in real games; otherwise crashes or garbage frames |
+| X9 | **Power/battery and thermal context in logs** | Laptops throttle on battery; explains "random" slowdowns |
+| X10 | **Synthetic test app + fault-injection flags** | Lets the whole pipeline be verified automatically (dropped/duplicated frames, jitter, slow disk) |
+| X11 | **Overhead measurement mode** | Proves R2 with numbers, compared against FRAPS |
+| X12 | **Core logic as a library, CLI as a thin front-end** | A GUI can be added later without rewriting |
+| X13 | **Hardware-encoder fallback** (Media Foundation: QuickSync/NVENC/AMF) | The only way to record high resolutions on slow disks |
+
+### 1.3 Out of scope for v1
+GUI, live streaming, webcam overlay, multi-drive striping (Dxtory-style), editing, D3D12/Vulkan (planned late milestone, §16), HDR output.
+
+### 1.4 Changes to the codec plan's §12 interface table
+- DUP frames are generated by the **host** from gaps in the frame timeline (§6.3), not by the hook calling `rcv_encode_duplicate`. This also covers total game freezes, when the hook isn't called at all.
+- The capture side may deliver **BGRA** (OpenGL, D3D9 in v1) as well as NV12; the host converts BGRA → I420 before the codec when the output format is YUV420 (§8.2).
+- Rate-controller thresholds are refined to four levels with hysteresis, and CPU overload is handled separately from disk overload (§9).
+
+---
+
+## 2. Technology choices
+
+| Area | Choice | Notes |
+|---|---|---|
+| Language | **C++20** | Same as the codec. Hook DLL, host and tools all C++. |
+| Compiler / build | MSVC 2022 (+ clang-cl for sanitizers), CMake ≥ 3.25, Ninja | Build x64 for everything; also x86 for `rec_hook32.dll` and `rec_inject32.exe` |
+| Platform | Windows 10 1809+ / Windows 11, x64 host | High-resolution waitable timers need Windows 10 1803+ |
+| Function hooking | **MinHook** (BSD-2) | Inline hooks for x86 and x64 |
+| Function-address discovery | **kiero2** (MIT), vendored at a pinned commit | Creates a throwaway device/swap chain on a hidden window and returns its vtable entries, so we know where `Present`, `ResizeBuffers`, `Reset` etc. live. It only *finds* addresses; MinHook does the hooking. Used for D3D9/10/11/12 only (§4.6). C++17, compiles fine under C++20 |
+| CLI parsing | **CLI11** (BSD-3, header-only) | |
+| Config | **toml++** (MIT, header-only) | `rec.toml` |
+| Logging | **spdlog** async logger (MIT), host side only | The hook uses its own lock-free shared-memory log ring (§10.2) |
+| Tests | doctest | |
+| Audio | WASAPI (loopback, process loopback, capture) | |
+| Hardware fallback | Media Foundation Sink Writer with hardware MFTs | Vendor-neutral |
+| External tool | FFmpeg CLI (not linked) | `rec convert` pipes decoded frames and audio into it |
+
+No Qt, .NET or other runtimes. No logging, allocation or C++ exceptions inside the hook's Present path.
+
+---
+
+## 3. Architecture
+
+### 3.1 Processes and components
+```
+┌──────────────────────────── Game process (x86 or x64) ────────────────────────────┐
+│  rec_hook{32,64}.dll                                                                │
+│   • MinHook on Present / SwapBuffers / ResizeBuffers / Reset                        │
+│   • Backend: D3D11 | OpenGL | D3D9 | (D3D10, D3D12, Vulkan later)                   │
+│   • GPU: copy back buffer → scale + RGB→YUV (NV12) → staging ring (async readback)  │
+│   • Frame pacer (FRAPS-style lock) + timestamps (QPC)                               │
+│   • Writes frames into shared-memory ring; logs into shared-memory log ring         │
+│   • Control thread: host commands, heartbeat                                        │
+└───────────────┬───────────────────────────────────────────────────────────────────┘
+                │ shared memory (frames, control, log ring) + named events
+┌───────────────▼──────────────────── rec.exe (x64) ──────────────────────────────────┐
+│  rec_core (library)                        │  CLI front-end                         │
+│   • Session state machine                  │   • Commands (§12)                     │
+│   • Hotkeys (F9) + audio cue               │   • Live status line                   │
+│   • Frame receiver + BGRA→YUV converter    │                                        │
+│   • RCV1 encoder (2 threads) / HW encoder  │                                        │
+│   • Rate controller                        │                                        │
+│   • Audio capture (WASAPI)                 │                                        │
+│   • Muxer (AVI OpenDML) + disk writer      │                                        │
+│   • Logger, telemetry CSV, summary JSON    │                                        │
+│   • Monitor (1 Hz: CPU, disk, power)       │                                        │
+└────────────────────────────────────────────┴────────────────────────────────────────┘
+```
+
+### 3.2 Host threads
+| Thread | Priority | Job |
+|---|---|---|
+| Main / CLI | Normal | Parse commands, run the session state machine, draw the status line |
+| Hotkey | Normal | Message loop for `RegisterHotKey`; posts start/stop events |
+| Receiver / encoder | Normal | Waits for frame-ready; fills DUP gaps; converts if needed; calls `rcv_encode_frame` directly on the shared-memory slot (no copy); frees the slot; pushes the packet to the mux queue |
+| Codec worker ×1 | Normal (configurable) | Second RCV1 worker (codec pool) |
+| Audio | MMCSS "Audio" | WASAPI event-driven capture; timestamps packets with QPC |
+| Muxer / writer | Above normal | Interleaves audio and video by timestamp; builds AVI chunks; overlapped unbuffered writes |
+| Logger | Below normal | spdlog async sink; drains the hook's log ring |
+| Monitor | Below normal | 1 Hz stats: queue levels, CPU (game and host), disk free, power, write rate |
+
+On a 2-core/4-thread CPU the encoder uses at most 2 threads (receiver + 1 worker), leaving 2 logical CPUs for the game.
+
+### 3.3 Session state machine (host, mirrored in the hook)
+```
+DETACHED → ATTACHING → IDLE ⇄ ARMING → RECORDING → STOPPING → IDLE
+                                   ↘ ERROR (logged; returns to IDLE or DETACHED)
+```
+- **IDLE:** hooked, not recording. Hook cost is one flag check per Present. GPU resources are created lazily on the first Present after attach, so F9 starts instantly.
+- **ARMING:** host opens the output file, audio and encoder; hook starts on the next Present.
+- **STOPPING:** hook stops issuing new captures and flushes in-flight readbacks; host drains queues, pads the timeline to the stop time, writes indexes, closes the file, writes the summary.
+- F9 presses during ARMING/STOPPING are ignored (and logged). Presses within 300 ms of the previous one are debounced.
+
+---
+
+## 4. Injection and hooking
+
+### 4.1 Getting into the process
+- `rec launch <exe> [-- args]`: `CreateProcessW(CREATE_SUSPENDED)` → inject → `ResumeThread`. This is the most reliable path: hooks are in place before the game creates its device.
+- `rec attach --pid N | --name X.exe`: inject into a running process. The hook then locates the existing device/swap chain on the next Present.
+- Injection method: `VirtualAllocEx` + `WriteProcessMemory` (DLL path) + `CreateRemoteThread(LoadLibraryW)`.
+- **Bitness:** detect with `IsWow64Process2`. 64-bit target → `rec.exe` injects `rec_hook64.dll`. 32-bit target → spawn `rec_inject32.exe`, which injects `rec_hook32.dll`. (A 64-bit process can't reliably resolve `LoadLibraryW` in a 32-bit process.)
+- **Elevation:** if the target runs elevated and `rec` doesn't, fail with a clear message (`E1003`) telling the user to run `rec` as administrator.
+- On load, the hook opens the host's shared memory by name (`Local\rec_<gamePID>_*`), verifies the protocol version, then installs hooks from a separate thread (never inside `DllMain`).
+- **Install timing (important with kiero2):** kiero2 only works once the API's DLL is already loaded in the process (it uses `GetModuleHandle`, not `LoadLibrary`). With `rec attach` this is always true. With `rec launch` the hook is injected into a suspended process *before* the game loads `d3d11.dll`/`d3d9.dll`, so:
+  1. The install thread first handles every API whose DLL is already loaded.
+  2. For the rest, it registers `LdrRegisterDllNotification` (ntdll). The callback runs under the loader lock, so it **only** sets a flag and signals an event; the install thread wakes, waits ~50 ms, then calls kiero2 and MinHook from its own thread. Logged as `I1103 deferred_until_module_loaded <dll>`.
+  3. The hook must **never** call `LoadLibrary` on a graphics DLL just to locate it: that would put `d3d11.dll` into an OpenGL game, confuse API detection (§4.3) and create an unnecessary device.
+  - This is race-free for our purposes: MinHook patches the function's code, not one object's vtable, so a swap chain the game created a moment before the hook went in is still caught on its next `Present`.
+
+### 4.2 Anti-cheat safety (X6)
+Before injecting, scan the target's loaded modules and running services/processes for known anti-cheat components (e.g. EasyAntiCheat, BattlEye, Vanguard, and others in a configurable `anticheat_blocklist`). If found: **refuse to inject** and log `E1004` explaining that it could get the account banned. `--force` overrides only for games the user owns and knows are safe offline. Document this in the README.
+
+### 4.3 API detection
+`rec list` and the hook both detect APIs from loaded modules: `d3d9.dll`, `d3d10*.dll`, `d3d11.dll`, `d3d12.dll`, `opengl32.dll`, `vulkan-1.dll`, `dxgi.dll`. Several can be loaded at once (launchers, overlays), so the backend is chosen by **which Present is actually called** at runtime: all supported Present functions are hooked, and the first one that fires with a real swap chain wins. Logged as `I1101`.
+
+> **Your test game:** since FRAPS (which supports DirectX up to 11 and OpenGL, but not D3D12 or Vulkan) could record it, your Minecraft build is most likely running on OpenGL (Java Edition). `rec list` will confirm. For that reason the OpenGL backend is built right after D3D11.
+
+### 4.4 Functions hooked per API
+| API | Hooked | How addresses are found |
+|---|---|---|
+| DXGI (D3D10/11, and 12 later) | `IDXGISwapChain::Present`, `IDXGISwapChain1::Present1`, `ResizeBuffers`, `ResizeBuffers1` (D3D12) | **kiero2** `Implementation_D3D11` → `swapchain_methods[]`. D3D10 games use the same DXGI swap chain code, so the D3D11 result covers them; `Implementation_D3D10` is not needed |
+| D3D12 (M10) | Same DXGI entries, plus `ID3D12CommandQueue::ExecuteCommandLists` to learn which queue the game presents on | **kiero2** `Implementation_D3D12` → `swapchain_methods[]`, `command_queue_methods[]` |
+| OpenGL | `wglSwapBuffers` (opengl32.dll) and `SwapBuffers` (gdi32.dll), guarding against double-counting | Plain `GetProcAddress` on the exports. kiero2's OpenGL backend does the same thing (plus ~340 unneeded lookups) and doesn't cover gdi32, so it isn't used |
+| D3D9 | `IDirect3DDevice9::Present`, `IDirect3DSwapChain9::Present`, `IDirect3DDevice9Ex::PresentEx`, `Reset`, `ResetEx` | **kiero2** `Implementation_D3D9` → `device_methods[]` for `Reset`/`Present`. kiero2 does **not** return the swap-chain or `Ex` vtables, so we add a small custom kiero2 backend `Implementation_D3D9Ex` (§4.6.4) |
+| Vulkan (later) | Implicit Vulkan layer (registry manifest) intercepting `vkQueuePresentKHR` | Layer dispatch. **kiero2's Vulkan backend is not used:** it returns `vulkan-1.dll` loader exports, and most engines call `vkQueuePresentKHR` through a pointer from `vkGetDeviceProcAddr`, which bypasses the export, so a hook there would miss them |
+
+**Overlays** (Steam, Discord, RTSS/Afterburner, GeForce Experience) also hook Present. MinHook chains correctly in normal cases. Log detected overlay modules at attach (`I1102`), because they are the first suspects when capture misbehaves.
+
+### 4.5 Detach
+`rec detach` disables the hooks, waits until no thread is inside a hook (atomic in-hook counter), releases GPU resources on the next Present (or abandons them if no Present arrives within 2 s), then `FreeLibraryAndExitThread`. The recommended practice is to leave the hook loaded until the game exits.
+
+### 4.6 kiero2 integration rules
+kiero2 (≈1,250 lines, MIT) replaces the code we would otherwise write to find vtable addresses. It is small, but it has sharp edges. These rules cover them.
+
+#### 4.6.1 Vendoring and build
+- Copy the source into `third_party/kiero2/` at a **pinned commit** (reviewed: `8f57dd9`, 2026-06-12) and record the commit in `docs/DECISIONS.md`. Do **not** use `FetchContent` with `GIT_TAG master`; it's a small, single-maintainer project and `master` can change under us.
+- Build it as part of `rec_hook32.dll` and `rec_hook64.dll` with only `KIERO_BUILD_D3D9`, `KIERO_BUILD_D3D11` and (M10) `KIERO_BUILD_D3D12` on; `KIERO_BUILD_OPENGL`, `KIERO_BUILD_D3D10` and `KIERO_BUILD_VULKAN` off.
+- kiero2's `Implementation_*` numbers depend on header **include order**. Include headers only through one wrapper, `hook/kiero_wrap.hpp`, in a fixed order, and never include backend headers directly anywhere else.
+- Before including `kiero.hpp`, define:
+  - `KIERO_DBG_MSG(msg, ...)` → write a DEBUG record into our shared-memory log ring (§10.2). The default is `printf` in debug builds, and the hook must never touch the console.
+  - `KIERO_ASSERT(x)` → our own check that logs and returns, never `abort()` inside the game.
+
+#### 4.6.2 When and where it runs
+- Only on the hook's **install thread** (§4.1), once per API, before any hooks are enabled. **Never** inside `Present`, `DllMain`, or a loader-notification callback.
+- It allocates (`std::vector`, `std::unordered_map`) and creates a hidden window plus a throwaway device. That's fine at install time and is why it must never run on the render path.
+- Wrap each `locate` call in the same SEH guard as the hooks (§13.2). A crash inside a graphics driver while making the dummy device must disable capture for that API, not kill the game.
+- Time each call and log it in `I1101` (typically tens of milliseconds; creating a D3D12 device can take longer).
+
+#### 4.6.3 Using the results safely
+kiero2 reads each vtable until it hits a null pointer. Nothing guarantees a null there, so the returned vectors can end with junk entries. Therefore:
+- **Never** use `.size()` as "number of methods". Read only the fixed indices below, and check `index < size()` first.
+- **Validate every pointer before hooking:** it must be non-null and lie inside the image of the expected module (`dxgi.dll` for swap-chain methods, `d3d9.dll` for D3D9, `d3d12.dll` for the command queue), checked with `GetModuleInformation`. If a check fails, skip that hook and log `W1106 vtable_pointer_outside_module` (API, index, address, module). An overlay that has already inline-hooked `Present` still passes, because its patch is inside the function, which stays inside the module; MinHook chains onto it as usual (§4.4).
+- Check the return value of `locate`: anything other than `kiero::Error_Nil` → `E1105 locate_failed` with the API and kiero2's error code translated to text; that API stays unhooked and the others carry on.
+- kiero2 creates its dummy D3D11/D3D12 device on adapter 0. That's fine even on dual-GPU laptops: the methods we hook are in the Microsoft runtime DLLs (`dxgi.dll`, `d3d9.dll`), which are the same whichever GPU the game uses.
+
+Vtable indices used (from the Windows SDK headers; **the builder must re-check each one against the SDK's `dxgi.h`/`dxgi1_2.h`/`dxgi1_4.h`/`d3d9.h`/`d3d12.h` and write them as named constants in `hook/vtable_indices.h`**):
+
+| Interface | Method | Index |
+|---|---|---|
+| `IDXGISwapChain` | `Present` | 8 |
+| `IDXGISwapChain` | `ResizeBuffers` | 13 |
+| `IDXGISwapChain1` | `Present1` | 22 |
+| `IDXGISwapChain3` | `ResizeBuffers1` | 39 |
+| `IDirect3DDevice9` | `Reset` | 16 |
+| `IDirect3DDevice9` | `Present` | 17 |
+| `IDirect3DDevice9Ex` | `PresentEx` | 121 |
+| `IDirect3DDevice9Ex` | `ResetEx` | 132 |
+| `IDirect3DSwapChain9` | `Present` | 3 |
+| `ID3D12CommandQueue` | `ExecuteCommandLists` | 10 |
+
+`Present1` and `ResizeBuffers1` come from the same vtable as `Present`: the real DXGI swap-chain object implements all the `IDXGISwapChainN` interfaces in one vtable. Still, the pointer check above is required, and if index 22 or 39 fails it, those two hooks are skipped (most games call plain `Present`).
+
+#### 4.6.4 Custom backend for D3D9Ex and the D3D9 swap chain
+kiero2 supports adding backends (see its README, "Adding a new backend"). Add `hook/kiero_d3d9ex.{hpp,cpp}` defining `Implementation_D3D9Ex`:
+- `Direct3DCreate9Ex` → `CreateDeviceEx` on kiero2's dummy window (`kiero::_::create_dummy_win32_window`) → record the device vtable (gives `PresentEx`, `ResetEx`, and also `Present`/`Reset` at the same indices as plain D3D9).
+- `GetSwapChain(0)` → record the `IDirect3DSwapChain9` vtable (for `Present` at index 3).
+- Output struct `D3D9ExOutput { std::vector<void*> device_ex_methods, swapchain_methods; }`. Same null-terminated read and same validation rules as §4.6.3.
+- If `Direct3DCreate9Ex` is missing or fails, fall back to kiero2's plain `Implementation_D3D9` and hook only `Present`/`Reset`.
+
+#### 4.6.5 What kiero2 does *not* change
+Everything after an address is found stays as planned: MinHook for hooking, backend selection by which Present fires first (§4.3), the SEH guard, detach (§4.5), and the Vulkan layer. If kiero2 ever becomes a problem, the replacement is the same ~150 lines per API it contains, behind the same `hook/kiero_wrap.hpp` interface.
+
+---
+
+## 5. GPU capture backends
+
+Common rule for every backend: **never wait on the GPU.** Each capture goes into one of N staging slots (N = 3 by default, configurable 2–5). A slot is read back only once its fence/query reports completion, which normally happens 1–2 frames later.
+
+### 5.1 D3D11 (first backend)
+Per captured frame, inside the Present hook, before calling the original Present:
+1. `swapchain->GetBuffer(0)`. If MSAA (`SampleDesc.Count > 1`) → `ResolveSubresource` into our resolve texture.
+2. `CopyResource` into our own texture of the same format. (Back buffers often lack `SHADER_RESOURCE` usage, so we can't sample them directly.)
+3. **Scale + convert** with one pixel-shader pass (or two: Y and UV) into `R8_UNORM` (W×H) and `R8G8_UNORM` (W/2×H/2) render targets. The shader does bilinear or area downscaling, letterboxing, BT.601 full-range conversion (formulas in codec plan §4.3) and 2×2 chroma averaging.
+4. `CopyResource` Y and UV into the staging slot (`D3D11_USAGE_STAGING`, `CPU_ACCESS_READ`). Issue a `D3D11_QUERY_EVENT`.
+5. For the **oldest pending** slot: `GetData(query, D3D11_ASYNC_GETDATA_DONOTFLUSH)`. If it's ready: `Map(READ, D3D11_MAP_FLAG_DO_NOT_WAIT)`, copy into a free shared-memory frame slot (§7), `Unmap`. If it isn't ready, try again next Present. If all staging slots are busy: skip capturing this frame (`W1201 gpu_backlog`).
+- **Pipeline state:** our draw calls must not disturb the game's state. Use `ID3D11DeviceContext1::SwapDeviceContextState` with our own `ID3DDeviceContextState`: swap in, draw, swap back. This is cheaper and safer than saving and restoring state piece by piece.
+- **Formats handled:** `B8G8R8A8(_SRGB)`, `R8G8B8A8(_SRGB)`, `R10G10B10A2`, `R16G16B16A16_FLOAT` (scRGB HDR → clamp + sRGB encode, logged as `W1204 hdr_approximated`). Anything else → `E1205 unsupported_format`; capture stays off.
+- **Optional optimisation (after M3):** move the memcpy off the render thread. Map in Present N, have a hook worker thread copy while mapped, and Unmap in Present N+1 once the copy is done. Enable only if measurements show the memcpy matters.
+
+### 5.2 OpenGL
+Inside the `wglSwapBuffers` hook, before the original call:
+1. Save the state we touch (bound read/draw framebuffers, pixel-pack buffer, viewport, scissor enable).
+2. `glBlitFramebuffer` from the default framebuffer (`GL_BACK`) into our FBO at output size. Flipping Y in the blit rectangle fixes GL's bottom-left origin for free; `GL_LINEAR` does the scaling.
+3. `glReadPixels` into a **PBO** (`GL_PIXEL_PACK_BUFFER`, `GL_BGRA`, `GL_UNSIGNED_BYTE`) → `glFenceSync`.
+4. Oldest pending PBO: `glClientWaitSync(fence, 0, 0)` (timeout 0). If signalled: `glMapBufferRange(READ)` → copy to a shared slot → unmap.
+5. Restore state.
+- v1 reads back **BGRA**; the host converts to I420 (§8.2). A later optimisation can add a GLSL YUV-conversion pass to halve the readback size.
+- Requires GL 3.0+ (FBO blit, sync objects). Older contexts → `E1206 gl_version_unsupported`.
+- The hook must use the game's current context (`wglGetCurrentContext`) and create its objects lazily in that context; if the context changes, recreate them (`I1207`).
+
+### 5.3 D3D9 (later milestone)
+`GetBackBuffer` → `StretchRect` (scaling) into our render target → `GetRenderTargetData` into a ring of `D3DPOOL_SYSTEMMEM` surfaces with `D3DQUERYTYPE_EVENT` queries → `LockRect(D3DLOCK_READONLY | D3DLOCK_DONOTWAIT)` once the query signals. Use `IDirect3DStateBlock9` to save and restore state. Reads back BGRA. Handle `Reset`/`ResetEx` by releasing all `D3DPOOL_DEFAULT` resources before the original call.
+
+### 5.4 Resize, alt-tab, device lost (X8)
+- `ResizeBuffers` / `Reset` hooks: release our references to the back buffer **before** calling the original (otherwise the game's resize fails), then recreate on the next Present.
+- **Output size stays fixed during a recording.** A new back-buffer size is scaled and letterboxed into the same output (`I1208 backbuffer_resized old→new`).
+- Minimised or occluded (Present returns `DXGI_STATUS_OCCLUDED`, or no Presents arrive): the host fills the timeline with DUPs, so the video continues and stays in sync with audio.
+- `DXGI_ERROR_DEVICE_REMOVED/RESET` or a lost D3D9 device: drop all GPU resources, log `E1209` with the removal reason, and retry once the device is valid again.
+
+---
+
+## 6. Frame pacing and timeline (no jitter)
+
+### 6.1 Clock
+All timestamps (hook, host, audio) use **QPC** (`QueryPerformanceCounter`), which is system-wide and therefore shared between processes. The session start time `t0` is chosen by the host at ARMING and written into shared memory.
+
+### 6.2 Capture modes
+- Tick interval `T = 1 / fps`. `fps` is clamped to the display refresh rate of the monitor the game window is on (`MonitorFromWindow` → `EnumDisplaySettingsW` / DXGI output); logged as `I1301`.
+- **Lock mode (default, FRAPS behaviour):** in the Present hook, if `now < next_tick`, sleep until `next_tick` using a high-resolution waitable timer (`CREATE_WAITABLE_TIMER_HIGH_RESOLUTION`), then spin (`_mm_pause`) for the last ~200 µs. Capture, then `next_tick += T`. If the game is late by more than one tick, re-anchor `next_tick` to the tick after `now` (the host fills the missed ticks with DUPs). This caps the game at the recording rate, as FRAPS did.
+- **Free mode (`--no-lock`):** the game is not limited; a frame is captured on the first Present at or after each tick. Uneven game frame times then show up as slight motion unevenness, but the output is still constant frame rate.
+- Note for users (README): with vsync on, a target that doesn't divide evenly into the refresh rate (e.g. 50 on a 60 Hz display) makes the game judder on screen while recording. The recording itself stays smooth.
+
+### 6.3 Frame index and DUP filling
+- Each captured frame carries `tick = round((present_qpc − t0) / T)` plus both raw timestamps.
+- The host keeps `next_expected_tick`. For a frame with tick k: emit `k − next_expected_tick` DUP packets first (`rcv_encode_duplicate`), then encode the frame. A frame with `k < next_expected_tick` (shouldn't happen in lock mode) is dropped and logged (`W2301 late_frame`).
+- **Stalls:** if no frame arrives for more than 250 ms, the host emits DUPs up to the current time on its own. The file therefore stays in sync with audio even when the game freezes completely (as in your 13.5-second Minecraft spike).
+- **Stop:** pad DUPs up to the stop time.
+
+---
+
+## 7. Shared-memory transport (hook ↔ host)
+
+### 7.1 Objects (named per game PID)
+| Name | Contents |
+|---|---|
+| `Local\rec_<pid>_ctl` | Control block: protocol version, host PID, session state, config (fps, output size, lock mode, format), `t0`, heartbeats, counters, error codes |
+| `Local\rec_<pid>_frames` | Frame ring: N slots (default 8), each = 64-byte slot header + pixel data sized to the maximum frame |
+| `Local\rec_<pid>_log` | Hook log ring (§10.2) |
+| Events | `cmd` (host→hook), `frame_ready` (semaphore, hook→host), `slot_free` (host→hook, optional) |
+
+### 7.2 Slot header (64 bytes, same layout for x86 and x64 — fixed-width types only)
+`state (atomic u32: FREE, WRITING, READY, READING)`, `seq (u32)`, `tick (u64)`, `present_qpc (u64)`, `capture_done_qpc (u64)`, `width, height (u16)`, `layout (u8: NV12 | BGRA)`, `flags (u8)`, `stride0, stride1 (u32)`, `game_frame_time_us (u32)`, `hook_cost_us (u32)`, reserved.
+
+### 7.3 Rules
+- The hook takes a FREE slot with a compare-exchange FREE→WRITING, fills it, sets READY and releases `frame_ready`. **If there's no FREE slot, it drops the frame** (`W1202 ring_full_drop`, counted) and never waits.
+- The host processes slots in `seq` order, READY→READING, encodes straight from the slot memory, then sets FREE.
+- Sizing: computed at ARMING from output size and layout. Examples: 1360×744 NV12 = 1,517,760 bytes/slot → 8 slots ≈ 12 MB; 3840×2160 BGRA = 33.2 MB/slot.
+- **Liveness:** the host checks the game process handle; the hook checks the host heartbeat (1 Hz). If the host dies, the hook stops capturing, frees GPU resources and goes idle (`E1401 host_lost`). If the game dies, the host finalises the file (`W2401 target_exited`).
+
+---
+
+## 8. Host encoding pipeline
+
+### 8.1 Encoder modes
+| Mode | When | Output |
+|---|---|---|
+| `rcv` (default) | Normal | RCV1 lossless / near-lossless in AVI |
+| `rcv-strict` | User wants lossless or nothing | RCV1 lossless only; overload → dropped frames (as DUPs) |
+| `hw` | Selected, or suggested when the disk benchmark shows RCV1 can't keep up | H.264/HEVC via Media Foundation hardware encoder at high bitrate (default 50 Mbps at 1080p60, scaled by resolution) in MP4 |
+
+### 8.2 Colour conversion in the host
+When a slot's layout is BGRA and the output is YUV420: AVX2/SSE4.1 BGRA → I420 conversion (BT.601 full range, identical formula to the GPU shader), written into a preallocated buffer. Target cost ≤ 1.5 ms at 1360×744 on the i5-7200U (target, not measured). `--format rgb` skips this and uses the codec's GBR mode (lossless RGB, larger files).
+
+### 8.3 Packet flow
+`slot → [convert] → rcv_encode_frame → packet → mux queue (RAM, bounded) → writer`. Packets are written into a preallocated **packet arena** (ring buffer, default 256 MB, configurable `queue_mb`), so nothing is allocated per frame.
+
+---
+
+## 9. Rate controller
+
+Two different overloads need two different responses:
+
+| Symptom | Meaning | Response |
+|---|---|---|
+| **Packet queue** (encoder → disk) filling | **Disk too slow** | Compress harder: step up NEAR (near-lossless) |
+| **Frame ring** (hook → encoder) filling, or encode time > frame budget | **CPU too slow** | Near-lossless won't help (it costs *more* CPU). Drop frames by turning them into DUPs, and log it |
+
+Disk levels (packet-queue fill, hysteresis: step up immediately, step down only after 2 s below the lower threshold):
+
+| Level | Queue fill | Action |
+|---|---|---|
+| 0 | < 40% | Lossless |
+| 1 | 40–60% | NEAR = 1 |
+| 2 | 60–75% | NEAR = 2 |
+| 3 | 75–90% | NEAR = 3 |
+| 4 | > 90% | Replace incoming frames with DUPs until below 75% |
+
+- In `rcv-strict` mode levels 1–3 are skipped.
+- Every level change is logged (`W3101 rate_level old→new`, with queue fill and recent write MB/s).
+- CPU overload: if the frame ring is > 50% full or the rolling average encode time exceeds 80% of T, log `W3102 encoder_overloaded` and start dropping frames (as DUPs) until the ring is < 25% full.
+- **Startup check:** estimate the required rate as `W × H × 1.5 × fps ÷ 2.49` (the measured FRAPS ratio; e.g. 720p60 ≈ 33 MB/s, 1080p60 ≈ 75 MB/s) and compare it with the cached disk benchmark for that volume. If the benchmark is below 1.2× the estimate, warn (`W4001 disk_may_be_too_slow`) and suggest `--encoder hw` or a lower resolution/frame rate.
+
+---
+
+## 10. Logging and telemetry (R9)
+
+### 10.1 Outputs per session
+Every recording `<Game> YYYY-MM-DD HH-MM-SS-cc.avi` gets:
+| File | Content |
+|---|---|
+| `….log` | Human-readable event log (INFO and above; DEBUG with `--verbose`) |
+| `….frames.csv` | One row per output frame (telemetry, §10.3) |
+| `….summary.json` | End-of-session statistics (§10.5) |
+
+Plus a rolling application log `%LOCALAPPDATA%\rec\logs\rec.log` (5 × 10 MB rotation) for everything outside recordings (attach, errors, doctor runs). The console shows only WARN and above, so the live status line stays readable.
+
+Line format:
+```
+2026-09-25 11:56:49.123 [WARN ] [writer ] W4101 slow_write latency=312ms size=8MiB rate=26MB/s queue=64%
+```
+Every event has a **stable code** (letter = level, first digit = subsystem: 1 hook, 2 transport, 3 encoder/rate, 4 disk, 5 audio, 6 system, 7 CLI/hotkeys) so problems can be searched for and counted.
+
+### 10.2 Logging from inside the game (hook)
+- The hook **never touches files or the console.** It writes fixed-size 64-byte records into a lock-free multi-producer ring in shared memory: `qpc, level, code, thread id, four u64 arguments, 16-char tag`.
+- If the ring is full the record is dropped and a counter increases; the host logs `W2402 hook_log_overflow n` so losses are visible.
+- The host logger thread drains the ring every 50 ms and formats the records.
+
+### 10.3 Per-frame telemetry CSV (columns)
+```
+out_index, type(I/P/DUP/DROP), tick, present_qpc_us, game_frame_ms, pacing_wait_ms,
+hook_cost_ms, readback_latency_frames, map_copy_ms, ring_fill_pct, convert_ms,
+encode_ms, packet_bytes, ratio, near, blocks_skipped_pct, packet_queue_pct,
+write_latency_ms (of the write containing this frame), audio_drift_ms
+```
+This is the same kind of per-frame analysis done on your FRAPS clip, and can be loaded in Excel or a script. CSV rows are buffered in memory and written by the writer thread in large blocks, never per frame.
+
+### 10.4 Event catalogue (minimum set; thresholds configurable)
+| Code | Level | Event | Trigger / data |
+|---|---|---|---|
+| I6001 | INFO | Session start | OS build, CPU model, core count, RAM, GPU + driver version, power source, game exe + PID + bitness, API, back-buffer size/format, output size, fps, lock mode, encoder mode, disk path, filesystem, free space, cached disk benchmark |
+| I7001 | INFO | Hotkey | Key, action (start/stop), state |
+| W7002 | WARN | Hotkey ignored | Pressed during ARMING/STOPPING or debounced |
+| E7003 | ERROR | Hotkey registration failed | Key already taken by another app → fell back to low-level keyboard hook |
+| I1101 | INFO | Backend selected | API, swap-chain info |
+| I1102 | INFO | Overlays detected | Module names |
+| I1103 | INFO | Hook install deferred | Graphics DLL not loaded yet (launch mode); waiting for it (§4.1) |
+| E1105 | ERROR | Address lookup failed | kiero2 `locate` returned an error; API, error code as text, time taken. That API stays unhooked |
+| W1106 | WARN | Vtable pointer outside module | API, index, address, expected module; that one hook is skipped (§4.6.3) |
+| W1201 | WARN | GPU backlog | All staging slots pending (GPU behind); frame skipped |
+| W1202 | WARN | Ring full, frame dropped | Host not consuming fast enough |
+| W1203 | WARN | Slow hook | Hook cost > 1.0 ms (excluding deliberate pacing wait); logs the breakdown |
+| W1210 | WARN | Game stall | Game frame time > 4 × T, or > 250 ms |
+| I1208 | INFO | Back buffer resized | Old → new |
+| E1209 | ERROR | Device removed/reset | Reason HRESULT decoded to text |
+| E1205/E1206 | ERROR | Unsupported format / GL version | Capture disabled |
+| W1301 | WARN | Pacing error | Actual tick time − target > 1 ms (p99 reported each second) |
+| W2301 | WARN | Late frame dropped | Tick went backwards |
+| W3101 | WARN | Rate level change | Old → new, queue %, MB/s |
+| W3102 | WARN | Encoder overloaded | Avg encode ms vs budget, ring % |
+| W3103 | WARN | Slow encode | Single frame encode > T |
+| W4101 | WARN | Slow write | Write latency > 50 ms |
+| E4102 | ERROR | Very slow write | Write latency > 250 ms |
+| W4103 | WARN | Low disk space | < 5 GB free |
+| E4104 | ERROR | Critical disk space → auto stop | < 1 GB free |
+| E4105 | ERROR | Write failed | `GetLastError` text; recording stopped and file finalised |
+| I4106 | INFO | File split | FAT32 4 GB limit or `split_gb` reached |
+| W5101 | WARN | Audio discontinuity | WASAPI `AUDCLNT_BUFFERFLAGS_DATA_DISCONTINUITY` |
+| W5102 | WARN | A/V drift corrected | Drift ms, samples inserted/dropped |
+| W5103 | WARN | Audio device changed/lost | Default device switch; stream restarted |
+| W6101 | WARN | Power state change | AC ↔ battery, battery saver |
+| W6102 | WARN | High system CPU | > 95% for 3 s (game and host % reported) |
+| E1401 / W2401 | ERR/WARN | Host lost / target exited | |
+| F6999 | FATAL | Unhandled exception | Minidump path |
+
+**Every second during a recording** an `I6002` summary line is logged: game fps, captured fps, DUPs, drops, avg/max hook ms, avg/max encode ms, ratio, NEAR level, queue %, write MB/s, free space.
+
+### 10.5 Summary JSON (end of session)
+Duration; frames by type (I/P/DUP/dropped); game fps (avg, 1% low); hook cost (avg, p50, p99, max); encode ms (avg, p99, max); compression ratio (real frames, overall); bytes written; average and peak write MB/s; slow-write counts; seconds at each rate level; audio discontinuities; maximum A/V drift; warning and error counts by code; final status (OK / stopped by error + code).
+
+---
+
+## 11. Container and disk writer
+
+### 11.1 Container: AVI OpenDML (AVI 2.0)
+- Video stream: FourCC `RCV1`, `BITMAPINFOHEADER` with the 32-byte RCV1 sequence header as extradata. `AVIIF_KEYFRAME` on I-frames. DUP packets are written as normal 8-byte chunks.
+- Audio stream(s): `WAVE_FORMAT_PCM`, 48 kHz, 16-bit, stereo (≈0.19 MB/s); a second track for the microphone if enabled.
+- OpenDML: `RIFF AVI ` + `RIFF AVIX` extension blocks (~1 GB each), `indx` super-index + `ix##` standard indexes per block, and a legacy `idx1` for the first block. Needed for files > 1 GB.
+- Interleave audio and video about every 0.5 s, ordered by QPC timestamp.
+
+### 11.2 Writer
+- Dedicated writer thread; file opened with `FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED`. Data goes into **sector-aligned 8 MB write buffers** (double-buffered, two writes in flight).
+- At close: write the final partial buffer padded to the sector size, then truncate to the real length with `SetFileInformationByHandle(FileEndOfFileInfo)`.
+- Preallocate in 1 GB steps (`FileAllocationInfo`) to reduce fragmentation on hard drives.
+- Measure every write's latency and throughput; feed the rate controller and telemetry.
+- **File splitting:** automatic on FAT32 volumes (at 3.9 GB); optional `split_gb` for other volumes. Each part is a complete AVI with its own sequence header; the first frame of each part is forced to be an I-frame.
+
+### 11.3 Crash safety (X5)
+- Every 10 s, the writer flushes the current indexes (in the AVI structure: `ix##` chunks for the data written so far) so an unfinished file is mostly indexed.
+- `rec repair <file>` scans the RIFF chunks linearly, rebuilds all indexes, and truncates any partial trailing chunk. Tested by killing `rec.exe` mid-recording (§14).
+
+### 11.4 Disk benchmark
+`rec bench-disk [--path D:\Recordings] [--size 2GB]`: sequential unbuffered 8 MB writes with the same code path as the real writer; reports sustained MB/s, p99 latency and the slowest write. Results are cached per volume in `rec.toml` and used by the startup check (§9).
+
+---
+
+## 12. CLI (R8)
+
+### 12.1 Commands
+```
+rec list                                   Processes with graphics APIs loaded (PID, name, bitness, APIs)
+rec launch <exe> [options] [-- game args]  Start a game with the hook injected
+rec attach (--pid N | --name X.exe) [options]
+rec detach
+rec bench-disk [--path P] [--size S]
+rec bench-overhead (--pid|--name) [--seconds 60]   A/B measurement of game frame times (§14.4)
+rec convert <in.avi> [--to mp4|mkv] [--crf 16] [--out P]   Decode + pipe to FFmpeg (video + audio)
+rec verify <in.avi>                        Decode every frame; check structure, indexes, CRCs if present
+rec repair <in.avi>                        Rebuild indexes after a crash
+rec doctor                                 Environment check (§12.3)
+rec config (show | set <key> <value> | reset)
+```
+
+### 12.2 Recording options (for `launch`/`attach`; defaults come from `rec.toml`)
+| Option | Default | Notes |
+|---|---|---|
+| `--fps N` | 60 | Clamped to refresh rate |
+| `--size WxH \| native` | 1280x720 | Clamped to back-buffer size; aspect preserved with letterboxing |
+| `--lock / --no-lock` | lock | §6.2 |
+| `--encoder rcv \| rcv-strict \| hw` | rcv | §8.1 |
+| `--format yuv420 \| rgb` | yuv420 | |
+| `--audio game \| system \| none` | game (falls back to system) | §13.3 |
+| `--mic [device]` | off | Separate track |
+| `--out DIR` | `%USERPROFILE%\Videos\rec` | |
+| `--hotkey F9` | F9 | Any virtual key plus modifiers |
+| `--sound / --no-sound` | sound | Start/stop cue |
+| `--queue-mb N` | 256 | Packet arena size |
+| `--split-gb N` | 0 (auto for FAT32) | |
+| `--verbose` | off | DEBUG logging |
+
+### 12.3 `rec doctor` checks
+Windows build; CPU features (AVX2/SSE4.1); logical core count; RAM; GPU(s) and driver versions; whether F9 is free to register; output folder writable; filesystem type; free space; cached disk benchmark vs the required rate at the default settings; power source; presence of a hardware encoder MFT; FFmpeg on PATH (for `convert`). Each check prints PASS/WARN/FAIL with a one-line fix.
+
+### 12.4 Live status line (single line, refreshed 4× per second)
+```
+● REC 00:03:17 | javaw.exe OpenGL 1360x744→1280x720 @60 lock | game 58.9 fps | hook 0.31 ms
+  | enc 2.4 ms | ratio 2.7 | lossless | queue 3% | disk 31 MB/s | drops 0 | free 212 GB
+```
+Idle: `○ IDLE javaw.exe (OpenGL) — press F9 to record`.
+Ctrl+C: stop the recording cleanly if one is running, then detach and exit.
+
+---
+
+## 13. Hotkeys, audio, robustness
+
+### 13.1 Hotkeys (R7)
+- Primary: `RegisterHotKey` on the hotkey thread (global; works when the game has focus). F9 toggles start/stop.
+- If registration fails (key taken by another app): fall back to a `WH_KEYBOARD_LL` hook on the same thread, and log `E7003`.
+- Debounce 300 ms; ignore auto-repeat.
+- **Audio cue (X4):** short distinct sounds for start, stop, and error (`PlaySound` with embedded WAV resources, played asynchronously on the hotkey thread). Disable with `--no-sound`.
+- Optional second key (config `marker_key`, off by default): writes a timestamped marker into the log and summary, handy for finding moments in long recordings.
+
+### 13.2 Protecting the game (R2, X1)
+- All hook entry points: increment the in-hook counter → `__try { capture work } __except(EXCEPTION_EXECUTE_HANDLER) { disable capture; record code in the control block }` → always call the original Present → decrement the counter.
+- Hook code allocates nothing in Present after setup; all objects are created in the lazy-init step.
+- A hard per-frame budget: if the hook's own work (excluding the deliberate pacing wait) exceeds 4 ms on 3 consecutive frames, capture pauses for 1 s and `W1203` is logged, so a pathological case can't cripple the game.
+
+### 13.3 Audio (X3)
+- **Game audio:** WASAPI process loopback (`ActivateAudioInterfaceAsync` with `AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK`, including the target's process tree). Needs Windows 10 build 20348 or later (in practice Windows 11); otherwise fall back to system loopback (`I5001`).
+- **System audio:** loopback on the default render device.
+- **Microphone:** shared-mode capture on the chosen device, separate AVI track.
+- Format: convert to 48 kHz / 16-bit / stereo in the audio thread when the device mix format differs (float → int16; resample with a simple polyphase filter if the rate differs).
+- **Silence gap:** loopback delivers **no packets while nothing is playing**. The audio thread inserts silence based on QPC so the audio timeline never falls behind.
+- **A/V sync:** each packet's QPC position comes from `IAudioCaptureClient::GetBuffer`. Audio before `t0` is trimmed, gaps are filled with silence. Drift (samples delivered vs QPC elapsed) is checked every 10 s; if |drift| > 5 ms, one sample per channel is inserted or dropped per 10 ms of audio until corrected (`W5102`).
+- Default-device changes (`IMMNotificationClient`): restart the stream on the new device and log `W5103`.
+
+### 13.4 Host crash handling
+`SetUnhandledExceptionFilter` → write a minidump (`MiniDumpWriteDump`) next to the log, flush the logger, attempt to finalise the AVI indexes, then exit. `F6999` is logged with the dump path.
+
+### 13.5 Timer and power hygiene
+- No global `timeBeginPeriod(1)`; use high-resolution waitable timers instead.
+- Log the power source and battery-saver state at start and on change (`W6101`), because an i5-7200U on battery can run at a much lower clock.
+
+---
+
+## 14. Testing strategy
+
+### 14.1 Synthetic test app (`rec_testapp`, X10)
+A small window app with D3D11, OpenGL and (later) D3D9 modes, 32-bit and 64-bit builds. Each frame it renders:
+- a **frame counter encoded as a 32-bit barcode** of large black/white blocks (survives scaling and near-lossless),
+- moving gradients and noise (realistic compression load),
+- a configurable frame-time pattern: steady, jittery, periodic spikes, a long freeze, resize events, alt-tab (minimise).
+
+`rec verify --testapp` decodes a recording, reads the barcodes and reports: missing counters, repeated counters that aren't DUPs, out-of-order frames, and the frame spacing of the output versus the expected tick grid. This checks R3 automatically.
+
+### 14.2 Automated test matrix
+| Test | Pass condition |
+|---|---|
+| End-to-end D3D11 / GL / D3D9, x64 and x86 | Every frame the app presented at a tick is present exactly once; DUPs only where the app didn't present |
+| Freeze test (app sleeps 10 s) | Video continues with DUPs; audio in sync after the freeze |
+| Resize storm (10 resizes/s for 5 s) | No crash; output size constant; `I1208` logged |
+| Device removed (`--debug-device-removed`) | `E1209` logged; resources recreated; capture resumes |
+| Host killed mid-recording | Game keeps running (`E1401` in hook log); `rec repair` recovers the file; `rec verify` passes |
+| Game killed mid-recording | File finalised; `W2401` |
+| 30-minute soak at 720p60 | No growth in memory or handles; A/V drift ≤ 1 frame (16.7 ms) |
+| Hook exception injection | Capture disables; game keeps running |
+| Address lookup, per API × x86/x64 | For each supported API, kiero2 (and `D3D9Ex`) returns pointers that pass §4.6.3 validation, and a hooked `Present` fires on the test app |
+| Launch mode, late-loaded DLL | `rec launch` on the test app: `I1103` logged, hooks installed after the DLL loads, first frame captured |
+| Lookup failure | `--debug-kiero-fail <api>` forces an error: `E1105` logged, other APIs unaffected, game keeps running |
+
+### 14.3 Fault-injection flags (debug builds and `--debug-*` options)
+`--debug-throttle-disk <MB/s>` (writer sleeps to simulate a slow HDD), `--debug-write-stall <ms every s>`, `--debug-encoder-delay <ms>`, `--debug-drop-readback <1/N>`, `--debug-hook-throw` (throws inside the hook guard), `--debug-fill-disk` (simulated free space), `--debug-device-removed` (backend behaves as if Present returned `DXGI_ERROR_DEVICE_REMOVED`), `--debug-kiero-fail <api>` (treat that API's address lookup as failed). Each one must produce the matching log codes from §10.4 and the expected rate-controller behaviour.
+
+### 14.4 Overhead measurement (R2, X11)
+`rec bench-overhead` attaches, then alternates 20-second windows of **idle** and **recording** (default 3 of each) in the same scene. It logs game frame-time distributions (avg fps, 1% low, p99 frame time) and hook cost for each window, then prints the difference. For comparison with FRAPS, run the same scene with FRAPS and note the in-game fps (F3 in Minecraft) the same way.
+
+---
+
+## 15. Performance targets (to validate on the i5-7200U; **targets, not measurements**)
+
+| # | Metric | Target |
+|---|---|---|
+| P1 | Hook cost when IDLE | < 5 µs per Present |
+| P2 | Hook cost when recording (excluding pacing wait), 1360×744 → 1280×720 | median ≤ 0.5 ms, p99 ≤ 1.0 ms |
+| P3 | Game fps while recording, same scene, lock at 60 | Not lower than with FRAPS under the same settings |
+| P4 | Pacing error (capture time vs tick) | p99 ≤ 1 ms |
+| P5 | F9 → first captured frame | ≤ 1 frame interval after the next Present |
+| P6 | F9 (stop) → file closed and summary written | ≤ 2 s |
+| P7 | Host CPU at 720p60, lossless | ≤ 2 logical CPUs busy on average |
+| P8 | Host memory | ≤ 400 MB at 1080p60 with default queue |
+| P9 | Unexplained frame loss in the test app | 0 |
+| P10 | A/V drift over 30 minutes | ≤ 16.7 ms |
+
+---
+
+## 16. Build milestones (in order)
+
+| M | Deliverable | Acceptance |
+|---|---|---|
+| M0 | Repository layout (§18), CMake for x64 + x86, `rec_core` + CLI skeleton (CLI11, toml++), spdlog async logging with session files, event-code registry, `rec doctor` (basic) | Builds clean at `/W4`; `rec doctor` runs; log files created |
+| M1 | `rec_testapp` (D3D11); injection (`launch`, `attach`, x64); vendor kiero2 (§4.6.1) + `kiero_wrap.hpp` + `vtable_indices.h` + pointer validation; deferred install via `LdrRegisterDllNotification`; MinHook D3D11 Present hook (address from kiero2) that only **measures** frame times; shared control block + hook log ring (kiero2 debug output routed into it); `rec list`; live status line showing game fps | Attach/detach 100× without a crash; `launch` and `attach` both hook successfully (`I1103` seen in launch mode); game fps visible; hook log records arrive in the host log |
+| M2 | D3D11 capture: copy + scale + NV12 shader + staging ring + shared frame ring; hotkey thread (F9) + audio cue; session state machine; host receives frames and checksums them (no encoding yet) | P1, P2 measured; F9 start/stop works in fullscreen; no GPU stalls (`W1201` rare) |
+| M3 | Integrate RCV1; timeline + DUP filling; lock/free pacing; AVI OpenDML writer (unbuffered, overlapped); `rec verify`; `rec convert` (video only); telemetry CSV + summary JSON | Test-app end-to-end passes P9; freeze test passes; files convert with FFmpeg |
+| M4 | OpenGL backend (PBO path) + host BGRA→I420 conversion; test on Minecraft | Minecraft recording works; overhead A/B vs FRAPS recorded |
+| M5 | Rate controller (disk + CPU); `bench-disk`; startup disk check; slow-write/free-space/power/CPU monitoring; all §10.4 codes wired; fault-injection flags | Every fault flag produces the right codes and behaviour; `--debug-throttle-disk 20` recording stays in sync with no stalls |
+| M6 | Audio: system loopback → process loopback → mic; A/V sync + drift correction; audio in `convert` | Freeze test and 30-minute soak meet P10 |
+| M7 | Robustness: resize/alt-tab/device-lost; SEH guard + budget guard; host crash handler + minidumps; periodic index flush + `rec repair`; FAT32 split; anti-cheat blocklist; x86 hook + `rec_inject32` | All §14.2 tests pass for x64 and x86 |
+| M8 | D3D9 backend, including the custom kiero2 `Implementation_D3D9Ex` backend (§4.6.4) | End-to-end tests pass on D3D9 and D3D9Ex test apps, x86 and x64 |
+| M9 | Hardware-encoder fallback (`--encoder hw`, Media Foundation → MP4) + suggestion logic | Records 1080p60 with `--debug-throttle-disk 15` without drops |
+| M10 | (Later) D3D12 (Present + command-queue discovery, both via kiero2 `Implementation_D3D12`) and Vulkan (implicit layer, not kiero2) | Test apps pass |
+| M11 | Acceptance report: P1–P10 measured, FRAPS comparison on the same Minecraft scene, known issues | Report complete |
+
+---
+
+## 17. Default configuration (`rec.toml`)
+```toml
+[record]
+fps = 60
+size = "1280x720"        # or "native"
+lock = true
+encoder = "rcv"          # rcv | rcv-strict | hw
+format = "yuv420"        # yuv420 | rgb
+out_dir = "%USERPROFILE%\\Videos\\rec"
+split_gb = 0             # 0 = auto (FAT32 only)
+queue_mb = 256
+staging_slots = 3
+frame_slots = 8
+
+[hotkeys]
+toggle = "F9"
+marker_key = ""          # e.g. "F10"
+sound = true
+
+[audio]
+source = "game"          # game | system | none
+mic = ""                 # device name or "" for off
+
+[rate]
+levels = [40, 60, 75, 90]   # packet-queue % thresholds (§9)
+step_down_after_s = 2
+
+[log]
+level = "info"
+slow_write_ms = 50
+very_slow_write_ms = 250
+slow_hook_ms = 1.0
+low_space_gb = 5
+critical_space_gb = 1
+
+[safety]
+anticheat_blocklist = ["EasyAntiCheat", "BEService", "BEDaisy", "vgc", "vgk"]
+```
+
+---
+
+## 18. Repository layout
+```
+rec/
+  CMakeLists.txt
+  codec/                    RCV1 (from RCV1_Codec_Plan.md) — x64 only
+  common/                   Shared-memory protocol structs, event codes, QPC helpers (x86 + x64)
+  hook/                     rec_hook{32,64}.dll
+    hook_main.cpp           Load, hook install, control thread, SEH guard
+    locate.cpp              Calls kiero2 per API, deferred install, pointer validation (§4.6)
+    kiero_wrap.hpp          The only place kiero2 headers are included (fixed order, log/assert macros)
+    kiero_d3d9ex.hpp/.cpp   Custom kiero2 backend for D3D9Ex + IDirect3DSwapChain9 (§4.6.4)
+    vtable_indices.h        Named vtable index constants (§4.6.3 table)
+    backend_d3d11.cpp
+    backend_gl.cpp
+    backend_d3d9.cpp
+    shaders/                HLSL scale + NV12 (compiled offline to bytecode headers)
+    pacer.cpp
+    logring.cpp
+  inject32/                 rec_inject32.exe (x86)
+  core/                     rec_core library (x64)
+    session.cpp  hotkeys.cpp  receiver.cpp  convert_bgra.cpp  ratecontrol.cpp
+    audio.cpp  mux_avi.cpp  writer.cpp  hwenc_mf.cpp  monitor.cpp  logging.cpp
+    telemetry.cpp  config.cpp  inject.cpp  anticheat.cpp  crash.cpp
+  cli/                      rec.exe front-end (CLI11), status line
+  tools/                    verify, repair, convert helpers
+  testapp/                  rec_testapp (D3D11 / GL / D3D9; x86 + x64)
+  tests/
+  third_party/              MinHook, kiero2 (pinned commit), CLI11, toml++, spdlog, doctest
+  docs/                     This plan, codec plan, DECISIONS.md, README.md
+```
+
+---
+*End of implementation plan.*
