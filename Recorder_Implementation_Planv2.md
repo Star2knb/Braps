@@ -159,7 +159,7 @@ Before injecting, scan the target's loaded modules and running services/processe
 ### 4.3 API detection
 `rec list` and the hook both detect APIs from loaded modules: `d3d9.dll`, `d3d10*.dll`, `d3d11.dll`, `d3d12.dll`, `opengl32.dll`, `vulkan-1.dll`, `dxgi.dll`. Several can be loaded at once (launchers, overlays), so the backend is chosen by **which Present is actually called** at runtime: all supported Present functions are hooked, and the first one that fires with a real swap chain wins. Logged as `I1101`.
 
-> **Your test game:** since FRAPS (which supports DirectX up to 11 and OpenGL, but not D3D12 or Vulkan) could record it, your Minecraft build is most likely running on OpenGL (Java Edition). `rec list` will confirm. For that reason the OpenGL backend is built right after D3D11.
+> **Your test game (updated 2026-09-28):** the Minecraft test recordings are **Bedrock Edition** (v26.52 main menu, Marketplace/Realms), not Java. Bedrock renders with DirectX, and FRAPS (DirectX up to 11 and OpenGL, not D3D12 or Vulkan) recorded it, so it ran on **D3D11** — the first backend (M2). `rec list` will confirm. The OpenGL backend (M4) is still needed for Java-based and other OpenGL games; the second test game, Warframe, is also DirectX.
 
 ### 4.4 Functions hooked per API
 | API | Hooked | How addresses are found |

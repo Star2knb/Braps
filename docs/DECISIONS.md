@@ -200,3 +200,28 @@ I-frame.
 the encoder's own phase A finds duplicates; with skip off, frames identical to the previous one go
 through `rcv_encode_duplicate` (the recorder host's path for timeline gaps), which keeps "noskip" rows
 comparable with the M2-M4 reports. `--no-decode` measures the encoder alone, as the recorder runs it.
+
+## M6
+
+**D-034 — GBR encoding without a reference copy.** A prepare pass (one job per slice, the same
+dispatch as phase A) converts the BGRA/BGRX input into encoder-owned "staging" planes G, B-G, R-G
+(§4.4) and, when phase A runs, compares them with the reference (equal planes <=> equal RGB, the
+transform is a bijection). Phase B predicts straight from the staging planes; afterwards staging and
+reference swap pointers, because a lossless reconstruction equals the source. YUV input keeps the
+copy into the reference (its buffers belong to the caller). For GBR, `time_skip_us` includes the
+conversion.
+
+**D-035 — Output layouts.** The codec stores colour metadata but never converts between YUV and RGB
+(§4.3): YUV420 streams decode to I420 or NV12, GBR streams to BGRA (alpha = 255). Other combinations
+return `RCV_ERR_UNSUPPORTED`.
+
+**D-036 — GBR details.** Colour conversion kernels are SSE2 (x64 baseline, 16 pixels per step, tested
+against scalar references), so no ISA dispatch. Odd sizes are allowed for GBR (§4.5 only requires
+even sizes for YUV420). Alpha is ignored: BGRX and BGRA with any alpha give identical packets.
+Near-lossless with GBR is `RCV_ERR_INVALID_ARG` (never allowed, §4.1), not "unsupported yet".
+
+**D-037 — RGB measurements.** Ratios for RGB use 3 bytes per pixel as the raw size (alpha is not
+coded). The RGB test content is the FRAPS recordings converted to BGRA, i.e. upsampled 4:2:0
+chroma, which is smoother than a true RGB capture, so RGB compression figures are optimistic until
+real RGB captures (OpenGL/D3D9 readback in the recorder) are available. `compare_rgb.ps1` pipes the
+frames from the recording through FFmpeg to avoid a 6.5 GB corpus on disk.

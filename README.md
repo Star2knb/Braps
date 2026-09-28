@@ -15,7 +15,8 @@ unchanged in [legacy/](legacy/) for reference; it is not part of the V2 build.
 | RCV1 codec | M3 — SSE4.1/AVX2 kernels, faster Huffman | done — [report](docs/reports/M3-speed.md): encode 3.18 ms, decode 5.26 ms (1 thread) |
 | RCV1 codec | M4 — thread pool, slice-parallel encode/decode | done — [report](docs/reports/M4-threads.md): encode 1.60 ms, decode 2.87 ms (2 threads) |
 | RCV1 codec | M5 — temporal skip (P-frames), auto-DUP, keyframe logic | done — [report](docs/reports/M5-skip.md): Minecraft files 41% smaller than FRAPS |
-| RCV1 codec | M6 — lossless RGB (GBR format, BGRA input/output) | next |
+| RCV1 codec | M6 — lossless RGB (GBR format, BGRA input/output) | done — [report](docs/reports/M6-rgb.md) |
+| RCV1 codec | M7 — near-lossless mode, per-frame NEAR switching | next |
 | Recorder | M0 | not started |
 
 ## Build
@@ -33,7 +34,8 @@ rcv_cli verify -i in.yuv -c out.rcv
 rcv_cli stats  -i out.rcv
 rcv_cli decode -i out.rcv -o - | ffmpeg -f rawvideo -pix_fmt yuv420p -s 1360x744 -r 60 -i - -c:v libx264 -crf 16 out.mp4
 ```
-Raw input is planar I420 (`ffmpeg ... -pix_fmt yuv420p -f rawvideo out.yuv`).
+Raw input is planar I420 (`ffmpeg ... -pix_fmt yuv420p -f rawvideo out.yuv`), or packed BGRA with
+`-f rgb` (`ffmpeg ... -pix_fmt bgra -f rawvideo out.bgra`), which is stored losslessly as GBR.
 
 ## Benchmarks
 Test corpora live in `corpus/` (git-ignored). From a FRAPS recording:
