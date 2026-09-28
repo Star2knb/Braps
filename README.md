@@ -16,7 +16,8 @@ unchanged in [legacy/](legacy/) for reference; it is not part of the V2 build.
 | RCV1 codec | M4 — thread pool, slice-parallel encode/decode | done — [report](docs/reports/M4-threads.md): encode 1.60 ms, decode 2.87 ms (2 threads) |
 | RCV1 codec | M5 — temporal skip (P-frames), auto-DUP, keyframe logic | done — [report](docs/reports/M5-skip.md): Minecraft files 41% smaller than FRAPS |
 | RCV1 codec | M6 — lossless RGB (GBR format, BGRA input/output) | done — [report](docs/reports/M6-rgb.md) |
-| RCV1 codec | M7 — near-lossless mode, per-frame NEAR switching | next |
+| RCV1 codec | M7 — near-lossless mode, per-frame NEAR switching | done — [report](docs/reports/M7-near-lossless.md): NEAR 1 = 8.4:1, NEAR 3 = 11.7:1 whole file |
+| RCV1 codec | M8 — hardening: validation audit, CRC-32C, no-allocation test, fuzzing | next |
 | Recorder | M0 | not started |
 
 ## Build

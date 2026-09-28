@@ -225,3 +225,29 @@ coded). The RGB test content is the FRAPS recordings converted to BGRA, i.e. ups
 chroma, which is smoother than a true RGB capture, so RGB compression figures are optimistic until
 real RGB captures (OpenGL/D3D9 readback in the recorder) are available. `compare_rgb.ps1` pipes the
 frames from the recording through FFmpeg to avoid a 6.5 GB corpus on disk.
+
+## M7
+
+**D-038 — Near-lossless encoding.** Exactly plan §5.5: `q = sign(e)·((|e|+n) div (2n+1))`, reconstruction
+`clamp(pred + q·(2n+1))`, symbol `q & 0xFF`; prediction uses reconstructed neighbours, so it is serial
+along a row. Implementation: the MED clamp form (D-023), and per-NEAR tables indexed by `e + 255`
+giving the symbol and `q·(2n+1)` (no division or multiply on the dependency chain). Two consecutive
+full rows are coded as a **wavefront** (row j+1 one sample behind row j, which is all its prediction
+needs) so two serial chains overlap on one core; the output is identical to coding the rows one after
+the other. Rows with skipped blocks use the single-row path. NEAR is taken per frame from
+`rcv_encode_params`.
+
+**D-039 — Near-lossless skip.** Phase A compares with tolerance NEAR (SSE2 saturating differences);
+lossless keeps the exact compare. The comparison is with the *reference* (the previous
+reconstruction), so a skipped block's samples stay within NEAR of the current frame's source: the
+error bound holds on every frame, with no drift along P-frame chains. Skipped blocks keep the
+reference samples (no copy).
+
+**D-040 — Decoder reconstruction policy.** All reconstruction loops (single, paired, masked rows) take
+a policy: lossless adds modulo 256 (same code as before), near-lossless adds the dequantised value
+from a 256-entry table and clamps. The table is defined for every byte, so corrupt symbols can't
+index out of range or overflow.
+
+**D-041 — Verifying near-lossless streams.** `rcv_cli verify` allows the largest NEAR seen so far
+(header byte 9; a DUP carries none) and reports the maximum error per plane; `rcv_bench --near`
+checks every frame against its own NEAR.
