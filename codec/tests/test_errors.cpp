@@ -34,9 +34,20 @@ TEST_CASE("errors: encoder config validation") {
     c.predictor = 2;
     CHECK(rcv_encoder_create(&c, &enc) == RCV_ERR_INVALID_ARG);
     c = config_for(64, 32);
-    c.format = RCV_FMT_GBR;
-    CHECK(rcv_encoder_create(&c, &enc) == RCV_ERR_UNSUPPORTED);
+    c.format = RCV_FMT_GBR;  // GBR needs a BGRA/BGRX input layout
+    CHECK(rcv_encoder_create(&c, &enc) == RCV_ERR_INVALID_ARG);
     CHECK(rcv_max_packet_size(&c) == 0);
+    c = config_for(64, 32);
+    c.input_layout = RCV_IN_BGRA;  // ... and YUV420 an I420/NV12 one
+    CHECK(rcv_encoder_create(&c, &enc) == RCV_ERR_INVALID_ARG);
+    c = config_for(33, 21);
+    c.format = RCV_FMT_GBR;
+    c.input_layout = RCV_IN_BGRX;  // odd sizes are fine for GBR
+    CHECK(rcv_encoder_create(&c, &enc) == RCV_OK);
+    rcv_encoder_destroy(enc);
+    enc = nullptr;
+    c.format = rcv_format(7);
+    CHECK(rcv_encoder_create(&c, &enc) == RCV_ERR_INVALID_ARG);
     CHECK(enc == nullptr);
 }
 
@@ -86,9 +97,15 @@ TEST_CASE("errors: sequence header validation") {
     bad[10] = 65;  // display wider than coded
     CHECK(rcv_decoder_create(bad, 1, &dec) == RCV_ERR_BITSTREAM);
     std::memcpy(bad, seq, 32);
-    bad[5] = 1;  // GBR: M6
-    CHECK(rcv_decoder_create(bad, 1, &dec) == RCV_ERR_UNSUPPORTED);
+    bad[5] = 2;  // unknown format
+    CHECK(rcv_decoder_create(bad, 1, &dec) == RCV_ERR_BITSTREAM);
     CHECK(dec == nullptr);
+    std::memcpy(bad, seq, 32);
+    bad[5] = 1;   // GBR
+    bad[6] = 63;  // odd width: fine for GBR
+    bad[10] = 63;
+    CHECK(rcv_decoder_create(bad, 1, &dec) == RCV_OK);
+    rcv_decoder_destroy(dec);
 }
 
 TEST_CASE("errors: packets rejected by the decoder") {

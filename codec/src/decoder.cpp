@@ -1,5 +1,5 @@
 // RCV1 decoder (codec plan §5.7, §6, §8, Appendix A.2).
-// Scope so far: I-, P- and DUP frames; I420 / NV12 output. Chunks are decoded in parallel on the
+// Scope so far: YUV420 and GBR; I-, P- and DUP frames; I420 / NV12 / BGRA output. Chunks are decoded in parallel on the
 // thread pool; within a chunk, entropy decoding and reconstruction run fused in one serial pass (the
 // decoder is inherently serial along a row, §5.4). Decoding happens in place in the reference, so
 // skipped blocks of a P-frame simply keep the previous frame's samples.
@@ -11,6 +11,7 @@
 #include <new>
 
 #include "aligned_buffer.h"
+#include "colour.h"
 #include "crc32c.h"
 #include "format.h"
 #include "huffman.h"
@@ -476,16 +477,23 @@ rcv_status check_output(const rcv_decoder* d, rcv_output_layout layout, uint8_t*
     if (!plane || !plane[0]) return RCV_OK;  // decode only
     if (!stride) return RCV_ERR_INVALID_ARG;
     const Geometry& g = d->geo;
+    // The codec stores colour metadata but never converts between YUV and RGB (§4.3):
+    // YUV420 streams output I420/NV12, GBR streams output BGRA.
+    const bool gbr = g.format == RCV_FMT_GBR;
     switch (layout) {
     case RCV_OUT_I420:
+        if (gbr) return RCV_ERR_UNSUPPORTED;
         for (int p = 0; p < 3; ++p)
             if (!plane[p] || stride[p] < g.plane_w[p]) return RCV_ERR_INVALID_ARG;
         return RCV_OK;
     case RCV_OUT_NV12:
+        if (gbr) return RCV_ERR_UNSUPPORTED;
         if (!plane[1] || stride[0] < g.width || stride[1] < g.width) return RCV_ERR_INVALID_ARG;
         return RCV_OK;
     case RCV_OUT_BGRA:
-        return RCV_ERR_UNSUPPORTED;  // M6
+        if (!gbr) return RCV_ERR_UNSUPPORTED;
+        if (stride[0] < 4 * g.width) return RCV_ERR_INVALID_ARG;
+        return RCV_OK;
     default:
         return RCV_ERR_INVALID_ARG;
     }
@@ -495,6 +503,14 @@ void write_output(const rcv_decoder* d, rcv_output_layout layout, uint8_t* const
                   const int32_t stride[3]) {
     if (!plane || !plane[0]) return;
     const Geometry& g = d->geo;
+    if (layout == RCV_OUT_BGRA) {  // GBR planes -> B, G, R, 255 (§4.4 inverse)
+        for (int y = 0; y < g.height; ++y) {
+            const ptrdiff_t o = y * d->ref_stride[0];
+            gbr_to_bgra_row(d->ref_plane[0] + o, d->ref_plane[1] + o, d->ref_plane[2] + o, g.width,
+                            plane[0] + ptrdiff_t(y) * stride[0]);
+        }
+        return;
+    }
     if (layout == RCV_OUT_I420) {
         for (int p = 0; p < 3; ++p)
             for (int y = 0; y < g.plane_h[p]; ++y)
@@ -558,8 +574,6 @@ rcv_status rcv_decoder_create(const uint8_t seq_header[32], uint8_t num_threads,
     SeqHeader h;
     rcv_status st = parse_seq_header(seq_header, &h);
     if (st != RCV_OK) return st;
-    if (h.format == RCV_FMT_GBR) return RCV_ERR_UNSUPPORTED;  // M6
-
     rcv_decoder* d = new (std::nothrow) rcv_decoder{};
     if (!d) return RCV_ERR_OUT_OF_MEMORY;
     d->seq = h;

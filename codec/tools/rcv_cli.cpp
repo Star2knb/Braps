@@ -20,10 +20,11 @@ namespace {
 void usage() {
     std::fprintf(stderr,
                  "usage:\n"
-                 "  rcv_cli encode -i in.yuv -s WxH [-f yuv420] [-r FPS[/DEN]] [--near N] [--slices S]\n"
+                 "  rcv_cli encode -i in.raw -s WxH [-f yuv420|rgb] [-r FPS[/DEN]] [--near N] [--slices S]\n"
+                 "                 (-f yuv420: planar I420 input; -f rgb: packed BGRA input, stored as GBR)\n"
                  "                 [--threads T] [--predictor med|left] [--no-skip] [--keyint K] [--crc]\n"
                  "                 [--isa scalar|sse41|avx2] [--frames N] -o out.rcv\n"
-                 "  rcv_cli decode -i in.rcv -o out.yuv            (raw I420; '-' = stdout)\n"
+                 "  rcv_cli decode -i in.rcv -o out.raw            (raw I420, or BGRA for RGB; '-' = stdout)\n"
                  "  rcv_cli verify -i in.yuv -c in.rcv             (bit-exact round-trip check)\n"
                  "  rcv_cli stats  -i in.rcv [-v]                  (frame types, sizes, ratios)\n"
                  "Input/output '-' means stdin/stdout.\n");
@@ -136,21 +137,70 @@ struct RcvReader {
 
 size_t i420_size(int w, int h) { return size_t(w) * h + 2 * size_t(w / 2) * (h / 2); }
 
+// Raw frames as the CLI reads and writes them: planar I420 for YUV420, packed BGRA (4 bytes per
+// pixel) for GBR/RGB. Ratios use the bytes that are actually coded: 1.5 per pixel for I420, 3 for
+// RGB (alpha is not stored).
+struct RawFormat {
+    bool rgb = false;
+    int w = 0, h = 0;
+
+    size_t frame_bytes() const { return rgb ? size_t(w) * h * 4 : i420_size(w, h); }
+    double coded_bytes() const { return rgb ? 3.0 * w * h : double(i420_size(w, h)); }
+    rcv_output_layout layout() const { return rgb ? RCV_OUT_BGRA : RCV_OUT_I420; }
+
+    rcv_frame_in input(const uint8_t* f) const {
+        rcv_frame_in in{};
+        if (rgb) {
+            in.plane[0] = f;
+            in.stride[0] = 4 * w;
+            return in;
+        }
+        in.plane[0] = f;
+        in.plane[1] = f + size_t(w) * h;
+        in.plane[2] = in.plane[1] + size_t(w / 2) * (h / 2);
+        in.stride[0] = w;
+        in.stride[1] = in.stride[2] = w / 2;
+        return in;
+    }
+    void output(uint8_t* f, uint8_t* planes[3], int32_t strides[3]) const {
+        const rcv_frame_in in = input(f);
+        for (int p = 0; p < 3; ++p) {
+            planes[p] = const_cast<uint8_t*>(in.plane[p]);
+            strides[p] = in.stride[p];
+        }
+    }
+    // Component of byte k of a frame: 0-2 = Y/Cb/Cr or B/G/R, -1 = BGRA alpha (not compared).
+    int component(size_t k) const {
+        if (rgb) return (k & 3) == 3 ? -1 : int(k & 3);
+        const size_t y = size_t(w) * h, c = size_t(w / 2) * (h / 2);
+        return k < y ? 0 : k < y + c ? 1 : 2;
+    }
+};
+
 int cmd_encode(const Args& a) {
     int w = 0, h = 0;
     if (!a.has("-i") || !a.has("-o") || !parse_size(a.get("-s"), &w, &h)) {
         usage();
         return 2;
     }
-    if (a.get("-f", "yuv420") != "yuv420") {
-        std::fprintf(stderr, "only -f yuv420 is implemented so far (RGB/GBR arrives in M6)\n");
+    const std::string fmt = a.get("-f", "yuv420");
+    if (fmt != "yuv420" && fmt != "rgb") {
+        std::fprintf(stderr, "bad -f (yuv420 or rgb)\n");
         return 2;
     }
+    RawFormat raw_fmt;
+    raw_fmt.rgb = fmt == "rgb";
+    raw_fmt.w = w;
+    raw_fmt.h = h;
 
     rcv_encoder_config cfg;
     rcv_encoder_config_init(&cfg);
     cfg.coded_width = uint16_t(w);
     cfg.coded_height = uint16_t(h);
+    if (raw_fmt.rgb) {
+        cfg.format = RCV_FMT_GBR;
+        cfg.input_layout = RCV_IN_BGRA;
+    }
     unsigned fps_num = 60, fps_den = 1;
     if (a.has("-r") && sscanf_s(a.get("-r").c_str(), "%u/%u", &fps_num, &fps_den) < 1) {
         std::fprintf(stderr, "bad -r\n");
@@ -201,14 +251,9 @@ int cmd_encode(const Args& a) {
     rcv_write_sequence_header(&cfg, seq);
     if (!write_exact(out.get(), seq, 32)) return 1;
 
-    const size_t frame_size = i420_size(w, h);
+    const size_t frame_size = raw_fmt.frame_bytes();
     std::vector<uint8_t> frame(frame_size), pkt(rcv_max_packet_size(&cfg));
-    rcv_frame_in fin{};
-    fin.plane[0] = frame.data();
-    fin.plane[1] = frame.data() + size_t(w) * h;
-    fin.plane[2] = fin.plane[1] + size_t(w / 2) * (h / 2);
-    fin.stride[0] = w;
-    fin.stride[1] = fin.stride[2] = w / 2;
+    const rcv_frame_in fin = raw_fmt.input(frame.data());
 
     long frames = 0;
     uint64_t bytes_out = 32;
@@ -235,12 +280,12 @@ int cmd_encode(const Args& a) {
         }
         bytes_out += 4 + info.packet_size;
         type_count[info.frame_type]++;
-        if (info.frame_type != 0) real_ratio.push_back(double(frame_size) / info.packet_size);
+        if (info.frame_type != 0) real_ratio.push_back(raw_fmt.coded_bytes() / info.packet_size);
         enc_ms.push_back(info.time_total_us / 1000.0);
         ++frames;
     }
 
-    const double raw = double(frame_size) * frames;
+    const double raw = raw_fmt.coded_bytes() * double(frames);
     std::fprintf(stderr,
                  "encoded %ld frames (I %ld, P %ld, DUP %ld) %dx%d\n"
                  "  in  %.1f MB, out %.1f MB, overall ratio %.3f:1\n"
@@ -273,16 +318,21 @@ int cmd_decode(const Args& a) {
     if (!out) return 1;
 
     const int w = r.info.coded_width, h = r.info.coded_height;
-    std::vector<uint8_t> frame(i420_size(w, h));
-    uint8_t* planes[3] = {frame.data(), frame.data() + size_t(w) * h, frame.data() + size_t(w) * h + size_t(w / 2) * (h / 2)};
-    const int32_t strides[3] = {w, w / 2, w / 2};
+    RawFormat raw_fmt;
+    raw_fmt.rgb = r.info.format == RCV_FMT_GBR;
+    raw_fmt.w = w;
+    raw_fmt.h = h;
+    std::vector<uint8_t> frame(raw_fmt.frame_bytes());
+    uint8_t* planes[3];
+    int32_t strides[3];
+    raw_fmt.output(frame.data(), planes, strides);
     long n = 0;
     for (int rc; (rc = r.next()) != 0; ++n) {
         if (rc < 0) {
             std::fprintf(stderr, "packet %ld: truncated or corrupt container\n", n);
             return 1;
         }
-        st = rcv_decode_frame(dec, r.pkt.data(), r.pkt.size(), RCV_OUT_I420, planes, strides, nullptr);
+        st = rcv_decode_frame(dec, r.pkt.data(), r.pkt.size(), raw_fmt.layout(), planes, strides, nullptr);
         if (st != RCV_OK) {
             std::fprintf(stderr, "packet %ld: decode failed: %s\n", n, rcv_status_string(st));
             return 1;
@@ -292,7 +342,7 @@ int cmd_decode(const Args& a) {
             return 1;
         }
     }
-    std::fprintf(stderr, "decoded %ld frames (%dx%d I420)\n", n, w, h);
+    std::fprintf(stderr, "decoded %ld frames (%dx%d %s)\n", n, w, h, raw_fmt.rgb ? "BGRA" : "I420");
     return 0;
 }
 
@@ -314,11 +364,15 @@ int cmd_verify(const Args& a) {
     std::unique_ptr<rcv_decoder, void (*)(rcv_decoder*)> guard(dec, rcv_decoder_destroy);
 
     const int w = r.info.coded_width, h = r.info.coded_height;
-    const size_t fs = i420_size(w, h);
-    const size_t plane_off[4] = {0, size_t(w) * h, size_t(w) * h + size_t(w / 2) * (h / 2), fs};
+    RawFormat raw_fmt;
+    raw_fmt.rgb = r.info.format == RCV_FMT_GBR;
+    raw_fmt.w = w;
+    raw_fmt.h = h;
+    const size_t fs = raw_fmt.frame_bytes();
     std::vector<uint8_t> frame(fs), ref(fs);
-    uint8_t* planes[3] = {frame.data(), frame.data() + plane_off[1], frame.data() + plane_off[2]};
-    const int32_t strides[3] = {w, w / 2, w / 2};
+    uint8_t* planes[3];
+    int32_t strides[3];
+    raw_fmt.output(frame.data(), planes, strides);
 
     long n = 0, bad_frames = 0;
     int max_err[3] = {};
@@ -327,7 +381,7 @@ int cmd_verify(const Args& a) {
             std::fprintf(stderr, "packet %ld: truncated or corrupt container\n", n);
             return 1;
         }
-        st = rcv_decode_frame(dec, r.pkt.data(), r.pkt.size(), RCV_OUT_I420, planes, strides, nullptr);
+        st = rcv_decode_frame(dec, r.pkt.data(), r.pkt.size(), raw_fmt.layout(), planes, strides, nullptr);
         if (st != RCV_OK) {
             std::fprintf(stderr, "packet %ld: decode failed: %s\n", n, rcv_status_string(st));
             return 1;
@@ -337,19 +391,21 @@ int cmd_verify(const Args& a) {
             return 1;
         }
         bool frame_ok = true;
-        for (int p = 0; p < 3; ++p)
-            for (size_t k = plane_off[p]; k < plane_off[p + 1]; ++k) {
-                const int e = std::abs(int(frame[k]) - int(ref[k]));
-                if (e) {
-                    frame_ok = false;
-                    max_err[p] = std::max(max_err[p], e);
-                }
+        for (size_t k = 0; k < fs; ++k) {
+            const int c = raw_fmt.component(k);
+            if (c < 0) continue;  // alpha
+            const int e = std::abs(int(frame[k]) - int(ref[k]));
+            if (e) {
+                frame_ok = false;
+                max_err[c] = std::max(max_err[c], e);
             }
+        }
         if (!frame_ok && ++bad_frames <= 10) std::fprintf(stderr, "frame %ld differs\n", n);
     }
     if (bad_frames) {
-        std::fprintf(stderr, "FAIL: %ld of %ld frames differ; max error Y %d, Cb %d, Cr %d\n", bad_frames, n,
-                     max_err[0], max_err[1], max_err[2]);
+        std::fprintf(stderr, "FAIL: %ld of %ld frames differ; max error %s %d, %s %d, %s %d\n", bad_frames, n,
+                     raw_fmt.rgb ? "B" : "Y", max_err[0], raw_fmt.rgb ? "G" : "Cb", max_err[1],
+                     raw_fmt.rgb ? "R" : "Cr", max_err[2]);
         return 1;
     }
     std::fprintf(stderr, "PASS: %ld frames bit-exact (%dx%d)\n", n, w, h);
@@ -365,7 +421,11 @@ int cmd_stats(const Args& a) {
     if (!r.open(a.get("-i"))) return 1;
     const bool verbose = a.has("-v");
     const int w = r.info.coded_width, h = r.info.coded_height;
-    const double raw = double(i420_size(w, h));
+    RawFormat raw_fmt;
+    raw_fmt.rgb = r.info.format == RCV_FMT_GBR;
+    raw_fmt.w = w;
+    raw_fmt.h = h;
+    const double raw = raw_fmt.coded_bytes();
     static const char* kTypes[] = {"DUP", "I", "P"};
     static const char* kModes[] = {"HUFFMAN", "SINGLE", "RAW", "EMPTY"};
     long n = 0, type_count[3] = {}, mode_count[4] = {};

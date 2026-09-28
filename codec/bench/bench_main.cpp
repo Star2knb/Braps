@@ -8,7 +8,9 @@
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <fcntl.h>
 #include <intrin.h>
+#include <io.h>
 #include <powerbase.h>
 
 #include <algorithm>
@@ -33,7 +35,8 @@ double ms_since(Clock::time_point t0) {
 
 void usage() {
     std::fprintf(stderr,
-                 "usage: rcv_bench -i corpus.yuv -s WxH [-r FPS] [--frames N]\n"
+                 "usage: rcv_bench -i corpus.raw|- -s WxH [-r FPS] [--frames N] [--format yuv420|gbr]\n"
+                 "                 (yuv420: planar I420 frames; gbr: packed BGRA frames; '-' reads stdin)\n"
                  "                 [--predictor med|left|both] [--slices 8[,1,...]] (0 = auto)\n"
                  "                 [--isa auto|scalar|sse41|avx2|all[,...]] [--threads 1[,2,...]]\n"
                  "                 [--skip on|off|both]   (temporal skip / P-frames; default on)\n"
@@ -52,6 +55,7 @@ struct Options {
     std::vector<rcv_isa> isas{RCV_ISA_AUTO};
     std::vector<int> threads{1};
     std::vector<int> skip{1};  // temporal skip on / off
+    bool rgb = false;          // --format gbr: input is packed BGRA, coded as GBR
     int cpu = -2;  // -2: last logical CPU, -1: no pinning
     bool verify = true;
     bool decode = true;  // --no-decode: encoder only, like the recorder (keeps its reference in cache)
@@ -97,6 +101,11 @@ bool parse_options(int argc, char** argv, Options* o) {
             else return false;
         } else if (k == "--slices") o->slices = parse_int_list(v);
         else if (k == "--threads") o->threads = parse_int_list(v);
+        else if (k == "--format") {
+            if (v == "yuv420") o->rgb = false;
+            else if (v == "gbr" || v == "rgb") o->rgb = true;
+            else return false;
+        }
         else if (k == "--skip") {
             if (v == "on") o->skip = {1};
             else if (v == "off") o->skip = {0};
@@ -329,12 +338,16 @@ void pin_worker(void* user, int worker) {
 
 class RcvRun {
 public:
-    RcvRun(int w, int h, double fps, int predictor, int slices, rcv_isa isa, int threads, bool skip,
+    RcvRun(int w, int h, bool rgb, double fps, int predictor, int slices, rcv_isa isa, int threads, bool skip,
            const PinPlan* pins)
-        : w_(w), h_(h), threads_(threads), skip_(skip) {
+        : w_(w), h_(h), threads_(threads), skip_(skip), rgb_(rgb) {
         rcv_encoder_config_init(&cfg_);
         cfg_.coded_width = uint16_t(w);
         cfg_.coded_height = uint16_t(h);
+        if (rgb) {
+            cfg_.format = RCV_FMT_GBR;
+            cfg_.input_layout = RCV_IN_BGRA;
+        }
         cfg_.fps_num = uint32_t(fps + 0.5);
         cfg_.fps_den = 1;
         cfg_.predictor = uint8_t(predictor);
@@ -370,7 +383,7 @@ public:
         if (st != RCV_OK) return st;
         rcv::set_stage_profile(enc_, &series.stages);
         pkt_.resize(rcv_max_packet_size(&cfg_));
-        out_.resize(size_t(w_) * h_ * 3 / 2);
+        out_.resize(rgb_ ? size_t(w_) * h_ * 4 : size_t(w_) * h_ * 3 / 2);
         return RCV_OK;
     }
 
@@ -382,11 +395,16 @@ public:
         const bool dup = identical && !skip_;
         const size_t ysize = size_t(w_) * h_, csize = size_t(w_ / 2) * (h_ / 2);
         rcv_frame_in in{};
-        in.plane[0] = src;
-        in.plane[1] = src + ysize;
-        in.plane[2] = src + ysize + csize;
-        in.stride[0] = w_;
-        in.stride[1] = in.stride[2] = w_ / 2;
+        if (rgb_) {  // packed BGRA
+            in.plane[0] = src;
+            in.stride[0] = 4 * w_;
+        } else {
+            in.plane[0] = src;
+            in.plane[1] = src + ysize;
+            in.plane[2] = src + ysize + csize;
+            in.stride[0] = w_;
+            in.stride[1] = in.stride[2] = w_ / 2;
+        }
 
         rcv_frame_info info{};
         const Clock::time_point t0 = Clock::now();
@@ -401,9 +419,11 @@ public:
         double dec_ms = 0;
         if (decode) {
             uint8_t* planes[3] = {out_.data(), out_.data() + ysize, out_.data() + ysize + csize};
-            const int32_t strides[3] = {w_, w_ / 2, w_ / 2};
+            int32_t strides[3] = {w_, w_ / 2, w_ / 2};
+            if (rgb_) strides[0] = 4 * w_;
             const Clock::time_point t1 = Clock::now();
-            st = rcv_decode_frame(dec_, pkt_.data(), info.packet_size, RCV_OUT_I420, planes, strides, nullptr);
+            st = rcv_decode_frame(dec_, pkt_.data(), info.packet_size, rgb_ ? RCV_OUT_BGRA : RCV_OUT_I420, planes,
+                                  strides, nullptr);
             dec_ms = ms_since(t1);
             if (st != RCV_OK) {
                 std::fprintf(stderr, "\n%s: frame %ld: decode failed: %s\n", series.name.c_str(), index,
@@ -421,7 +441,19 @@ public:
         }
         series.enc_ms.push_back(enc_ms);
         if (decode) series.dec_ms.push_back(dec_ms);
-        if (verify && std::memcmp(out_.data(), src, out_.size()) != 0) series.verify_failures++;
+        if (verify && !same_output(src)) series.verify_failures++;
+        return true;
+    }
+
+    // Decoded frame equals the source; for BGRA only colour counts (alpha isn't stored).
+    bool same_output(const uint8_t* src) const {
+        if (!rgb_) return std::memcmp(out_.data(), src, out_.size()) == 0;
+        for (size_t k = 0; k < out_.size(); k += 4) {
+            uint32_t a, b;
+            std::memcpy(&a, src + k, 4);
+            std::memcpy(&b, out_.data() + k, 4);
+            if ((a ^ b) & 0x00FFFFFFu) return false;
+        }
         return true;
     }
 
@@ -429,7 +461,7 @@ public:
 
 private:
     int w_, h_, threads_;
-    bool skip_;
+    bool skip_, rgb_;
     rcv_encoder_config cfg_{};
     rcv_encoder* enc_ = nullptr;
     rcv_decoder* dec_ = nullptr;
@@ -483,7 +515,7 @@ int main(int argc, char** argv) {
         usage();
         return 2;
     }
-    if ((opt.w | opt.h) & 1) {
+    if (!opt.rgb && ((opt.w | opt.h) & 1)) {
         std::fprintf(stderr, "YUV420 needs even dimensions\n");
         return 2;
     }
@@ -502,7 +534,8 @@ int main(int argc, char** argv) {
             for (rcv_isa isa : opt.isas)
                 for (int t : opt.threads)
                     for (int sk : opt.skip) {
-                        auto r = std::make_unique<RcvRun>(opt.w, opt.h, opt.fps, p, s, isa, t, sk != 0, &pins);
+                        auto r = std::make_unique<RcvRun>(opt.w, opt.h, opt.rgb, opt.fps, p, s, isa, t, sk != 0,
+                                                          &pins);
                         const rcv_status st = r->init();
                         if (st != RCV_OK) {
                             std::fprintf(stderr, "%s: init failed: %s\n", r->series.name.c_str(),
@@ -516,11 +549,15 @@ int main(int argc, char** argv) {
         if (!load_sizes(opt.compare[i].first, opt.compare[i].second, &externals[i])) return 1;
 
     FILE* in = nullptr;
-    if (fopen_s(&in, opt.input.c_str(), "rb") != 0 || !in) {
+    if (opt.input == "-") {  // e.g. piped from FFmpeg, so large RGB corpora need no disk space
+        in = stdin;
+        _setmode(_fileno(stdin), _O_BINARY);
+    } else if (fopen_s(&in, opt.input.c_str(), "rb") != 0 || !in) {
         std::fprintf(stderr, "cannot open %s\n", opt.input.c_str());
         return 1;
     }
-    const size_t fs = size_t(opt.w) * opt.h * 3 / 2;
+    // Input frame bytes; ratios use the coded bytes (I420: the same; BGRA: 3 per pixel, no alpha).
+    const size_t fs = opt.rgb ? size_t(opt.w) * opt.h * 4 : size_t(opt.w) * opt.h * 3 / 2;
     std::vector<uint8_t> cur(fs), prev(fs);
     std::vector<uint8_t> unique;
     const Clock::time_point start = Clock::now();
@@ -538,7 +575,7 @@ int main(int argc, char** argv) {
         std::swap(cur, prev);
         if (n % 50 == 0) std::fprintf(stderr, "\r  frame %ld", n);
     }
-    std::fclose(in);
+    if (in != stdin) std::fclose(in);
     const double wall_s = ms_since(start) / 1000.0;
     const CpuClock clk_after = cpu_clock();
     std::fprintf(stderr, "\r  %zu frames in %.1f s\n", unique.size(), wall_s);
@@ -549,12 +586,14 @@ int main(int argc, char** argv) {
 
     size_t n_unique = 0;
     for (uint8_t u : unique) n_unique += u;
-    const double raw = double(fs);
+    const double raw = opt.rgb ? 3.0 * opt.w * opt.h : double(fs);
 
     std::printf("## RCV1 benchmark\n\n");
-    std::printf("- Corpus: `%s`, %dx%d YUV 4:2:0 @ %.3g fps, %zu frames: %zu real, %zu identical to the previous "
+    std::printf("- Corpus: `%s`, %dx%d %s @ %.3g fps, %zu frames: %zu real, %zu identical to the previous "
                 "frame (coded as DUP by RCV1)\n",
-                opt.input.c_str(), opt.w, opt.h, opt.fps, unique.size(), n_unique, unique.size() - n_unique);
+                opt.input == "-" ? "stdin" : opt.input.c_str(), opt.w, opt.h,
+                opt.rgb ? "BGRA -> GBR (lossless RGB)" : "YUV 4:2:0", opt.fps, unique.size(), n_unique,
+                unique.size() - n_unique);
     std::printf("- Machine: %s, %lu logical CPUs, %s; Windows-reported clock %lu/%lu MHz before, %lu MHz after\n",
                 cpu_brand().c_str(), logical, power_state().c_str(), clk_before.current, clk_before.max,
                 clk_after.current);

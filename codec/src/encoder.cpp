@@ -7,6 +7,7 @@
 #include <new>
 
 #include "aligned_buffer.h"
+#include "colour.h"
 #include "cpu.h"
 #include "crc32c.h"
 #include "format.h"
@@ -51,8 +52,17 @@ struct rcv_encoder {
     uint32_t* row_skipped;                // per block row: number of skipped blocks
     uint32_t slice_skipped[kMaxSlices];
     bool frame_p;                         // the frame being encoded is a P-frame
+    bool run_phase_a;                     // the prepare pass also runs the skip compare
     uint8_t* rowbuf_mem;
     uint8_t* rowbuf[kMaxThreads];         // per worker: residuals of one partially skipped row
+
+    // GBR format (§4.4). Each frame's BGRA input is converted into these planes, which the encoder
+    // then predicts from directly; afterwards they become the reference by swapping pointers with
+    // it (lossless: the reconstruction equals the source), so RGB needs no copy into the reference.
+    bool gbr;
+    uint8_t* staging_mem;
+    uint8_t* staging_plane[3];
+    rcv_frame_in staging_in;              // the staging planes as a planar input, for the skip compare
 };
 
 void rcv::set_stage_profile(rcv_encoder* enc, StageTimes* sink) {
@@ -69,9 +79,13 @@ uint32_t elapsed_us(Clock::time_point t0) {
 
 rcv_status validate_config(const rcv_encoder_config* c, Geometry* g) {
     if (!c) return RCV_ERR_INVALID_ARG;
-    if (c->format == RCV_FMT_GBR) return RCV_ERR_UNSUPPORTED;  // M6
-    if (c->format != RCV_FMT_YUV420) return RCV_ERR_INVALID_ARG;
-    if (c->input_layout != RCV_IN_I420 && c->input_layout != RCV_IN_NV12) return RCV_ERR_INVALID_ARG;
+    if (c->format == RCV_FMT_YUV420) {
+        if (c->input_layout != RCV_IN_I420 && c->input_layout != RCV_IN_NV12) return RCV_ERR_INVALID_ARG;
+    } else if (c->format == RCV_FMT_GBR) {
+        if (c->input_layout != RCV_IN_BGRA && c->input_layout != RCV_IN_BGRX) return RCV_ERR_INVALID_ARG;
+    } else {
+        return RCV_ERR_INVALID_ARG;
+    }
     if (c->num_slices > kMaxSlices) return RCV_ERR_INVALID_ARG;
     if (!init_geometry(g, c->format, c->coded_width, c->coded_height, c->num_slices))
         return RCV_ERR_INVALID_ARG;
@@ -94,6 +108,10 @@ rcv_encoder_config resolve_defaults(const rcv_encoder_config& c) {
 // Checked on the calling thread before any job runs.
 rcv_status validate_input(const rcv_encoder* e, const rcv_frame_in* in) {
     const Geometry& g = e->geo;
+    if (e->gbr) {  // BGRA / BGRX: 4 bytes per pixel, alpha ignored
+        if (!in->plane[0] || in->stride[0] < 4 * g.width) return RCV_ERR_INVALID_ARG;
+        return RCV_OK;
+    }
     if (e->cfg.input_layout == RCV_IN_I420) {
         for (int p = 0; p < 3; ++p)
             if (!in->plane[p] || in->stride[p] < g.plane_w[p]) return RCV_ERR_INVALID_ARG;
@@ -122,6 +140,10 @@ void copy_span(rcv_encoder* e, const rcv_frame_in* in, int p, int y, int x0, int
 void copy_rows(rcv_encoder* e, const rcv_frame_in* in, int p, int r0, int r1) {
     for (int y = r0; y < r1; ++y) copy_span(e, in, p, y, 0, e->geo.plane_w[p]);
 }
+
+// Planes the encoder predicts from: the reference (after copying the input into it) for YUV,
+// the staging planes (the converted input) for GBR. Both have the same strides.
+uint8_t* work_plane(const rcv_encoder* e, int p) { return e->gbr ? e->staging_plane[p] : e->ref_plane[p]; }
 
 ResidualFn residual_kernel(rcv_isa isa) {
     switch (isa) {
@@ -193,16 +215,30 @@ size_t encode_chunk(uint8_t* out, const uint8_t* syms, size_t count, const uint3
     return huff_size;
 }
 
-// Phase A job (§5.3): compares every block of slice s with the reference. Only reads the
-// reference; phase B, which overwrites it, starts after every phase A job has finished.
-void skip_job(void* ctx, int s, int worker) {
+// Prepare job for slice s, before phase B:
+//  - GBR: converts the slice's BGRA rows into the staging planes (§4.4);
+//  - phase A (§5.3), if it runs: compares every block of the slice with the reference.
+// Only reads the reference; phase B, which may overwrite it, starts after every prepare job.
+void prepare_job(void* ctx, int s, int worker) {
     rcv_encoder* e = static_cast<rcv_encoder*>(ctx);
     const Geometry& g = e->geo;
     StageTimer timer(e->prof ? &e->worker_prof[worker] : nullptr);
+    if (e->gbr) {
+        const uint8_t* src = e->job_in->plane[0];
+        const ptrdiff_t ss = e->job_in->stride[0], ds = e->ref_stride[0];
+        for (int y = g.slice_row(0, s); y < g.slice_row(0, s + 1); ++y)
+            bgra_to_gbr_row(src + y * ss, g.width, e->staging_plane[0] + y * ds, e->staging_plane[1] + y * ds,
+                            e->staging_plane[2] + y * ds);
+        timer.lap(&StageTimes::load_ns);
+    }
+    if (!e->run_phase_a) return;
+    // GBR compares the converted planes (equal planes <=> equal RGB: the transform is reversible).
+    const rcv_frame_in* cmp = e->gbr ? &e->staging_in : e->job_in;
+    const rcv_input_layout layout = e->gbr ? RCV_IN_I420 : e->cfg.input_layout;  // GBR staging is planar
     uint32_t skipped = 0;
     for (int by = g.slice_block_row[s]; by < g.slice_block_row[s + 1]; ++by) {
         uint8_t* f = e->skip_flags + size_t(by) * size_t(g.blocks_x);
-        const uint32_t row = uint32_t(compare_block_row(g, e->job_in, e->cfg.input_layout, e->ref_plane, e->ref_stride, by, f));
+        const uint32_t row = uint32_t(compare_block_row(g, cmp, layout, e->ref_plane, e->ref_stride, by, f));
         e->row_skipped[by] = row;
         skipped += row;
     }
@@ -211,9 +247,9 @@ void skip_job(void* ctx, int s, int worker) {
 }
 
 // P-frame chunk: rows are handled one at a time. A row whose blocks are all skipped costs nothing;
-// otherwise the row is copied into the reference, residuals are computed for the whole row with
-// the SIMD kernel, and only the non-skipped samples are kept, in raster order (§5.4). Skipped
-// samples are never coded but still serve as neighbours.
+// otherwise the row is copied into the reference (YUV; GBR predicts from its staging planes),
+// residuals are computed for the whole row with the SIMD kernel, and only the non-skipped samples
+// are kept, in raster order (§5.4). Skipped samples are never coded but still serve as neighbours.
 // Copying the whole row equals the plan's "copy the non-skipped blocks" (§5.7) because a lossless
 // skip means those samples are already identical; it is one memcpy instead of many small ones.
 // (Near-lossless skip, M7, tolerates differences and will need the per-block copy.)
@@ -221,7 +257,7 @@ size_t p_chunk_residuals(rcv_encoder* e, int pl, int s, int worker, StageTimer& 
     const Geometry& g = e->geo;
     const int r0 = g.slice_row(pl, s), r1 = g.slice_row(pl, s + 1);
     const int w = g.plane_w[pl], shift = g.block_shift[pl], bw = 1 << shift;
-    uint8_t* plane = e->ref_plane[pl];
+    uint8_t* plane = work_plane(e, pl);
     const ptrdiff_t stride = e->ref_stride[pl];
     uint8_t* out = e->resid[worker];
     uint8_t* row = e->rowbuf[worker];
@@ -231,8 +267,10 @@ size_t p_chunk_residuals(rcv_encoder* e, int pl, int s, int worker, StageTimer& 
         const uint32_t nskip = e->row_skipped[br];
         if (nskip == uint32_t(g.blocks_x)) continue;
         const uint8_t* f = e->skip_flags + size_t(br) * size_t(g.blocks_x);
-        copy_span(e, e->job_in, pl, j, 0, w);
-        timer.lap(&StageTimes::load_ns);
+        if (!e->gbr) {
+            copy_span(e, e->job_in, pl, j, 0, w);
+            timer.lap(&StageTimes::load_ns);
+        }
         uint8_t* x = plane + j * stride;
         const uint8_t* up = j == r0 ? nullptr : x - stride;
         if (nskip == 0) {
@@ -268,9 +306,11 @@ void encode_job(void* ctx, int job, int worker) {
         timer.lap(&StageTimes::predict_ns);
     } else {
         const int r0 = g.slice_row(pl, s), r1 = g.slice_row(pl, s + 1);
-        copy_rows(e, e->job_in, pl, r0, r1);
-        timer.lap(&StageTimes::load_ns);
-        n = e->residuals(e->ref_plane[pl], e->ref_stride[pl], g.plane_w[pl], r0, r1, e->cfg.predictor,
+        if (!e->gbr) {
+            copy_rows(e, e->job_in, pl, r0, r1);
+            timer.lap(&StageTimes::load_ns);
+        }
+        n = e->residuals(work_plane(e, pl), e->ref_stride[pl], g.plane_w[pl], r0, r1, e->cfg.predictor,
                          e->resid[worker], hist);
         timer.lap(&StageTimes::predict_ns);
     }
@@ -373,6 +413,7 @@ rcv_status rcv_encoder_create(const rcv_encoder_config* cfg, rcv_encoder** out) 
     e->cfg = resolve_defaults(*cfg);
     e->cfg.num_threads = uint8_t(threads);
     e->geo = g;
+    e->gbr = e->cfg.format == RCV_FMT_GBR;
     e->colour = pack_colour(e->cfg.colour_matrix, e->cfg.full_range, 0);
     e->max_packet = max_packet_size(g);
 
@@ -380,6 +421,20 @@ rcv_status rcv_encoder_create(const rcv_encoder_config* cfg, rcv_encoder** out) 
     for (int p = 0; p < 3; ++p) {
         e->ref_stride[p] = ptrdiff_t(align64(size_t(g.plane_w[p])));
         total += size_t(e->ref_stride[p]) * size_t(g.plane_h[p]);
+    }
+    if (e->gbr) {
+        e->staging_mem = static_cast<uint8_t*>(aligned_alloc64(total));
+        if (!e->staging_mem) {
+            rcv_encoder_destroy(e);
+            return RCV_ERR_OUT_OF_MEMORY;
+        }
+        uint8_t* sp = e->staging_mem;
+        for (int i = 0; i < 3; ++i) {
+            e->staging_plane[i] = sp;
+            e->staging_in.plane[i] = sp;
+            e->staging_in.stride[i] = int32_t(e->ref_stride[i]);
+            sp += size_t(e->ref_stride[i]) * size_t(g.plane_h[i]);
+        }
     }
     const size_t resid_each = align64(max_chunk_samples(g));
     const int jobs = 3 * g.num_slices;
@@ -430,6 +485,7 @@ void rcv_encoder_destroy(rcv_encoder* e) {
     aligned_free64(e->skip_flags);
     aligned_free64(e->row_skipped);
     aligned_free64(e->rowbuf_mem);
+    aligned_free64(e->staging_mem);
     delete e;
 }
 
@@ -440,7 +496,7 @@ rcv_status rcv_encode_frame(rcv_encoder* e, const rcv_frame_in* in, const rcv_en
     if (out_capacity < e->max_packet) return RCV_ERR_BUFFER_TOO_SMALL;
     const uint8_t near_level = params ? params->near_level : 0;
     if (near_level > 3) return RCV_ERR_INVALID_ARG;
-    if (near_level != 0) return RCV_ERR_UNSUPPORTED;  // M7
+    if (near_level != 0) return e->gbr ? RCV_ERR_INVALID_ARG : RCV_ERR_UNSUPPORTED;  // GBR: never (§4.1); YUV: M7
 
     const rcv_status st = validate_input(e, in);
     if (st != RCV_OK) return st;
@@ -455,13 +511,15 @@ rcv_status rcv_encode_frame(rcv_encoder* e, const rcv_frame_in* in, const rcv_en
     // changed -> I (same cost, free seek point); (5) otherwise P.
     const bool force_i = (params && params->force_keyframe) || !e->has_ref ||
                          e->frames_since_i >= e->cfg.keyframe_interval || !e->cfg.enable_skip;
+    e->run_phase_a = !force_i;
     uint32_t skipped = 0, skip_us = 0;
-    if (!force_i) {
+    if (e->gbr || !force_i) {
+        // Prepare pass: GBR conversion and/or phase A. For GBR, time_skip_us includes the conversion.
         const Clock::time_point ts = Clock::now();
-        e->pool.run(skip_job, e, S);  // phase A
-        for (int s = 0; s < S; ++s) skipped += e->slice_skipped[s];
+        e->pool.run(prepare_job, e, S);
+        for (int s = 0; s < S && !force_i; ++s) skipped += e->slice_skipped[s];
         skip_us = elapsed_us(ts);
-        if (skipped == blocks) {
+        if (!force_i && skipped == blocks) {
             e->job_in = nullptr;
             write_dup_packet(out);  // the reference stays as it is
             e->frames_since_i++;
@@ -481,6 +539,15 @@ rcv_status rcv_encode_frame(rcv_encoder* e, const rcv_frame_in* in, const rcv_en
     const int jobs = 3 * S;
     e->pool.run(encode_job, e, jobs);
     e->job_in = nullptr;
+    if (e->gbr) {
+        // The converted frame is the new reconstruction: it becomes the reference (no copy).
+        for (int p = 0; p < 3; ++p) {
+            uint8_t* t = e->ref_plane[p];
+            e->ref_plane[p] = e->staging_plane[p];
+            e->staging_plane[p] = t;
+            e->staging_in.plane[p] = t;
+        }
+    }
 
     // Assembly in fixed order, so the packet never depends on scheduling (A3).
     uint8_t* payload = out + kFrameHeaderSize;
