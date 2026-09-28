@@ -54,24 +54,33 @@ void med_row(const uint8_t* x, const uint8_t* up, int width, uint8_t* out) {
     for (; i < width; ++i) out[i] = uint8_t(x[i] - med_tail(x[i - 1], up[i], up[i - 1]));
 }
 
+// Row worker without the trailing vzeroupper, shared by the two entry points below.
+void row_avx2(const uint8_t* x, const uint8_t* up, int width, int predictor, uint8_t* out) {
+    if (!up) {
+        out[0] = uint8_t(x[0] - 128);
+        left_row(x, width, out);
+        return;
+    }
+    out[0] = uint8_t(x[0] - up[0]);
+    if (predictor == kPredMed)
+        med_row(x, up, width, out);
+    else
+        left_row(x, width, out);
+}
+
 }  // namespace
+
+void residual_row_avx2(const uint8_t* x, const uint8_t* up, int width, int predictor, uint8_t* out) {
+    row_avx2(x, up, width, predictor, out);
+    _mm256_zeroupper();  // callers are baseline (SSE) code
+}
 
 size_t residuals_lossless_avx2(const uint8_t* plane, ptrdiff_t stride, int width, int row_begin, int row_end,
                                int predictor, uint8_t* out, uint32_t hist[256]) {
     uint8_t* o = out;
     for (int j = row_begin; j < row_end; ++j, o += width) {
         const uint8_t* x = plane + j * stride;
-        if (j == row_begin) {
-            o[0] = uint8_t(x[0] - 128);
-            left_row(x, width, o);
-            continue;
-        }
-        const uint8_t* up = x - stride;
-        o[0] = uint8_t(x[0] - up[0]);
-        if (predictor == kPredMed)
-            med_row(x, up, width, o);
-        else
-            left_row(x, width, o);
+        row_avx2(x, j == row_begin ? nullptr : x - stride, width, predictor, o);
     }
     _mm256_zeroupper();
     const size_t n = size_t(o - out);

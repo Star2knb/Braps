@@ -10,6 +10,7 @@ set(RCV_SOURCES
     src/predict_avx2.cpp
     src/crc32c.cpp
     src/threadpool.cpp
+    src/skipmap.cpp
     src/encoder.cpp
     src/decoder.cpp
 )
@@ -46,6 +47,7 @@ add_executable(rcv_tests
     tests/test_windows_h.cpp
     tests/test_simd.cpp
     tests/test_threads.cpp
+    tests/test_pframes.cpp
 )
 # Tests exercise internal kernels too, so they see the private headers.
 target_include_directories(rcv_tests PRIVATE src)

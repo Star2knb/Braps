@@ -370,7 +370,8 @@ int cmd_stats(const Args& a) {
     static const char* kModes[] = {"HUFFMAN", "SINGLE", "RAW", "EMPTY"};
     long n = 0, type_count[3] = {}, mode_count[4] = {};
     uint64_t total = 32;
-    std::vector<double> real_ratio;
+    std::vector<double> real_ratio, p_skip_pct;
+    const size_t blocks = size_t((w + 15) / 16) * size_t((h + 15) / 16);
     if (verbose) std::printf("frame,type,bytes,ratio\n");
     for (int rc; (rc = r.next()) != 0; ++n) {
         if (rc < 0 || r.pkt.size() < 8 || r.pkt[5] > 2) {
@@ -382,10 +383,18 @@ int cmd_stats(const Args& a) {
         total += 4 + r.pkt.size();
         const double ratio = raw / double(r.pkt.size());
         if (type != 0) real_ratio.push_back(ratio);
-        if (type == 1 && r.pkt.size() >= 32) {  // tally chunk modes (I-frames have no skip map)
+        if (type != 0 && r.pkt.size() >= 32) {  // tally chunk modes; P-frames start with the skip map
             const size_t S = r.pkt[11];
-            const uint8_t* dir = r.pkt.data() + 32;
-            size_t off = 32 + 12 * S;
+            size_t map = 0;
+            if (type == 2) {
+                map = ((blocks + 7) / 8 + 3) & ~size_t(3);
+                size_t skipped = 0;
+                for (size_t b = 0; b < blocks && 32 + (b >> 3) < r.pkt.size(); ++b)
+                    skipped += (r.pkt[32 + (b >> 3)] >> (b & 7)) & 1;
+                p_skip_pct.push_back(100.0 * double(skipped) / double(blocks));
+            }
+            const uint8_t* dir = r.pkt.data() + 32 + map;
+            size_t off = 32 + map + 12 * S;
             for (size_t k = 0; k < 3 * S && off < r.pkt.size(); ++k) {
                 if (r.pkt[off] < 4) mode_count[r.pkt[off]]++;
                 off += load_u32(dir + 4 * k);
@@ -400,6 +409,11 @@ int cmd_stats(const Args& a) {
         std::printf("real-frame ratio: median %.3f, min %.3f, max %.3f\n", median(real_ratio),
                     *std::min_element(real_ratio.begin(), real_ratio.end()),
                     *std::max_element(real_ratio.begin(), real_ratio.end()));
+    if (!p_skip_pct.empty()) {
+        double sum = 0;
+        for (double v : p_skip_pct) sum += v;
+        std::printf("P-frames: %.1f%% of blocks skipped on average\n", sum / double(p_skip_pct.size()));
+    }
     std::printf("chunk modes:");
     for (int m = 0; m < 4; ++m) std::printf(" %s %ld", kModes[m], mode_count[m]);
     std::printf("\n");

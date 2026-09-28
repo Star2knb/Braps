@@ -36,7 +36,8 @@ void usage() {
                  "usage: rcv_bench -i corpus.yuv -s WxH [-r FPS] [--frames N]\n"
                  "                 [--predictor med|left|both] [--slices 8[,1,...]] (0 = auto)\n"
                  "                 [--isa auto|scalar|sse41|avx2|all[,...]] [--threads 1[,2,...]]\n"
-                 "                 [--cpu N | --cpu -1] [--no-verify] [--csv frames.csv]\n"
+                 "                 [--skip on|off|both]   (temporal skip / P-frames; default on)\n"
+                 "                 [--cpu N | --cpu -1] [--no-verify] [--no-decode] [--csv frames.csv]\n"
                  "                 [--compare NAME=sizes.txt]...\n"
                  "sizes.txt: one packet size per line, in frame order ('# enc_ms=X' line optional).\n");
 }
@@ -50,8 +51,10 @@ struct Options {
     std::vector<int> slices{8};
     std::vector<rcv_isa> isas{RCV_ISA_AUTO};
     std::vector<int> threads{1};
+    std::vector<int> skip{1};  // temporal skip on / off
     int cpu = -2;  // -2: last logical CPU, -1: no pinning
     bool verify = true;
+    bool decode = true;  // --no-decode: encoder only, like the recorder (keeps its reference in cache)
     std::vector<std::pair<std::string, std::string>> compare;
 };
 
@@ -75,6 +78,11 @@ bool parse_options(int argc, char** argv, Options* o) {
             o->verify = false;
             continue;
         }
+        if (k == "--no-decode") {
+            o->decode = false;
+            o->verify = false;
+            continue;
+        }
         if (i + 1 >= argc) return false;
         const std::string v = argv[++i];
         if (k == "-i") o->input = v;
@@ -89,6 +97,12 @@ bool parse_options(int argc, char** argv, Options* o) {
             else return false;
         } else if (k == "--slices") o->slices = parse_int_list(v);
         else if (k == "--threads") o->threads = parse_int_list(v);
+        else if (k == "--skip") {
+            if (v == "on") o->skip = {1};
+            else if (v == "off") o->skip = {0};
+            else if (v == "both") o->skip = {1, 0};
+            else return false;
+        }
         else if (k == "--isa") {
             o->isas.clear();
             size_t pos = 0;
@@ -197,6 +211,10 @@ struct Series {
     std::string name;
     std::vector<uint32_t> bytes;
     std::vector<double> enc_ms, dec_ms;
+    std::vector<uint8_t> types;          // RCV1: frame type per packet (0 DUP, 1 I, 2 P)
+    std::vector<double> skip_pct;        // RCV1 P-frames: % of blocks skipped
+    std::vector<double> skip_ms;         // RCV1: phase A wall time, frames where it ran
+    std::vector<double> skip_ms_full;    // ... of those, frames that turned out unchanged (whole frame compared)
     double external_enc_ms = -1;  // from '# enc_ms=' in a --compare file
     rcv::StageTimes stages;
     long verify_failures = 0;
@@ -311,8 +329,9 @@ void pin_worker(void* user, int worker) {
 
 class RcvRun {
 public:
-    RcvRun(int w, int h, double fps, int predictor, int slices, rcv_isa isa, int threads, const PinPlan* pins)
-        : w_(w), h_(h), threads_(threads) {
+    RcvRun(int w, int h, double fps, int predictor, int slices, rcv_isa isa, int threads, bool skip,
+           const PinPlan* pins)
+        : w_(w), h_(h), threads_(threads), skip_(skip) {
         rcv_encoder_config_init(&cfg_);
         cfg_.coded_width = uint16_t(w);
         cfg_.coded_height = uint16_t(h);
@@ -322,6 +341,7 @@ public:
         cfg_.num_slices = uint8_t(slices);
         cfg_.isa = isa;
         cfg_.num_threads = uint8_t(threads);
+        cfg_.enable_skip = skip ? 1 : 0;
         if (pins && pins->count) {
             cfg_.on_worker_start = pin_worker;
             cfg_.user = const_cast<PinPlan*>(pins);
@@ -330,9 +350,10 @@ public:
         const rcv_isa shown = isa == RCV_ISA_AUTO ? rcv_cpu_isa() : isa;
         series.name = std::string("RCV1 ") + (predictor ? "MED" : "LEFT") +
                       (slices ? " S=" + std::to_string(slices) : std::string(" S=auto")) + " " + kIsa[shown] +
-                      " T=" + std::to_string(threads);
+                      " T=" + std::to_string(threads) + (skip ? "" : " noskip");
     }
     int threads() const { return threads_; }
+    bool skip() const { return skip_; }
     ~RcvRun() {
         rcv_encoder_destroy(enc_);
         rcv_decoder_destroy(dec_);
@@ -354,7 +375,11 @@ public:
     }
 
     // Returns false on a codec error (which is fatal for the benchmark).
-    bool frame(const uint8_t* src, bool dup, bool verify, long index) {
+    // With skip on, every frame goes through rcv_encode_frame and the encoder itself turns
+    // unchanged frames into DUPs (phase A). With skip off, frames identical to the previous one are
+    // sent as rcv_encode_duplicate, as the recorder host does for timeline gaps (and as in M2-M4).
+    bool frame(const uint8_t* src, bool identical, bool decode, bool verify, long index) {
+        const bool dup = identical && !skip_;
         const size_t ysize = size_t(w_) * h_, csize = size_t(w_ / 2) * (h_ / 2);
         rcv_frame_in in{};
         in.plane[0] = src;
@@ -373,19 +398,29 @@ public:
                          rcv_status_string(st));
             return false;
         }
-        uint8_t* planes[3] = {out_.data(), out_.data() + ysize, out_.data() + ysize + csize};
-        const int32_t strides[3] = {w_, w_ / 2, w_ / 2};
-        const Clock::time_point t1 = Clock::now();
-        st = rcv_decode_frame(dec_, pkt_.data(), info.packet_size, RCV_OUT_I420, planes, strides, nullptr);
-        const double dec_ms = ms_since(t1);
-        if (st != RCV_OK) {
-            std::fprintf(stderr, "\n%s: frame %ld: decode failed: %s\n", series.name.c_str(), index,
-                         rcv_status_string(st));
-            return false;
+        double dec_ms = 0;
+        if (decode) {
+            uint8_t* planes[3] = {out_.data(), out_.data() + ysize, out_.data() + ysize + csize};
+            const int32_t strides[3] = {w_, w_ / 2, w_ / 2};
+            const Clock::time_point t1 = Clock::now();
+            st = rcv_decode_frame(dec_, pkt_.data(), info.packet_size, RCV_OUT_I420, planes, strides, nullptr);
+            dec_ms = ms_since(t1);
+            if (st != RCV_OK) {
+                std::fprintf(stderr, "\n%s: frame %ld: decode failed: %s\n", series.name.c_str(), index,
+                             rcv_status_string(st));
+                return false;
+            }
         }
         series.bytes.push_back(info.packet_size);
+        series.types.push_back(info.frame_type);
+        if (info.frame_type == 2 && info.blocks_total)
+            series.skip_pct.push_back(100.0 * info.blocks_skipped / info.blocks_total);
+        if (skip_ && !dup && (info.frame_type != 1 || info.time_skip_us)) {
+            series.skip_ms.push_back(info.time_skip_us / 1000.0);
+            if (info.frame_type == 0) series.skip_ms_full.push_back(info.time_skip_us / 1000.0);
+        }
         series.enc_ms.push_back(enc_ms);
-        series.dec_ms.push_back(dec_ms);
+        if (decode) series.dec_ms.push_back(dec_ms);
         if (verify && std::memcmp(out_.data(), src, out_.size()) != 0) series.verify_failures++;
         return true;
     }
@@ -394,6 +429,7 @@ public:
 
 private:
     int w_, h_, threads_;
+    bool skip_;
     rcv_encoder_config cfg_{};
     rcv_encoder* enc_ = nullptr;
     rcv_decoder* dec_ = nullptr;
@@ -401,16 +437,41 @@ private:
 };
 
 void print_stage_table(const std::vector<std::unique_ptr<RcvRun>>& runs) {
-    std::printf("\nEncoder stage breakdown (mean ms per coded frame, single-thread runs only):\n\n");
-    std::printf("| Config | load | predict + histogram | table build | entropy write | other | total |\n");
-    std::printf("|---|---|---|---|---|---|---|\n");
+    std::printf("\nEncoder stage breakdown (mean ms per coded I/P frame, single-thread runs only; skip compare "
+                "per frame it ran on):\n\n");
+    std::printf("| Config | skip compare | load | predict + histogram | table build | entropy write | other | total |\n");
+    std::printf("|---|---|---|---|---|---|---|---|\n");
     for (const auto& r : runs) {
         const rcv::StageTimes& t = r->series.stages;
         if (!t.frames || r->threads() != 1) continue;  // with threads, stage times are summed CPU time
         const double k = 1e-6 / double(t.frames);
-        const double other = double(t.total_ns - t.load_ns - t.predict_ns - t.table_ns - t.entropy_ns);
-        std::printf("| %s | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f |\n", r->series.name.c_str(), t.load_ns * k,
-                    t.predict_ns * k, t.table_ns * k, t.entropy_ns * k, other * k, t.total_ns * k);
+        const double skip = t.skip_frames ? double(t.skip_ns) * 1e-6 / double(t.skip_frames) : 0.0;
+        // Phase A of coded frames is inside total; phase A of frames that became DUP is not.
+        const double other = double(t.total_ns) - double(t.load_ns + t.predict_ns + t.table_ns + t.entropy_ns) -
+                             skip * 1e6 * double(t.frames);
+        std::printf("| %s | %.3f | %.2f | %.2f | %.2f | %.2f | %.2f | %.2f |\n", r->series.name.c_str(), skip,
+                    t.load_ns * k, t.predict_ns * k, t.table_ns * k, t.entropy_ns * k, other > 0 ? other * k : 0.0,
+                    t.total_ns * k);
+    }
+}
+
+void print_frame_types(const std::vector<std::unique_ptr<RcvRun>>& runs) {
+    std::printf("\nFrame types and temporal skip:\n\n");
+    std::printf("| Config | I | P | DUP | blocks skipped in P (mean) | skip compare ms p50 / p99 / max (wall) "
+                "| ... on unchanged frames (whole frame compared) |\n");
+    std::printf("|---|---|---|---|---|---|---|\n");
+    for (const auto& r : runs) {
+        const Series& s = r->series;
+        long counts[3] = {};
+        for (uint8_t t : s.types) counts[t < 3 ? t : 0]++;
+        double pct = 0;
+        for (double v : s.skip_pct) pct += v;
+        const Dist sk = distribution(s.skip_ms), full = distribution(s.skip_ms_full);
+        char skip[64] = "-", skip_full[64] = "-";
+        if (sk.n) std::snprintf(skip, sizeof(skip), "%.3f / %.3f / %.3f", sk.p50, sk.p99, sk.max);
+        if (full.n) std::snprintf(skip_full, sizeof(skip_full), "%.3f / %.3f / %.3f", full.p50, full.p99, full.max);
+        std::printf("| %s | %ld | %ld | %ld | %.2f%% | %s | %s |\n", s.name.c_str(), counts[1], counts[2], counts[0],
+                    s.skip_pct.empty() ? 0.0 : pct / double(s.skip_pct.size()), skip, skip_full);
     }
 }
 
@@ -439,15 +500,17 @@ int main(int argc, char** argv) {
     for (int p : opt.predictors)
         for (int s : opt.slices)
             for (rcv_isa isa : opt.isas)
-                for (int t : opt.threads) {
-                    auto r = std::make_unique<RcvRun>(opt.w, opt.h, opt.fps, p, s, isa, t, &pins);
-                    const rcv_status st = r->init();
-                    if (st != RCV_OK) {
-                        std::fprintf(stderr, "%s: init failed: %s\n", r->series.name.c_str(), rcv_status_string(st));
-                        return 1;
+                for (int t : opt.threads)
+                    for (int sk : opt.skip) {
+                        auto r = std::make_unique<RcvRun>(opt.w, opt.h, opt.fps, p, s, isa, t, sk != 0, &pins);
+                        const rcv_status st = r->init();
+                        if (st != RCV_OK) {
+                            std::fprintf(stderr, "%s: init failed: %s\n", r->series.name.c_str(),
+                                         rcv_status_string(st));
+                            return 1;
+                        }
+                        runs.push_back(std::move(r));
                     }
-                    runs.push_back(std::move(r));
-                }
     std::vector<Series> externals(opt.compare.size());
     for (size_t i = 0; i < opt.compare.size(); ++i)
         if (!load_sizes(opt.compare[i].first, opt.compare[i].second, &externals[i])) return 1;
@@ -471,7 +534,7 @@ int main(int argc, char** argv) {
         const bool dup = !unique.empty() && std::memcmp(cur.data(), prev.data(), fs) == 0;
         unique.push_back(dup ? 0 : 1);
         for (auto& r : runs)
-            if (!r->frame(cur.data(), dup, opt.verify, n)) return 1;
+            if (!r->frame(cur.data(), dup, opt.decode, opt.verify, n)) return 1;
         std::swap(cur, prev);
         if (n % 50 == 0) std::fprintf(stderr, "\r  frame %ld", n);
     }
@@ -526,6 +589,7 @@ int main(int argc, char** argv) {
     for (const auto& r : runs) row(r->series);
     for (const Series& s : externals) row(s);
 
+    print_frame_types(runs);
     print_stage_table(runs);
 
     long failures = 0;
@@ -546,7 +610,8 @@ int main(int argc, char** argv) {
             for (const auto& r : runs)
                 for (size_t i = 0; i < r->series.bytes.size(); ++i)
                     std::fprintf(csv, "%zu,%s,%d,%u,%.4f,%.4f\n", i, r->series.name.c_str(), unique[i],
-                                 r->series.bytes[i], r->series.enc_ms[i], r->series.dec_ms[i]);
+                                 r->series.bytes[i], r->series.enc_ms[i],
+                                 i < r->series.dec_ms.size() ? r->series.dec_ms[i] : 0.0);
             for (const Series& s : externals)
                 for (size_t i = 0; i < s.bytes.size() && i < unique.size(); ++i)
                     std::fprintf(csv, "%zu,%s,%d,%u,,\n", i, s.name.c_str(), unique[i], s.bytes[i]);

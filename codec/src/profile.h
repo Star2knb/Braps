@@ -10,12 +10,14 @@
 namespace rcv {
 
 struct StageTimes {
+    uint64_t skip_ns = 0;     // phase A: temporal skip compare
+    uint64_t skip_frames = 0; // frames where phase A ran (incl. frames that became DUP)
     uint64_t load_ns = 0;     // input copy / NV12 de-interleave into the reference
     uint64_t predict_ns = 0;  // residuals + histogram
     uint64_t table_ns = 0;    // chunk mode decision + Huffman table build
     uint64_t entropy_ns = 0;  // bitstream / RAW payload writing
-    uint64_t total_ns = 0;    // whole rcv_encode_frame (the rest is header, directory, CRC)
-    uint64_t frames = 0;      // coded (non-DUP) frames accumulated
+    uint64_t total_ns = 0;    // whole rcv_encode_frame for I/P frames (the rest is assembly, CRC)
+    uint64_t frames = 0;      // coded (I/P) frames accumulated
 };
 
 // Attaches a sink that accumulates stage times for every coded frame (nullptr detaches).

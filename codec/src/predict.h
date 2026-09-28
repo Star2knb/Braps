@@ -40,6 +40,15 @@ size_t residuals_lossless_sse41(const uint8_t* plane, ptrdiff_t stride, int widt
 size_t residuals_lossless_avx2(const uint8_t* plane, ptrdiff_t stride, int width, int row_begin, int row_end,
                                int predictor, uint8_t* out, uint32_t hist[256]);
 
+// One row of lossless residuals (width symbols). `up` is the row above, or nullptr for the first
+// row of a slice (128, then the left neighbour). Used for P-frames, where only some samples of a
+// row are coded. Same output as the chunk functions above.
+using ResidualRowFn = void (*)(const uint8_t* x, const uint8_t* up, int width, int predictor, uint8_t* out);
+
+void residual_row_scalar(const uint8_t* x, const uint8_t* up, int width, int predictor, uint8_t* out);
+void residual_row_sse41(const uint8_t* x, const uint8_t* up, int width, int predictor, uint8_t* out);
+void residual_row_avx2(const uint8_t* x, const uint8_t* up, int width, int predictor, uint8_t* out);
+
 // Adds n symbols to hist using four interleaved sub-histograms (§5.6 step 1). Baseline code,
 // deliberately not inline so SIMD translation units call this one copy.
 void histogram_add(const uint8_t* syms, size_t n, uint32_t hist[256]);

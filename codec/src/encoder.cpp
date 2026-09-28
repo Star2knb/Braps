@@ -1,7 +1,7 @@
 // RCV1 encoder (codec plan §5, §6, §7, §8).
-// Scope so far: lossless YUV420 I-frames plus DUP packets. Each (plane, slice) chunk is one job on
-// the thread pool; residual kernels are dispatched by CPU (scalar / SSE4.1 / AVX2). Output is
-// byte-identical for every thread count and kernel level.
+// Scope so far: lossless YUV420 I-, P- and DUP frames. Phase A (temporal skip compare) runs one job
+// per slice; phase B one job per (plane, slice) chunk. Residual kernels are dispatched by CPU
+// (scalar / SSE4.1 / AVX2). Output is byte-identical for every thread count and kernel level.
 #include <chrono>
 #include <cstring>
 #include <new>
@@ -14,6 +14,7 @@
 #include "predict.h"
 #include "profile.h"
 #include "rcv/rcv.h"
+#include "skipmap.h"
 #include "threadpool.h"
 
 using namespace rcv;
@@ -31,6 +32,7 @@ struct rcv_encoder {
     bool has_ref;
     rcv_isa isa;              // resolved kernel level
     ResidualFn residuals;
+    ResidualRowFn residual_row;
     HuffWriteFn huff_write;
     StageTimes* prof;         // optional, rcv_bench only
 
@@ -43,6 +45,14 @@ struct rcv_encoder {
     size_t chunk_size[3 * kMaxSlices];
     StageTimes worker_prof[kMaxThreads];  // per worker, merged into *prof after each frame
     const rcv_frame_in* job_in;           // input of the frame being encoded
+
+    // Temporal skip (§5.3), filled by phase A.
+    uint8_t* skip_flags;                  // blocks_x * blocks_y, raster order, 1 = unchanged
+    uint32_t* row_skipped;                // per block row: number of skipped blocks
+    uint32_t slice_skipped[kMaxSlices];
+    bool frame_p;                         // the frame being encoded is a P-frame
+    uint8_t* rowbuf_mem;
+    uint8_t* rowbuf[kMaxThreads];         // per worker: residuals of one partially skipped row
 };
 
 void rcv::set_stage_profile(rcv_encoder* enc, StageTimes* sink) {
@@ -95,24 +105,22 @@ rcv_status validate_input(const rcv_encoder* e, const rcv_frame_in* in) {
     return RCV_OK;
 }
 
-// Copies rows [r0, r1) of plane p from the input into the reference buffer (source ==
-// reconstruction when lossless). Each job copies only its own slice's rows.
-void copy_rows(rcv_encoder* e, const rcv_frame_in* in, int p, int r0, int r1) {
-    const int w = e->geo.plane_w[p];
-    uint8_t* dst = e->ref_plane[p];
-    const ptrdiff_t ds = e->ref_stride[p];
+// Copies samples [x0, x1) of row y of plane p from the input into the reference buffer (source ==
+// reconstruction when lossless). Jobs only ever copy rows of their own slice.
+void copy_span(rcv_encoder* e, const rcv_frame_in* in, int p, int y, int x0, int x1) {
+    uint8_t* d = e->ref_plane[p] + y * e->ref_stride[p];
     if (e->cfg.input_layout == RCV_IN_I420 || p == 0) {
-        const uint8_t* src = in->plane[p];
-        for (int y = r0; y < r1; ++y) std::memcpy(dst + y * ds, src + ptrdiff_t(y) * in->stride[p], size_t(w));
+        std::memcpy(d + x0, in->plane[p] + ptrdiff_t(y) * in->stride[p] + x0, size_t(x1 - x0));
         return;
     }
     // NV12 chroma: Cb = even bytes, Cr = odd bytes of the interleaved plane.
     const int k = p - 1;
-    for (int y = r0; y < r1; ++y) {
-        const uint8_t* uv = in->plane[1] + ptrdiff_t(y) * in->stride[1];
-        uint8_t* d = dst + y * ds;
-        for (int x = 0; x < w; ++x) d[x] = uv[2 * x + k];
-    }
+    const uint8_t* uv = in->plane[1] + ptrdiff_t(y) * in->stride[1];
+    for (int x = x0; x < x1; ++x) d[x] = uv[2 * x + k];
+}
+
+void copy_rows(rcv_encoder* e, const rcv_frame_in* in, int p, int r0, int r1) {
+    for (int y = r0; y < r1; ++y) copy_span(e, in, p, y, 0, e->geo.plane_w[p]);
 }
 
 ResidualFn residual_kernel(rcv_isa isa) {
@@ -120,6 +128,14 @@ ResidualFn residual_kernel(rcv_isa isa) {
     case RCV_ISA_AVX2: return residuals_lossless_avx2;
     case RCV_ISA_SSE41: return residuals_lossless_sse41;
     default: return residuals_lossless_scalar;
+    }
+}
+
+ResidualRowFn residual_row_kernel(rcv_isa isa) {
+    switch (isa) {
+    case RCV_ISA_AVX2: return residual_row_avx2;
+    case RCV_ISA_SSE41: return residual_row_sse41;
+    default: return residual_row_scalar;
     }
 }
 
@@ -177,22 +193,109 @@ size_t encode_chunk(uint8_t* out, const uint8_t* syms, size_t count, const uint3
     return huff_size;
 }
 
-// One job = one (plane, slice) chunk: copy its rows, predict, entropy-code into its own scratch
+// Phase A job (§5.3): compares every block of slice s with the reference. Only reads the
+// reference; phase B, which overwrites it, starts after every phase A job has finished.
+void skip_job(void* ctx, int s, int worker) {
+    rcv_encoder* e = static_cast<rcv_encoder*>(ctx);
+    const Geometry& g = e->geo;
+    StageTimer timer(e->prof ? &e->worker_prof[worker] : nullptr);
+    uint32_t skipped = 0;
+    for (int by = g.slice_block_row[s]; by < g.slice_block_row[s + 1]; ++by) {
+        uint8_t* f = e->skip_flags + size_t(by) * size_t(g.blocks_x);
+        const uint32_t row = uint32_t(compare_block_row(g, e->job_in, e->cfg.input_layout, e->ref_plane, e->ref_stride, by, f));
+        e->row_skipped[by] = row;
+        skipped += row;
+    }
+    e->slice_skipped[s] = skipped;
+    timer.lap(&StageTimes::skip_ns);
+}
+
+// P-frame chunk: rows are handled one at a time. A row whose blocks are all skipped costs nothing;
+// otherwise the row is copied into the reference, residuals are computed for the whole row with
+// the SIMD kernel, and only the non-skipped samples are kept, in raster order (§5.4). Skipped
+// samples are never coded but still serve as neighbours.
+// Copying the whole row equals the plan's "copy the non-skipped blocks" (§5.7) because a lossless
+// skip means those samples are already identical; it is one memcpy instead of many small ones.
+// (Near-lossless skip, M7, tolerates differences and will need the per-block copy.)
+size_t p_chunk_residuals(rcv_encoder* e, int pl, int s, int worker, StageTimer& timer) {
+    const Geometry& g = e->geo;
+    const int r0 = g.slice_row(pl, s), r1 = g.slice_row(pl, s + 1);
+    const int w = g.plane_w[pl], shift = g.block_shift[pl], bw = 1 << shift;
+    uint8_t* plane = e->ref_plane[pl];
+    const ptrdiff_t stride = e->ref_stride[pl];
+    uint8_t* out = e->resid[worker];
+    uint8_t* row = e->rowbuf[worker];
+    size_t n = 0;
+    for (int j = r0; j < r1; ++j) {
+        const int br = j >> shift;
+        const uint32_t nskip = e->row_skipped[br];
+        if (nskip == uint32_t(g.blocks_x)) continue;
+        const uint8_t* f = e->skip_flags + size_t(br) * size_t(g.blocks_x);
+        copy_span(e, e->job_in, pl, j, 0, w);
+        timer.lap(&StageTimes::load_ns);
+        uint8_t* x = plane + j * stride;
+        const uint8_t* up = j == r0 ? nullptr : x - stride;
+        if (nskip == 0) {
+            e->residual_row(x, up, w, e->cfg.predictor, out + n);
+            n += size_t(w);
+        } else {
+            e->residual_row(x, up, w, e->cfg.predictor, row);
+            for (int b = 0; b < g.blocks_x; ++b) {
+                if (f[b]) continue;
+                const int x0 = b * bw, len = (w - x0) < bw ? (w - x0) : bw;
+                std::memcpy(out + n, row + x0, size_t(len));
+                n += size_t(len);
+            }
+        }
+        timer.lap(&StageTimes::predict_ns);
+    }
+    return n;
+}
+
+// Phase B job = one (plane, slice) chunk: copy its rows, predict, entropy-code into its own scratch
 // buffer. Job j is plane j / S, slice j % S, so the big luma chunks are claimed first (§8).
 // Jobs touch disjoint rows of the reference and never read another slice's rows (§4.6).
 void encode_job(void* ctx, int job, int worker) {
     rcv_encoder* e = static_cast<rcv_encoder*>(ctx);
     const Geometry& g = e->geo;
     const int S = g.num_slices, pl = job / S, s = job % S;
-    const int r0 = g.slice_row(pl, s), r1 = g.slice_row(pl, s + 1);
     StageTimer timer(e->prof ? &e->worker_prof[worker] : nullptr);
-    copy_rows(e, e->job_in, pl, r0, r1);
-    timer.lap(&StageTimes::load_ns);
     uint32_t hist[256] = {};
-    const size_t n = e->residuals(e->ref_plane[pl], e->ref_stride[pl], g.plane_w[pl], r0, r1, e->cfg.predictor,
-                                  e->resid[worker], hist);
-    timer.lap(&StageTimes::predict_ns);
+    size_t n;
+    if (e->frame_p) {
+        n = p_chunk_residuals(e, pl, s, worker, timer);
+        histogram_add(e->resid[worker], n, hist);
+        timer.lap(&StageTimes::predict_ns);
+    } else {
+        const int r0 = g.slice_row(pl, s), r1 = g.slice_row(pl, s + 1);
+        copy_rows(e, e->job_in, pl, r0, r1);
+        timer.lap(&StageTimes::load_ns);
+        n = e->residuals(e->ref_plane[pl], e->ref_stride[pl], g.plane_w[pl], r0, r1, e->cfg.predictor,
+                         e->resid[worker], hist);
+        timer.lap(&StageTimes::predict_ns);
+    }
     e->chunk_size[job] = encode_chunk(e->chunk_buf[job], e->resid[worker], n, hist, e->huff_write, timer);
+}
+
+// Adds the per-worker stage times of the frame just encoded to the profile sink.
+void merge_profile(rcv_encoder* e, Clock::time_point t0, bool coded, bool ran_skip) {
+    if (!e->prof) return;
+    // Stage times are CPU time summed over workers; total is wall-clock time.
+    for (int w = 0; w < e->pool.threads(); ++w) {
+        StageTimes& wp = e->worker_prof[w];
+        e->prof->skip_ns += wp.skip_ns;
+        e->prof->load_ns += wp.load_ns;
+        e->prof->predict_ns += wp.predict_ns;
+        e->prof->table_ns += wp.table_ns;
+        e->prof->entropy_ns += wp.entropy_ns;
+        wp = StageTimes{};
+    }
+    if (ran_skip) e->prof->skip_frames++;
+    if (coded) {
+        e->prof->total_ns +=
+            uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0).count());
+        e->prof->frames++;
+    }
 }
 
 void fill_info(rcv_frame_info* info, uint32_t size, uint8_t type, uint32_t blocks_total,
@@ -265,6 +368,7 @@ rcv_status rcv_encoder_create(const rcv_encoder_config* cfg, rcv_encoder** out) 
     const int threads = resolve_thread_count(cfg->num_threads);
     e->isa = isa;
     e->residuals = residual_kernel(isa);
+    e->residual_row = residual_row_kernel(isa);
     e->huff_write = isa == RCV_ISA_AVX2 ? huff_write_avx2 : huff_write_scalar;
     e->cfg = resolve_defaults(*cfg);
     e->cfg.num_threads = uint8_t(threads);
@@ -282,10 +386,15 @@ rcv_status rcv_encoder_create(const rcv_encoder_config* cfg, rcv_encoder** out) 
     size_t chunk_total = 0;
     for (int j = 0; j < jobs; ++j)
         chunk_total += align64(kChunkHeaderSize + align4(g.chunk_samples(j / g.num_slices, j % g.num_slices)));
+    const size_t blocks = size_t(g.blocks_x) * size_t(g.blocks_y);
+    const size_t row_each = align64(size_t(g.plane_w[0]));
     e->ref_mem = static_cast<uint8_t*>(aligned_alloc64(total));
     e->resid_mem = static_cast<uint8_t*>(aligned_alloc64(resid_each * size_t(threads)));
     e->chunk_mem = static_cast<uint8_t*>(aligned_alloc64(chunk_total));
-    if (!e->ref_mem || !e->resid_mem || !e->chunk_mem) {
+    e->skip_flags = static_cast<uint8_t*>(aligned_alloc64(align64(blocks)));
+    e->row_skipped = static_cast<uint32_t*>(aligned_alloc64(align64(sizeof(uint32_t) * size_t(g.blocks_y))));
+    e->rowbuf_mem = static_cast<uint8_t*>(aligned_alloc64(row_each * size_t(threads)));
+    if (!e->ref_mem || !e->resid_mem || !e->chunk_mem || !e->skip_flags || !e->row_skipped || !e->rowbuf_mem) {
         rcv_encoder_destroy(e);
         return RCV_ERR_OUT_OF_MEMORY;
     }
@@ -295,7 +404,10 @@ rcv_status rcv_encoder_create(const rcv_encoder_config* cfg, rcv_encoder** out) 
         e->ref_plane[i] = p;
         p += size_t(e->ref_stride[i]) * size_t(g.plane_h[i]);
     }
-    for (int w = 0; w < threads; ++w) e->resid[w] = e->resid_mem + resid_each * size_t(w);
+    for (int w = 0; w < threads; ++w) {
+        e->resid[w] = e->resid_mem + resid_each * size_t(w);
+        e->rowbuf[w] = e->rowbuf_mem + row_each * size_t(w);
+    }
     uint8_t* c = e->chunk_mem;
     for (int j = 0; j < jobs; ++j) {
         e->chunk_buf[j] = c;
@@ -315,6 +427,9 @@ void rcv_encoder_destroy(rcv_encoder* e) {
     aligned_free64(e->ref_mem);
     aligned_free64(e->resid_mem);
     aligned_free64(e->chunk_mem);
+    aligned_free64(e->skip_flags);
+    aligned_free64(e->row_skipped);
+    aligned_free64(e->rowbuf_mem);
     delete e;
 }
 
@@ -330,18 +445,50 @@ rcv_status rcv_encode_frame(rcv_encoder* e, const rcv_frame_in* in, const rcv_en
     const rcv_status st = validate_input(e, in);
     if (st != RCV_OK) return st;
 
-    // Phase B (§5.1): every chunk in parallel, each into its own scratch buffer.
-    // Temporal skip (phase A) and P-frames arrive in M5; for now every coded frame is an I-frame.
     const Geometry& g = e->geo;
     const int S = g.num_slices;
-    const int jobs = 3 * S;
+    const uint32_t blocks = uint32_t(g.blocks_x) * uint32_t(g.blocks_y);
     e->job_in = in;
+
+    // Frame type (§5.2), in order: (1) forced keyframe, keyframe interval reached or no reference
+    // -> I without phase A; (2) skip disabled -> I; (3) nothing changed -> DUP; (4) every block
+    // changed -> I (same cost, free seek point); (5) otherwise P.
+    const bool force_i = (params && params->force_keyframe) || !e->has_ref ||
+                         e->frames_since_i >= e->cfg.keyframe_interval || !e->cfg.enable_skip;
+    uint32_t skipped = 0, skip_us = 0;
+    if (!force_i) {
+        const Clock::time_point ts = Clock::now();
+        e->pool.run(skip_job, e, S);  // phase A
+        for (int s = 0; s < S; ++s) skipped += e->slice_skipped[s];
+        skip_us = elapsed_us(ts);
+        if (skipped == blocks) {
+            e->job_in = nullptr;
+            write_dup_packet(out);  // the reference stays as it is
+            e->frames_since_i++;
+            e->frame_number++;
+            merge_profile(e, t0, false, true);
+            fill_info(info, uint32_t(kDupPacketSize), kFrameDup, blocks, 0, elapsed_us(t0));
+            if (info) {
+                info->blocks_skipped = blocks;
+                info->time_skip_us = skip_us;
+            }
+            return RCV_OK;
+        }
+    }
+    e->frame_p = skipped != 0;
+
+    // Phase B (§5.1): every chunk in parallel, each into its own scratch buffer.
+    const int jobs = 3 * S;
     e->pool.run(encode_job, e, jobs);
     e->job_in = nullptr;
 
     // Assembly in fixed order, so the packet never depends on scheduling (A3).
     uint8_t* payload = out + kFrameHeaderSize;
     uint8_t* dir = payload;
+    if (e->frame_p) {
+        pack_skip_map(g, e->skip_flags, payload);
+        dir += skip_map_size(g);
+    }
     uint8_t* p = dir + size_t(jobs) * 4;
     for (int j = 0; j < jobs; ++j) {
         put_u32(dir + 4 * size_t(j), uint32_t(e->chunk_size[j]));
@@ -351,7 +498,7 @@ rcv_status rcv_encode_frame(rcv_encoder* e, const rcv_frame_in* in, const rcv_en
     const size_t payload_size = size_t(p - payload);
 
     FrameHeader h{};
-    h.type = kFrameI;
+    h.type = e->frame_p ? kFrameP : kFrameI;
     h.flags = e->cfg.enable_crc ? kFlagCrc : 0;
     h.format = uint8_t(e->cfg.format);
     h.near_level = 0;
@@ -366,26 +513,16 @@ rcv_status rcv_encode_frame(rcv_encoder* e, const rcv_frame_in* in, const rcv_en
     write_frame_header(h, out);
 
     e->has_ref = true;
-    e->frames_since_i = 1;
+    e->frames_since_i = e->frame_p ? e->frames_since_i + 1 : 1;
     e->frame_number++;
 
-    if (e->prof) {
-        // Stage times are CPU time summed over workers; total is wall-clock time.
-        for (int w = 0; w < e->pool.threads(); ++w) {
-            StageTimes& wp = e->worker_prof[w];
-            e->prof->load_ns += wp.load_ns;
-            e->prof->predict_ns += wp.predict_ns;
-            e->prof->table_ns += wp.table_ns;
-            e->prof->entropy_ns += wp.entropy_ns;
-            wp = StageTimes{};
-        }
-        e->prof->total_ns +=
-            uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0).count());
-        e->prof->frames++;
-    }
+    merge_profile(e, t0, true, !force_i);
     const uint32_t us = elapsed_us(t0);
-    fill_info(info, uint32_t(kFrameHeaderSize + payload_size), kFrameI,
-              uint32_t(g.blocks_x * g.blocks_y), us, us);
+    fill_info(info, uint32_t(kFrameHeaderSize + payload_size), h.type, blocks, us - skip_us, us);
+    if (info) {
+        info->blocks_skipped = skipped;
+        info->time_skip_us = skip_us;
+    }
     return RCV_OK;
 }
 

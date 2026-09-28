@@ -1,7 +1,8 @@
 // RCV1 decoder (codec plan §5.7, §6, §8, Appendix A.2).
-// Scope so far: I-frames and DUP; I420 / NV12 output. Chunks are decoded in parallel on the thread
-// pool; within a chunk, entropy decoding and reconstruction run fused in one serial pass (the
-// decoder is inherently serial along a row, §5.4).
+// Scope so far: I-, P- and DUP frames; I420 / NV12 output. Chunks are decoded in parallel on the
+// thread pool; within a chunk, entropy decoding and reconstruction run fused in one serial pass (the
+// decoder is inherently serial along a row, §5.4). Decoding happens in place in the reference, so
+// skipped blocks of a P-frame simply keep the previous frame's samples.
 // The decoder must never crash on bad input: every length is checked before use (§6.5).
 #include <stdlib.h>  // _byteswap_uint64
 
@@ -15,6 +16,7 @@
 #include "huffman.h"
 #include "predict.h"
 #include "rcv/rcv.h"
+#include "skipmap.h"
 #include "threadpool.h"
 
 using namespace rcv;
@@ -48,6 +50,11 @@ struct rcv_decoder {
     rcv_status job_status[3 * kMaxSlices];
     Geometry frame_geo;        // geometry of the frame being decoded (slice count from its header)
     int frame_predictor;
+    bool frame_p;              // the frame being decoded is a P-frame
+
+    // P-frame skip map (§6.3), unpacked. Allocated in rcv_decoder_create.
+    uint8_t* skip_flags;       // blocks_x * blocks_y, 1 = skipped
+    uint32_t* row_skipped;     // per block row: number of skipped blocks
 };
 
 namespace {
@@ -154,6 +161,70 @@ void reconstruct(uint8_t* plane, ptrdiff_t stride, int width, int r0, int r1, in
     src = next;
 }
 
+// P-frame row with some skipped blocks (§5.4): only samples of non-skipped blocks are coded, in
+// raster order. Skipped samples already hold the reference values and act as neighbours, exactly
+// as they did in the encoder. `up` is nullptr for the first row of a slice.
+template <class Source>
+inline void row_masked(uint8_t* x, const uint8_t* up, int width, int bw, const uint8_t* flags, int predictor,
+                       Source& next) {
+    for (int x0 = 0, b = 0; x0 < width; x0 += bw, ++b) {
+        if (flags[b]) continue;
+        const int x1 = x0 + bw < width ? x0 + bw : width;
+        int i = x0;
+        if (!up) {
+            uint8_t a = i == 0 ? uint8_t(128) : x[i - 1];
+            for (; i < x1; ++i) {
+                a = uint8_t(a + next());
+                x[i] = a;
+            }
+            continue;
+        }
+        if (i == 0) {
+            x[0] = uint8_t(up[0] + next());
+            i = 1;
+        }
+        int a = x[i - 1];
+        if (predictor == kPredMed) {
+            int c = up[i - 1];
+            for (; i < x1; ++i) {
+                const int b_ = up[i];
+                a = (predict_med_clamp(a, b_, c) + next()) & 0xFF;
+                x[i] = uint8_t(a);
+                c = b_;
+            }
+        } else {
+            for (; i < x1; ++i) {
+                a = (a + next()) & 0xFF;
+                x[i] = uint8_t(a);
+            }
+        }
+    }
+}
+
+// Rebuilds rows [r0, r1) of one slice of a P-frame: fully skipped rows are left alone, unskipped
+// rows take the fast paths, the rest go segment by segment.
+template <class Source>
+void reconstruct_masked(uint8_t* plane, ptrdiff_t stride, int width, int r0, int r1, int predictor, int shift,
+                        const uint8_t* flags, const uint32_t* row_skipped, int blocks_x, Source& src) {
+    Source next = src;  // local copy, see reconstruct()
+    for (int j = r0; j < r1; ++j) {
+        const int br = j >> shift;
+        const uint32_t nskip = row_skipped[br];
+        if (nskip == uint32_t(blocks_x)) continue;
+        uint8_t* x = plane + j * stride;
+        const uint8_t* up = j == r0 ? nullptr : x - stride;
+        if (nskip == 0) {
+            if (up)
+                row_rest(x, up, width, predictor, next);
+            else
+                row_first(x, width, next);
+        } else {
+            row_masked(x, up, width, 1 << shift, flags + size_t(br) * size_t(blocks_x), predictor, next);
+        }
+    }
+    src = next;
+}
+
 // Two slices of one plane rebuilt in lockstep. Each slice is a serial chain (Huffman bit
 // position, then left neighbour), but the two chains are independent, so interleaving them
 // lets the CPU overlap them on one core. Rows beyond the shorter slice are finished alone.
@@ -248,33 +319,44 @@ rcv_status decode_huffman_pair(rcv_decoder* d, HuffDecTable* luts, const uint8_t
     return close_huffman(b, size_b);
 }
 
-// Decodes one chunk straight into the reference plane. The sample count comes from geometry,
-// never from the packet.
-rcv_status decode_chunk(rcv_decoder* d, HuffDecTable* lut, const uint8_t* c, size_t size, int plane,
-                        const Geometry& g, int slice, int predictor) {
-    if (!chunk_header_ok(c, size)) return RCV_ERR_BITSTREAM;
-    const size_t count = g.chunk_samples(plane, slice);
+// Rebuilds one chunk's rows from a source: all samples for an I-frame, only those of non-skipped
+// blocks for a P-frame.
+template <class Source>
+void rebuild_chunk(rcv_decoder* d, int plane, const Geometry& g, int slice, int predictor, Source& src) {
     uint8_t* dst = d->ref_plane[plane];
     const ptrdiff_t stride = d->ref_stride[plane];
     const int w = g.plane_w[plane], r0 = g.slice_row(plane, slice), r1 = g.slice_row(plane, slice + 1);
+    if (d->frame_p)
+        reconstruct_masked(dst, stride, w, r0, r1, predictor, g.block_shift[plane], d->skip_flags, d->row_skipped,
+                           g.blocks_x, src);
+    else
+        reconstruct(dst, stride, w, r0, r1, predictor, src);
+}
+
+// Decodes one chunk straight into the reference plane. The sample count is derived from geometry
+// and the skip map, never read from the packet (§6.4).
+rcv_status decode_chunk(rcv_decoder* d, HuffDecTable* lut, const uint8_t* c, size_t size, int plane,
+                        const Geometry& g, int slice, int predictor) {
+    if (!chunk_header_ok(c, size)) return RCV_ERR_BITSTREAM;
+    const size_t count = coded_chunk_samples(g, plane, slice, d->frame_p ? d->skip_flags : nullptr);
     switch (c[0]) {
     case kChunkHuffman: {
         HuffSource src;
         const rcv_status st = open_huffman(c, size, count, lut, &src);
         if (st != RCV_OK) return st;
-        reconstruct(dst, stride, w, r0, r1, predictor, src);
+        rebuild_chunk(d, plane, g, slice, predictor, src);
         return close_huffman(src, size);
     }
     case kChunkSingle: {
         if (count == 0 || size != kChunkHeaderSize) return RCV_ERR_BITSTREAM;
         SingleSource src{c[1]};
-        reconstruct(dst, stride, w, r0, r1, predictor, src);
+        rebuild_chunk(d, plane, g, slice, predictor, src);
         return RCV_OK;
     }
     case kChunkRaw: {
         if (c[1] != 0 || count == 0 || size != kChunkHeaderSize + align4(count)) return RCV_ERR_BITSTREAM;
         RawSource src{c + kChunkHeaderSize};
-        reconstruct(dst, stride, w, r0, r1, predictor, src);
+        rebuild_chunk(d, plane, g, slice, predictor, src);
         return RCV_OK;
     }
     case kChunkEmpty:
@@ -297,7 +379,8 @@ void decode_job(void* ctx, int j, int worker) {
                                           d->frame_predictor);
 }
 
-rcv_status decode_i_frame(rcv_decoder* d, const uint8_t* pkt, size_t size) {
+// I- or P-frame (the caller has checked that a P-frame has a reference).
+rcv_status decode_coded_frame(rcv_decoder* d, const uint8_t* pkt, size_t size, bool p_frame) {
     if (size < kFrameHeaderSize) return RCV_ERR_BITSTREAM;
     const uint16_t flags = get_u16(pkt + 6);
     const uint8_t format = pkt[8];
@@ -328,22 +411,35 @@ rcv_status decode_i_frame(rcv_decoder* d, const uint8_t* pkt, size_t size) {
     }
     if (near_level != 0) return RCV_ERR_UNSUPPORTED;  // M7
 
+    // P-frames start with the skip map (§6.3); the reference is not touched if it is invalid.
+    const size_t map_size = p_frame ? skip_map_size(g) : 0;
+    if (map_size > payload_size) return RCV_ERR_BITSTREAM;
+    if (p_frame) {
+        if (!unpack_skip_map(g, payload, d->skip_flags)) return RCV_ERR_BITSTREAM;
+        for (int by = 0; by < g.blocks_y; ++by) {
+            uint32_t n = 0;
+            for (int bx = 0; bx < g.blocks_x; ++bx) n += d->skip_flags[size_t(by) * size_t(g.blocks_x) + size_t(bx)];
+            d->row_skipped[by] = n;
+        }
+    }
+    const uint8_t* dir = payload + map_size;
     const size_t num_chunks = size_t(3) * slices;
     const size_t dir_size = num_chunks * 4;
-    if (dir_size > payload_size) return RCV_ERR_BITSTREAM;
+    if (dir_size > payload_size - map_size) return RCV_ERR_BITSTREAM;
     uint64_t sum = 0;
     for (size_t k = 0; k < num_chunks; ++k) {
-        const uint32_t cs = get_u32(payload + 4 * k);
+        const uint32_t cs = get_u32(dir + 4 * k);
         if (cs < kChunkHeaderSize || (cs & 3)) return RCV_ERR_BITSTREAM;
         sum += cs;
     }
-    if (sum != payload_size - dir_size) return RCV_ERR_BITSTREAM;
+    if (sum != payload_size - map_size - dir_size) return RCV_ERR_BITSTREAM;
 
-    // Job list, in plane order (big luma jobs first). Neighbouring HUFFMAN chunks are paired.
+    // Job list, in plane order (big luma jobs first). For I-frames neighbouring HUFFMAN chunks are
+    // paired (lockstep decode); P-frame rows differ per slice, so their chunks run singly.
     int njobs = 0;
-    const uint8_t* chunk = payload + dir_size;
+    const uint8_t* chunk = dir + dir_size;
     for (int pl = 0; pl < 3; ++pl) {
-        auto chunk_size = [&](int s) { return get_u32(payload + 4 * (size_t(pl) * slices + size_t(s))); };
+        auto chunk_size = [&](int s) { return get_u32(dir + 4 * (size_t(pl) * slices + size_t(s))); };
         for (int s = 0; s < slices;) {
             DecodeJob& job = d->jobs[njobs++];
             job.chunk = chunk;
@@ -351,7 +447,7 @@ rcv_status decode_i_frame(rcv_decoder* d, const uint8_t* pkt, size_t size) {
             job.slice = s;
             job.size[0] = chunk_size(s);
             // Sizes are >= 4 (checked above), so both mode bytes are inside the payload.
-            if (s + 1 < slices && chunk[0] == kChunkHuffman && chunk[job.size[0]] == kChunkHuffman) {
+            if (!p_frame && s + 1 < slices && chunk[0] == kChunkHuffman && chunk[job.size[0]] == kChunkHuffman) {
                 job.size[1] = chunk_size(s + 1);
                 job.count = 2;
             } else {
@@ -367,6 +463,7 @@ rcv_status decode_i_frame(rcv_decoder* d, const uint8_t* pkt, size_t size) {
     d->has_ref = false;
     d->frame_geo = g;
     d->frame_predictor = predictor;
+    d->frame_p = p_frame;
     d->pool.run(decode_job, d, njobs);
     for (int j = 0; j < njobs; ++j)  // first failure in job order, independent of scheduling
         if (d->job_status[j] != RCV_OK) return d->job_status[j];
@@ -475,7 +572,9 @@ rcv_status rcv_decoder_create(const uint8_t seq_header[32], uint8_t num_threads,
     const int threads = resolve_thread_count(num_threads);
     d->ref_mem = static_cast<uint8_t*>(aligned_alloc64(total));
     d->luts = static_cast<HuffDecTable*>(aligned_alloc64(sizeof(HuffDecTable) * 2 * size_t(threads)));
-    if (!d->ref_mem || !d->luts) {
+    d->skip_flags = static_cast<uint8_t*>(aligned_alloc64(align64(size_t(d->geo.blocks_x) * size_t(d->geo.blocks_y))));
+    d->row_skipped = static_cast<uint32_t*>(aligned_alloc64(align64(sizeof(uint32_t) * size_t(d->geo.blocks_y))));
+    if (!d->ref_mem || !d->luts || !d->skip_flags || !d->row_skipped) {
         rcv_decoder_destroy(d);
         return RCV_ERR_OUT_OF_MEMORY;
     }
@@ -498,6 +597,8 @@ void rcv_decoder_destroy(rcv_decoder* d) {
     d->pool.stop();
     aligned_free64(d->ref_mem);
     aligned_free64(d->luts);
+    aligned_free64(d->skip_flags);
+    aligned_free64(d->row_skipped);
     delete d;
 }
 
@@ -521,13 +622,15 @@ rcv_status rcv_decode_frame(rcv_decoder* d, const uint8_t* packet, size_t size, 
         if (!d->has_ref) return RCV_ERR_NO_REFERENCE;
         break;
     case kFrameI:
-        st = decode_i_frame(d, packet, size);
+        st = decode_coded_frame(d, packet, size, false);
         if (st != RCV_OK) return st;
         break;
     case kFrameP:
         if (size < kFrameHeaderSize) return RCV_ERR_BITSTREAM;
-        if (!d->has_ref) return RCV_ERR_NO_REFERENCE;
-        return RCV_ERR_UNSUPPORTED;  // M5
+        if (!d->has_ref) return RCV_ERR_NO_REFERENCE;  // e.g. after a seek (rcv_decoder_reset)
+        st = decode_coded_frame(d, packet, size, true);
+        if (st != RCV_OK) return st;
+        break;
     default:
         return RCV_ERR_BITSTREAM;
     }
@@ -540,6 +643,8 @@ rcv_status rcv_decode_frame(rcv_decoder* d, const uint8_t* packet, size_t size, 
         info->is_keyframe = type == kFrameI;
         info->blocks_total = uint32_t(d->geo.blocks_x * d->geo.blocks_y);
         if (type == kFrameDup) info->blocks_skipped = info->blocks_total;
+        if (type == kFrameP)
+            for (int by = 0; by < d->geo.blocks_y; ++by) info->blocks_skipped += d->row_skipped[by];
         info->time_total_us = elapsed_us(t0);
         info->time_encode_us = info->time_total_us;
     }

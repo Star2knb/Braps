@@ -50,22 +50,25 @@ void med_row(const uint8_t* x, const uint8_t* up, int width, uint8_t* out) {
 
 }  // namespace
 
+void residual_row_sse41(const uint8_t* x, const uint8_t* up, int width, int predictor, uint8_t* out) {
+    if (!up) {
+        out[0] = uint8_t(x[0] - 128);
+        left_row(x, width, out);
+        return;
+    }
+    out[0] = uint8_t(x[0] - up[0]);
+    if (predictor == kPredMed)
+        med_row(x, up, width, out);
+    else
+        left_row(x, width, out);
+}
+
 size_t residuals_lossless_sse41(const uint8_t* plane, ptrdiff_t stride, int width, int row_begin, int row_end,
                                 int predictor, uint8_t* out, uint32_t hist[256]) {
     uint8_t* o = out;
     for (int j = row_begin; j < row_end; ++j, o += width) {
         const uint8_t* x = plane + j * stride;
-        if (j == row_begin) {
-            o[0] = uint8_t(x[0] - 128);
-            left_row(x, width, o);
-            continue;
-        }
-        const uint8_t* up = x - stride;
-        o[0] = uint8_t(x[0] - up[0]);
-        if (predictor == kPredMed)
-            med_row(x, up, width, o);
-        else
-            left_row(x, width, o);
+        residual_row_sse41(x, j == row_begin ? nullptr : x - stride, width, predictor, o);
     }
     const size_t n = size_t(o - out);
     histogram_add(out, n, hist);
