@@ -165,3 +165,38 @@ changes thread priority or affinity itself; `on_worker_start` lets the caller do
 (446 real, 345 duplicate). Noisy, detailed content (FRAPS 1.58:1), as plan §11.2 asks. FFmpeg
 decodes 790 frames (it drops one trailing duplicate). The comparison script now names its output
 files per corpus (`<corpus>.sizes_*.txt`).
+
+## M5
+
+**D-029 — Frame types.** Implemented exactly as plan §5.2: forced keyframe, `frames_since_I >=
+keyframe_interval` or no reference -> I without phase A; skip disabled -> I; every block unchanged ->
+DUP (`rcv_encode_frame` itself returns the 8-byte packet and leaves the reference alone); no block
+unchanged -> I; otherwise P. `force_keyframe` wins even over an identical frame. An I-frame sets
+`frames_since_I = 1`; P and DUP (from either entry point) add one (D-010).
+
+**D-030 — Skip compare (phase A).** One job per slice. Lossless skip = every sample of the block equal
+in all three planes. The compare sweeps each block row row-by-row across the full width with SSE2
+(the x64 baseline, so no ISA dispatch), keeps a still-unchanged flag per block, skips blocks already
+known to differ and stops when all differ - on a changing frame usually after the first row. NV12
+chroma is compared by interleaving the reference Cb/Cr on the fly. A fully unchanged frame has to be
+read completely (~3 MB at 1360x744); that is memory-bandwidth bound on the i5-7200U (0.44 ms on one
+thread, 0.28 ms on two). Per-block hashes of the reference would halve the reads but a collision
+would silently skip a changed block, breaking losslessness, so they were rejected.
+
+**D-031 — P-frame encoding.** A row whose blocks are all skipped costs nothing. Otherwise the whole
+row is copied into the reference - equivalent to copying only the non-skipped blocks (§5.7) because
+a lossless skip means those samples are already identical - residuals are computed for the full row
+with the SIMD kernel, and only the non-skipped samples are kept, in raster order. Near-lossless skip
+(M7) tolerates differences and will need the per-block copy.
+
+**D-032 — P-frame decoding.** The skip map is strict: bits past the last block and padding bytes must
+be zero. Coded sample counts come from geometry + skip map. P-frame chunks are decoded singly (rows of
+neighbouring slices have different skip patterns, so no lockstep pairing). A P packet rejected before
+decoding starts (header, skip map, directory) leaves the reference intact; one that fails midway has
+already overwritten part of it, so the decoder returns `RCV_ERR_NO_REFERENCE` for P/DUP until the next
+I-frame.
+
+**D-033 — rcv_bench and temporal skip.** With skip on, every frame goes through `rcv_encode_frame`, so
+the encoder's own phase A finds duplicates; with skip off, frames identical to the previous one go
+through `rcv_encode_duplicate` (the recorder host's path for timeline gaps), which keeps "noskip" rows
+comparable with the M2-M4 reports. `--no-decode` measures the encoder alone, as the recorder runs it.
