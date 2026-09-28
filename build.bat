@@ -18,5 +18,8 @@ call "%VSINSTALL%\VC\Auxiliary\Build\vcvars64.bat" >nul || exit /b 1
 set "PRESET=%~1"
 if "%PRESET%"=="" set "PRESET=release"
 
-cmake --preset %PRESET% || exit /b 1
-cmake --build --preset %PRESET% || exit /b 1
+rem Always build the project this script lives in, whatever the current directory is.
+pushd "%~dp0" || exit /b 1
+cmake --preset %PRESET% || (popd & exit /b 1)
+cmake --build --preset %PRESET% || (popd & exit /b 1)
+popd
