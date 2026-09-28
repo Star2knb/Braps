@@ -10,6 +10,7 @@
 #include "format.h"
 #include "huffman.h"
 #include "predict.h"
+#include "profile.h"
 #include "rcv/rcv.h"
 
 using namespace rcv;
@@ -26,7 +27,12 @@ struct rcv_encoder {
     uint32_t frame_number;
     uint32_t frames_since_i;
     bool has_ref;
+    StageTimes* prof;         // optional, rcv_bench only
 };
+
+void rcv::set_stage_profile(rcv_encoder* enc, StageTimes* sink) {
+    if (enc) enc->prof = sink;
+}
 
 namespace {
 
@@ -92,10 +98,12 @@ rcv_status load_input(rcv_encoder* e, const rcv_frame_in* in) {
 
 // Writes one chunk (§6.4) and returns its size (a multiple of 4).
 // `out` must have room for the RAW bound: 4 + align4(count).
-size_t encode_chunk(uint8_t* out, const uint8_t* syms, size_t count, const uint32_t hist[256]) {
+size_t encode_chunk(uint8_t* out, const uint8_t* syms, size_t count, const uint32_t hist[256],
+                    StageTimer& timer) {
     std::memset(out, 0, kChunkHeaderSize);
     if (count == 0) {
         out[0] = kChunkEmpty;
+        timer.lap(&StageTimes::table_ns);
         return kChunkHeaderSize;
     }
     int distinct = 0, last = 0;
@@ -107,6 +115,7 @@ size_t encode_chunk(uint8_t* out, const uint8_t* syms, size_t count, const uint3
     if (distinct == 1) {
         out[0] = kChunkSingle;
         out[1] = uint8_t(last);
+        timer.lap(&StageTimes::table_ns);
         return kChunkHeaderSize;
     }
 
@@ -119,8 +128,10 @@ size_t encode_chunk(uint8_t* out, const uint8_t* syms, size_t count, const uint3
 
     if (huff_size > raw_size) {
         out[0] = kChunkRaw;
+        timer.lap(&StageTimes::table_ns);
         std::memcpy(out + kChunkHeaderSize, syms, count);
         std::memset(out + kChunkHeaderSize + count, 0, raw_size - kChunkHeaderSize - count);
+        timer.lap(&StageTimes::entropy_ns);
         return raw_size;
     }
 
@@ -128,11 +139,13 @@ size_t encode_chunk(uint8_t* out, const uint8_t* syms, size_t count, const uint3
     huff_pack_lengths(len, out + kChunkHeaderSize);
     uint16_t code[256];
     huff_canonical_codes(len, code);  // always valid for lengths from huff_build_lengths
+    timer.lap(&StageTimes::table_ns);
     uint8_t* bitstream = out + kChunkHeaderSize + kHuffTableSize;
     BitWriter bw(bitstream);
     for (size_t k = 0; k < count; ++k) bw.put(code[syms[k]], len[syms[k]]);
     const size_t n = bw.finish();
     std::memset(bitstream + n, 0, align4(n) - n);
+    timer.lap(&StageTimes::entropy_ns);
     return huff_size;
 }
 
@@ -238,12 +251,14 @@ rcv_status rcv_encode_frame(rcv_encoder* e, const rcv_frame_in* in, const rcv_en
     const Clock::time_point t0 = Clock::now();
     if (!e || !in || !out) return RCV_ERR_INVALID_ARG;
     if (out_capacity < e->max_packet) return RCV_ERR_BUFFER_TOO_SMALL;
-    const uint8_t near_level = params ? params->near : 0;
+    const uint8_t near_level = params ? params->near_level : 0;
     if (near_level > 3) return RCV_ERR_INVALID_ARG;
     if (near_level != 0) return RCV_ERR_UNSUPPORTED;  // M7
 
+    StageTimer timer(e->prof);
     rcv_status st = load_input(e, in);
     if (st != RCV_OK) return st;
+    timer.lap(&StageTimes::load_ns);
 
     // M1: every coded frame is an I-frame (temporal skip / P-frames arrive in M5).
     const Geometry& g = e->geo;
@@ -257,7 +272,8 @@ rcv_status rcv_encode_frame(rcv_encoder* e, const rcv_frame_in* in, const rcv_en
             const size_t n = residuals_lossless_scalar(e->ref_plane[pl], e->ref_stride[pl], g.plane_w[pl],
                                                        g.slice_row(pl, s), g.slice_row(pl, s + 1),
                                                        e->cfg.predictor, e->resid, hist);
-            const size_t cs = encode_chunk(p, e->resid, n, hist);
+            timer.lap(&StageTimes::predict_ns);
+            const size_t cs = encode_chunk(p, e->resid, n, hist, timer);
             put_u32(dir + 4 * (size_t(pl) * size_t(S) + size_t(s)), uint32_t(cs));
             p += cs;
         }
@@ -283,6 +299,11 @@ rcv_status rcv_encode_frame(rcv_encoder* e, const rcv_frame_in* in, const rcv_en
     e->frames_since_i = 1;
     e->frame_number++;
 
+    if (e->prof) {
+        e->prof->total_ns +=
+            uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - t0).count());
+        e->prof->frames++;
+    }
     const uint32_t us = elapsed_us(t0);
     fill_info(info, uint32_t(kFrameHeaderSize + payload_size), kFrameI,
               uint32_t(g.blocks_x * g.blocks_y), us, us);

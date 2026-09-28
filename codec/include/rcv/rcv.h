@@ -66,7 +66,7 @@ typedef struct {
 
 typedef struct {
     uint8_t  force_keyframe;
-    uint8_t  near;             /* 0..3, YUV420 only */
+    uint8_t  near_level;       /* 0..3, YUV420 only. Not "near": <windows.h> defines near as a macro. */
 } rcv_encode_params;
 
 typedef struct {

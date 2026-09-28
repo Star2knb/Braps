@@ -394,7 +394,7 @@ typedef struct {
 
 typedef struct {
     uint8_t  force_keyframe;
-    uint8_t  near;             /* 0..3, YUV420 only */
+    uint8_t  near_level;       /* 0..3, YUV420 only (not "near": <windows.h> defines it as a macro) */
 } rcv_encode_params;
 
 typedef struct {
@@ -532,7 +532,7 @@ Per corpus and configuration, report: mean / p50 / p99 / max encode ms per frame
 | GPU converter | Scales to the output size (≤ back-buffer size) and converts to YUV 4:2:0 full-range BT.601 (NV12 or I420) before readback |
 | Readback ring | Asynchronous staging textures with fences; hands `rcv_frame_in` to the encoder thread |
 | Encoder thread | Calls `rcv_encode_frame`; owns the codec object |
-| Rate controller | Watches the compressed-packet queue depth; sets `near` per frame (e.g. < 50% full → 0; 50–80% → 1–2; > 80% → drop frames and log) |
+| Rate controller | Watches the compressed-packet queue depth; sets `near_level` per frame (e.g. < 50% full → 0; 50–80% → 1–2; > 80% → drop frames and log) |
 | Disk writer | Large aligned unbuffered writes; container muxing (AVI OpenDML, keyframe index from `is_keyframe`) |
 | Hardware fallback | Separate path (QuickSync / NVENC / AMF), chosen at start from a disk benchmark; not part of RCV1 |
 

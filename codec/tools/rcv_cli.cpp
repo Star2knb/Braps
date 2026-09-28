@@ -172,7 +172,7 @@ int cmd_encode(const Args& a) {
     const std::string isa = a.get("--isa", "auto");
     cfg.isa = isa == "scalar" ? RCV_ISA_SCALAR : isa == "sse41" ? RCV_ISA_SSE41 : isa == "avx2" ? RCV_ISA_AVX2 : RCV_ISA_AUTO;
     rcv_encode_params params{};
-    params.near = uint8_t(std::atoi(a.get("--near", "0").c_str()));
+    params.near_level = uint8_t(std::atoi(a.get("--near", "0").c_str()));
     const long max_frames = std::atol(a.get("--frames", "0").c_str());
 
     rcv_encoder* enc = nullptr;
