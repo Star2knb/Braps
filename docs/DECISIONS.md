@@ -64,3 +64,37 @@ reconstructed. Simpler to validate; fusing the passes is an M3 optimisation.
 
 **D-013 — `rcv_cli verify` compares bytes directly** (reports differing frames and max error per plane)
 instead of computing MD5s; it is a strictly stronger check for a round trip.
+
+## M2
+
+**D-014 — `rcv_encode_params.near` renamed to `near_level`.** `<windows.h>` defines `near` (and `far`)
+as empty macros, so the plan's field name made `rcv.h` fail to compile after `windows.h` - which is
+exactly how the capture DLL and host will include it. The codec plan §7 is updated to match, and a
+test compiles `rcv.h` after `windows.h`.
+
+**D-015 — New Minecraft corpus; A4 measured against FRAPS on the same clip.** The original FRAPS clip
+(plan §1.3) was deleted. A new FRAPS recording of the same setup (1360x744 yuvj420p, 60 fps, 1,597
+frames, i5-7200U) is the corpus. On it FRAPS's real-frame median is 2.832:1 (not 2.49:1: different
+scene, far fewer duplicates). A4 ("FRAPS parity") is therefore checked against 2.832 on identical
+frames; the plan's 2.49 remains a floor. Corpus frames are extracted with `-pix_fmt yuvj420p`
+(no range conversion) into `corpus/` (git-ignored). Known quirk: FFmpeg's FRAPS decoder drops the
+8-byte duplicate packets and its constant-frame-rate logic fills each gap by repeating the *next*
+frame, so in 17 places a new frame appears one slot early (then repeats). Frame contents are exact;
+only those duplicate positions move by one slot.
+
+**D-016 — "Real frames" in reports.** rcv_bench codes a frame identical to its predecessor as a DUP
+packet (what the recorder host will emit, and what the M5 auto-DUP will do). Ratios are taken over
+real frames: for a codec that stores duplicates as marker packets (<= 64 bytes: FRAPS, RCV1 DUP) the
+frames it coded in full; for a codec without markers (Ut Video, FFV1) the frames that differ from
+their predecessor. This measures each codec on what it actually stored and is immune to the
+one-slot shift in D-015 (FRAPS: 1,443 coded frames; identical-frame detection: 1,441).
+
+**D-017 — Stage profiler.** `src/profile.h` gives rcv_bench per-stage encoder times (load,
+predict + histogram, table build, entropy write, other) through an internal, non-exported hook.
+With no sink attached it costs one branch per stage.
+
+**D-018 — External baselines.** Ut Video (`-pred median`) and FFV1 (`-level 3`, other options default)
+are run by FFmpeg with `-threads 1` on the raw corpus declared as `yuv420p` (no conversion), piped as
+NUT into ffprobe to collect per-frame packet sizes (`codec/bench/compare_baselines.ps1`). Their
+encode time is FFmpeg's user CPU time divided by frames, so it includes small demux/mux overhead
+and is approximate.
