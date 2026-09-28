@@ -12,6 +12,7 @@ set(RCV_SOURCES
     src/threadpool.cpp
     src/skipmap.cpp
     src/colour.cpp
+    src/nearlossless.cpp
     src/encoder.cpp
     src/decoder.cpp
 )
@@ -50,6 +51,7 @@ add_executable(rcv_tests
     tests/test_threads.cpp
     tests/test_pframes.cpp
     tests/test_gbr.cpp
+    tests/test_near.cpp
 )
 # Tests exercise internal kernels too, so they see the private headers.
 target_include_directories(rcv_tests PRIVATE src)

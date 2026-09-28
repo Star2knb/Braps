@@ -374,8 +374,10 @@ int cmd_verify(const Args& a) {
     int32_t strides[3];
     raw_fmt.output(frame.data(), planes, strides);
 
-    long n = 0, bad_frames = 0;
-    int max_err[3] = {};
+    // Near-lossless frames may differ by up to their NEAR (header byte 9). A DUP carries no NEAR, so
+    // the allowed error is the largest NEAR seen so far.
+    long n = 0, bad_frames = 0, near_frames = 0;
+    int max_err[3] = {}, tolerance = 0;
     for (int rc; (rc = r.next()) != 0; ++n) {
         if (rc < 0) {
             std::fprintf(stderr, "packet %ld: truncated or corrupt container\n", n);
@@ -390,25 +392,32 @@ int cmd_verify(const Args& a) {
             std::fprintf(stderr, "FAIL: source has fewer frames (%ld) than the .rcv file\n", n);
             return 1;
         }
+        if (r.pkt.size() >= 32 && r.pkt[5] != 0) {
+            tolerance = std::max(tolerance, int(r.pkt[9]));
+            near_frames += r.pkt[9] != 0;
+        }
         bool frame_ok = true;
         for (size_t k = 0; k < fs; ++k) {
             const int c = raw_fmt.component(k);
             if (c < 0) continue;  // alpha
             const int e = std::abs(int(frame[k]) - int(ref[k]));
-            if (e) {
-                frame_ok = false;
-                max_err[c] = std::max(max_err[c], e);
-            }
+            max_err[c] = std::max(max_err[c], e);
+            if (e > tolerance) frame_ok = false;
         }
-        if (!frame_ok && ++bad_frames <= 10) std::fprintf(stderr, "frame %ld differs\n", n);
+        if (!frame_ok && ++bad_frames <= 10) std::fprintf(stderr, "frame %ld differs beyond +-%d\n", n, tolerance);
     }
+    const char* names[3] = {raw_fmt.rgb ? "B" : "Y", raw_fmt.rgb ? "G" : "Cb", raw_fmt.rgb ? "R" : "Cr"};
     if (bad_frames) {
         std::fprintf(stderr, "FAIL: %ld of %ld frames differ; max error %s %d, %s %d, %s %d\n", bad_frames, n,
-                     raw_fmt.rgb ? "B" : "Y", max_err[0], raw_fmt.rgb ? "G" : "Cb", max_err[1],
-                     raw_fmt.rgb ? "R" : "Cr", max_err[2]);
+                     names[0], max_err[0], names[1], max_err[1], names[2], max_err[2]);
         return 1;
     }
-    std::fprintf(stderr, "PASS: %ld frames bit-exact (%dx%d)\n", n, w, h);
+    if (tolerance == 0)
+        std::fprintf(stderr, "PASS: %ld frames bit-exact (%dx%d)\n", n, w, h);
+    else
+        std::fprintf(stderr, "PASS: %ld frames (%dx%d), %ld near-lossless; max error %s %d, %s %d, %s %d (NEAR <= %d)\n",
+                     n, w, h, near_frames, names[0], max_err[0], names[1], max_err[1], names[2], max_err[2],
+                     tolerance);
     return 0;
 }
 

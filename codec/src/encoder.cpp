@@ -12,6 +12,7 @@
 #include "crc32c.h"
 #include "format.h"
 #include "huffman.h"
+#include "nearlossless.h"
 #include "predict.h"
 #include "profile.h"
 #include "rcv/rcv.h"
@@ -53,8 +54,12 @@ struct rcv_encoder {
     uint32_t slice_skipped[kMaxSlices];
     bool frame_p;                         // the frame being encoded is a P-frame
     bool run_phase_a;                     // the prepare pass also runs the skip compare
+    int near;                             // NEAR of the frame being encoded (0 = lossless), §5.5
+    NearTables near_tables[kMaxNear + 1]; // [1..3]
     uint8_t* rowbuf_mem;
-    uint8_t* rowbuf[kMaxThreads];         // per worker: residuals of one partially skipped row
+    uint8_t* rowbuf[kMaxThreads];         // per worker: two row buffers of rowbuf_size bytes (residuals of a
+                                          // partially skipped row, or de-interleaved NV12 source rows)
+    size_t rowbuf_size;
 
     // GBR format (§4.4). Each frame's BGRA input is converted into these planes, which the encoder
     // then predicts from directly; afterwards they become the reference by swapping pointers with
@@ -238,7 +243,10 @@ void prepare_job(void* ctx, int s, int worker) {
     uint32_t skipped = 0;
     for (int by = g.slice_block_row[s]; by < g.slice_block_row[s + 1]; ++by) {
         uint8_t* f = e->skip_flags + size_t(by) * size_t(g.blocks_x);
-        const uint32_t row = uint32_t(compare_block_row(g, cmp, layout, e->ref_plane, e->ref_stride, by, f));
+        // Near-lossless: a block within +-NEAR of the (reconstructed) reference may be skipped;
+        // the reference then stays within the error bound of this frame too (§5.3).
+        const uint32_t row =
+            uint32_t(compare_block_row(g, cmp, layout, e->ref_plane, e->ref_stride, by, f, e->near));
         e->row_skipped[by] = row;
         skipped += row;
     }
@@ -290,6 +298,157 @@ size_t p_chunk_residuals(rcv_encoder* e, int pl, int s, int worker, StageTimer& 
     return n;
 }
 
+// Source samples of row y of plane p: straight from the input, or de-interleaved (NV12 chroma)
+// into `buf`.
+const uint8_t* source_row(const rcv_encoder* e, int p, int y, uint8_t* buf) {
+    const rcv_frame_in* in = e->job_in;
+    if (e->cfg.input_layout == RCV_IN_I420 || p == 0) return in->plane[p] + ptrdiff_t(y) * in->stride[p];
+    const uint8_t* uv = in->plane[1] + ptrdiff_t(y) * in->stride[1];
+    const int k = p - 1;
+    for (int x = 0, w = e->geo.plane_w[p]; x < w; ++x) buf[x] = uv[2 * x + k];
+    return buf;
+}
+
+// Near-lossless coding of samples [i0, i1) of one row (§5.5). Prediction uses reconstructed
+// neighbours - `x` (this row, in the reference) and `up` (the row above, or nullptr for the first
+// row of the slice) - so it is serial along the row, like decoding. The quantised error is the
+// symbol; the reconstruction, within +-NEAR of the source, is written into the reference, where it
+// serves as the neighbour for the following samples and as the next frame's reference.
+uint8_t* near_span(const uint8_t* src, uint8_t* x, const uint8_t* up, int i0, int i1, int predictor,
+                   const NearTables& t, uint8_t* out) {
+    const int8_t* q = t.q + 255;         // symbol for e = x - pred in [-255, 255]
+    const int16_t* qs = t.qstep + 255;   // q * step for the same e
+    int i = i0;
+    if (i == 0 && i < i1) {
+        const int pred = up ? up[0] : 128;
+        const int e = src[0] - pred;
+        *out++ = uint8_t(q[e]);
+        x[0] = uint8_t(clamp255(pred + qs[e]));
+        i = 1;
+    }
+    if (i >= i1) return out;
+    if (!up || predictor != kPredMed) {  // first row of a slice, or LEFT: predict from the left
+        int a = x[i - 1];
+        for (; i < i1; ++i) {
+            const int e = src[i] - a;
+            *out++ = uint8_t(q[e]);
+            a = clamp255(a + qs[e]);
+            x[i] = uint8_t(a);
+        }
+    } else {
+        int a = x[i - 1], c = up[i - 1];
+        for (; i < i1; ++i) {
+            const int b = up[i];
+            const int pred = predict_med_clamp(a, b, c);
+            const int e = src[i] - pred;
+            *out++ = uint8_t(q[e]);
+            a = clamp255(pred + qs[e]);
+            x[i] = uint8_t(a);
+            c = b;
+        }
+    }
+    return out;
+}
+
+// Two consecutive full rows A (j) and B (j + 1) coded as a wavefront. B at column i needs only A up
+// to column i, so both rows advance in the same loop with B one step behind: two independent
+// serial chains the CPU overlaps on one core. Output (symbols in raster order: all of A, then all
+// of B; reconstruction) is identical to near_span on A, then on B.
+// MedA: row A uses MED (it has a row above); MedB: row B uses MED (its row above is A).
+template <bool MedA, bool MedB>
+uint8_t* near_rows2(const uint8_t* sa, const uint8_t* sb, uint8_t* xa, uint8_t* xb, const uint8_t* upa, int w,
+                    const NearTables& t, uint8_t* out) {
+    const int8_t* q = t.q + 255;
+    const int16_t* qs = t.qstep + 255;
+    uint8_t* oa = out;
+    uint8_t* ob = out + w;
+    int pa = upa ? upa[0] : 128;  // column 0: above (or 128 on a slice's first row) ...
+    int e = sa[0] - pa;
+    oa[0] = uint8_t(q[e]);
+    int ra = clamp255(pa + qs[e]);
+    xa[0] = uint8_t(ra);
+    e = sb[0] - ra;  // ... and for B the sample above it, A[0]
+    ob[0] = uint8_t(q[e]);
+    int rb = clamp255(ra + qs[e]);
+    xb[0] = uint8_t(rb);
+    int ca = MedA ? upa[0] : 0;
+    for (int i = 1; i < w; ++i) {
+        int predA;
+        if (MedA) {
+            const int b = upa[i];
+            predA = predict_med_clamp(ra, b, ca);
+            ca = b;
+        } else {
+            predA = ra;
+        }
+        e = sa[i] - predA;
+        oa[i] = uint8_t(q[e]);
+        const int prev_a = ra;
+        ra = clamp255(predA + qs[e]);
+        xa[i] = uint8_t(ra);
+
+        int predB;
+        if (MedB) {
+            predB = predict_med_clamp(rb, ra, prev_a);  // left, above = A[i], above-left = A[i-1]
+        } else {
+            predB = rb;
+        }
+        e = sb[i] - predB;
+        ob[i] = uint8_t(q[e]);
+        rb = clamp255(predB + qs[e]);
+        xb[i] = uint8_t(rb);
+    }
+    return out + 2 * size_t(w);
+}
+
+// Near-lossless chunk, I or P: rows whose blocks are all skipped cost nothing (the reference keeps
+// the previous reconstruction there); other rows code their non-skipped blocks with near_span.
+size_t near_chunk_residuals(rcv_encoder* e, int pl, int s, int worker, StageTimer& timer) {
+    const Geometry& g = e->geo;
+    const int r0 = g.slice_row(pl, s), r1 = g.slice_row(pl, s + 1);
+    const int w = g.plane_w[pl], shift = g.block_shift[pl], bw = 1 << shift;
+    const NearTables& t = e->near_tables[e->near];
+    uint8_t* plane = e->ref_plane[pl];
+    const ptrdiff_t stride = e->ref_stride[pl];
+    uint8_t* const out0 = e->resid[worker];
+    uint8_t* out = out0;
+    const bool med = e->cfg.predictor == kPredMed;
+    auto row_skips = [&](int j) { return e->frame_p ? e->row_skipped[j >> shift] : 0u; };
+    for (int j = r0; j < r1; ++j) {
+        const int br = j >> shift;
+        const uint32_t nskip = row_skips(j);
+        if (nskip == uint32_t(g.blocks_x)) continue;
+        uint8_t* x = plane + j * stride;
+        const uint8_t* up = j == r0 ? nullptr : x - stride;
+        if (nskip == 0 && j + 1 < r1 && row_skips(j + 1) == 0) {
+            // Two full rows: wavefront (see near_rows2).
+            const uint8_t* sa = source_row(e, pl, j, e->rowbuf[worker]);
+            const uint8_t* sb = source_row(e, pl, j + 1, e->rowbuf[worker] + e->rowbuf_size);
+            timer.lap(&StageTimes::load_ns);
+            if (!med)
+                out = near_rows2<false, false>(sa, sb, x, x + stride, up, w, t, out);
+            else if (up)
+                out = near_rows2<true, true>(sa, sb, x, x + stride, up, w, t, out);
+            else
+                out = near_rows2<false, true>(sa, sb, x, x + stride, up, w, t, out);
+            timer.lap(&StageTimes::predict_ns);
+            ++j;
+            continue;
+        }
+        const uint8_t* src = source_row(e, pl, j, e->rowbuf[worker]);
+        timer.lap(&StageTimes::load_ns);
+        if (nskip == 0) {
+            out = near_span(src, x, up, 0, w, e->cfg.predictor, t, out);
+        } else {
+            const uint8_t* f = e->skip_flags + size_t(br) * size_t(g.blocks_x);
+            for (int b = 0; b < g.blocks_x; ++b)
+                if (!f[b]) out = near_span(src, x, up, b * bw, (b + 1) * bw < w ? (b + 1) * bw : w, e->cfg.predictor, t, out);
+        }
+        timer.lap(&StageTimes::predict_ns);
+    }
+    return size_t(out - out0);
+}
+
 // Phase B job = one (plane, slice) chunk: copy its rows, predict, entropy-code into its own scratch
 // buffer. Job j is plane j / S, slice j % S, so the big luma chunks are claimed first (§8).
 // Jobs touch disjoint rows of the reference and never read another slice's rows (§4.6).
@@ -300,7 +459,11 @@ void encode_job(void* ctx, int job, int worker) {
     StageTimer timer(e->prof ? &e->worker_prof[worker] : nullptr);
     uint32_t hist[256] = {};
     size_t n;
-    if (e->frame_p) {
+    if (e->near) {
+        n = near_chunk_residuals(e, pl, s, worker, timer);
+        histogram_add(e->resid[worker], n, hist);
+        timer.lap(&StageTimes::predict_ns);
+    } else if (e->frame_p) {
         n = p_chunk_residuals(e, pl, s, worker, timer);
         histogram_add(e->resid[worker], n, hist);
         timer.lap(&StageTimes::predict_ns);
@@ -415,6 +578,7 @@ rcv_status rcv_encoder_create(const rcv_encoder_config* cfg, rcv_encoder** out) 
     e->geo = g;
     e->gbr = e->cfg.format == RCV_FMT_GBR;
     e->colour = pack_colour(e->cfg.colour_matrix, e->cfg.full_range, 0);
+    for (int n = 1; n <= kMaxNear; ++n) init_near_tables(n, &e->near_tables[n]);
     e->max_packet = max_packet_size(g);
 
     size_t total = 0;
@@ -448,7 +612,8 @@ rcv_status rcv_encoder_create(const rcv_encoder_config* cfg, rcv_encoder** out) 
     e->chunk_mem = static_cast<uint8_t*>(aligned_alloc64(chunk_total));
     e->skip_flags = static_cast<uint8_t*>(aligned_alloc64(align64(blocks)));
     e->row_skipped = static_cast<uint32_t*>(aligned_alloc64(align64(sizeof(uint32_t) * size_t(g.blocks_y))));
-    e->rowbuf_mem = static_cast<uint8_t*>(aligned_alloc64(row_each * size_t(threads)));
+    e->rowbuf_size = row_each;
+    e->rowbuf_mem = static_cast<uint8_t*>(aligned_alloc64(2 * row_each * size_t(threads)));
     if (!e->ref_mem || !e->resid_mem || !e->chunk_mem || !e->skip_flags || !e->row_skipped || !e->rowbuf_mem) {
         rcv_encoder_destroy(e);
         return RCV_ERR_OUT_OF_MEMORY;
@@ -461,7 +626,7 @@ rcv_status rcv_encoder_create(const rcv_encoder_config* cfg, rcv_encoder** out) 
     }
     for (int w = 0; w < threads; ++w) {
         e->resid[w] = e->resid_mem + resid_each * size_t(w);
-        e->rowbuf[w] = e->rowbuf_mem + row_each * size_t(w);
+        e->rowbuf[w] = e->rowbuf_mem + 2 * row_each * size_t(w);
     }
     uint8_t* c = e->chunk_mem;
     for (int j = 0; j < jobs; ++j) {
@@ -495,8 +660,8 @@ rcv_status rcv_encode_frame(rcv_encoder* e, const rcv_frame_in* in, const rcv_en
     if (!e || !in || !out) return RCV_ERR_INVALID_ARG;
     if (out_capacity < e->max_packet) return RCV_ERR_BUFFER_TOO_SMALL;
     const uint8_t near_level = params ? params->near_level : 0;
-    if (near_level > 3) return RCV_ERR_INVALID_ARG;
-    if (near_level != 0) return e->gbr ? RCV_ERR_INVALID_ARG : RCV_ERR_UNSUPPORTED;  // GBR: never (§4.1); YUV: M7
+    if (near_level > kMaxNear) return RCV_ERR_INVALID_ARG;
+    if (near_level != 0 && e->gbr) return RCV_ERR_INVALID_ARG;  // never for GBR (§4.1)
 
     const rcv_status st = validate_input(e, in);
     if (st != RCV_OK) return st;
@@ -505,6 +670,7 @@ rcv_status rcv_encode_frame(rcv_encoder* e, const rcv_frame_in* in, const rcv_en
     const int S = g.num_slices;
     const uint32_t blocks = uint32_t(g.blocks_x) * uint32_t(g.blocks_y);
     e->job_in = in;
+    e->near = near_level;  // chosen per frame by the caller's rate controller (§5.5)
 
     // Frame type (§5.2), in order: (1) forced keyframe, keyframe interval reached or no reference
     // -> I without phase A; (2) skip disabled -> I; (3) nothing changed -> DUP; (4) every block
@@ -566,9 +732,9 @@ rcv_status rcv_encode_frame(rcv_encoder* e, const rcv_frame_in* in, const rcv_en
 
     FrameHeader h{};
     h.type = e->frame_p ? kFrameP : kFrameI;
-    h.flags = e->cfg.enable_crc ? kFlagCrc : 0;
+    h.flags = uint16_t((e->cfg.enable_crc ? kFlagCrc : 0) | (e->near ? kFlagNear : 0));
     h.format = uint8_t(e->cfg.format);
-    h.near_level = 0;
+    h.near_level = uint8_t(e->near);
     h.predictor = e->cfg.predictor;
     h.slices = uint8_t(S);
     h.width = uint16_t(g.width);

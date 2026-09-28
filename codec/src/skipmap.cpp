@@ -25,6 +25,42 @@ bool span_equal(const uint8_t* a, const uint8_t* b, int n) {
     return std::memcmp(a, b, size_t(n)) == 0;
 }
 
+// Every |a - b| <= tol for 16 bytes: |a - b| via saturating subtracts both ways.
+bool within16(__m128i va, __m128i vb, __m128i tol) {
+    const __m128i d = _mm_or_si128(_mm_subs_epu8(va, vb), _mm_subs_epu8(vb, va));
+    return _mm_movemask_epi8(_mm_cmpeq_epi8(_mm_subs_epu8(d, tol), _mm_setzero_si128())) == 0xFFFF;
+}
+
+// n bytes within `tol` of each other (near-lossless skip).
+bool span_within(const uint8_t* a, const uint8_t* b, int n, int tol) {
+    const __m128i t = _mm_set1_epi8(char(tol));
+    if (n == 16)
+        return within16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(a)),
+                        _mm_loadu_si128(reinterpret_cast<const __m128i*>(b)), t);
+    if (n == 8)  // upper halves are zero in both, so they compare equal
+        return within16(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(a)),
+                        _mm_loadl_epi64(reinterpret_cast<const __m128i*>(b)), t);
+    for (int x = 0; x < n; ++x) {
+        const int d = int(a[x]) - int(b[x]);
+        if (d > tol || d < -tol) return false;
+    }
+    return true;
+}
+
+// NV12 chroma against planar reference Cb/Cr, within `tol`.
+bool nv12_span_within(const uint8_t* uv, const uint8_t* u, const uint8_t* v, int n, int tol) {
+    if (n == 8) {
+        const __m128i ref = _mm_unpacklo_epi8(_mm_loadl_epi64(reinterpret_cast<const __m128i*>(u)),
+                                              _mm_loadl_epi64(reinterpret_cast<const __m128i*>(v)));
+        return within16(_mm_loadu_si128(reinterpret_cast<const __m128i*>(uv)), ref, _mm_set1_epi8(char(tol)));
+    }
+    for (int x = 0; x < n; ++x) {
+        const int d0 = int(uv[2 * x]) - int(u[x]), d1 = int(uv[2 * x + 1]) - int(v[x]);
+        if (d0 > tol || d0 < -tol || d1 > tol || d1 < -tol) return false;
+    }
+    return true;
+}
+
 // n chroma samples of an interleaved CbCr (NV12) row against planar reference Cb and Cr.
 bool nv12_span_equal(const uint8_t* uv, const uint8_t* u, const uint8_t* v, int n) {
     if (n == 8) {
@@ -82,7 +118,7 @@ bool unpack_skip_map(const Geometry& g, const uint8_t* in, uint8_t* flags) {
 }
 
 int compare_block_row(const Geometry& g, const rcv_frame_in* in, rcv_input_layout layout, uint8_t* const ref_plane[3],
-                      const ptrdiff_t ref_stride[3], int by, uint8_t* unchanged) {
+                      const ptrdiff_t ref_stride[3], int by, uint8_t* unchanged, int tolerance) {
     const int nb = g.blocks_x;
     std::memset(unchanged, 1, size_t(nb));
     int remaining = nb;  // blocks not yet known to differ
@@ -98,7 +134,8 @@ int compare_block_row(const Geometry& g, const rcv_frame_in* in, rcv_input_layou
                 const uint8_t* s = in->plane[p] + ptrdiff_t(y) * in->stride[p];
                 for (int b = 0, x0 = 0; b < nb; ++b, x0 += bw) {
                     if (!unchanged[b]) continue;
-                    if (!span_equal(s + x0, r + x0, (w - x0) < bw ? (w - x0) : bw)) {
+                    const int n = (w - x0) < bw ? (w - x0) : bw;
+                    if (tolerance ? !span_within(s + x0, r + x0, n, tolerance) : !span_equal(s + x0, r + x0, n)) {
                         unchanged[b] = 0;
                         if (--remaining == 0) return 0;
                     }
@@ -108,7 +145,9 @@ int compare_block_row(const Geometry& g, const rcv_frame_in* in, rcv_input_layou
                 const uint8_t* v = ref_plane[2] + y * ref_stride[2];
                 for (int b = 0, x0 = 0; b < nb; ++b, x0 += bw) {
                     if (!unchanged[b]) continue;
-                    if (!nv12_span_equal(uv + 2 * x0, r + x0, v + x0, (w - x0) < bw ? (w - x0) : bw)) {
+                    const int n = (w - x0) < bw ? (w - x0) : bw;
+                    if (tolerance ? !nv12_span_within(uv + 2 * x0, r + x0, v + x0, n, tolerance)
+                                  : !nv12_span_equal(uv + 2 * x0, r + x0, v + x0, n)) {
                         unchanged[b] = 0;
                         if (--remaining == 0) return 0;
                     }

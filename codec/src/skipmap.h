@@ -24,12 +24,13 @@ void pack_skip_map(const Geometry& g, const uint8_t* flags, uint8_t* out);
 // Inverse of pack_skip_map. Returns false if any padding bit or byte is non-zero.
 bool unpack_skip_map(const Geometry& g, const uint8_t* in, uint8_t* flags);
 
-// Lossless skip test for block row `by`: sets unchanged[b] = 1 for every block whose samples equal
-// the reference in all three planes, 0 otherwise, and returns the number of unchanged blocks.
+// Skip test for block row `by`: sets unchanged[b] = 1 for every block whose samples all lie within
+// `tolerance` of the reference in all three planes (0 = lossless: exactly equal; NEAR n for
+// near-lossless, §5.3), 0 otherwise, and returns the number of unchanged blocks.
 // Compares row by row across the whole width (sequential memory access, prefetch-friendly),
 // skips blocks already known to differ, and stops as soon as every block differs - on a changing
 // frame usually after the first row. SSE2 (x64 baseline).
 int compare_block_row(const Geometry& g, const rcv_frame_in* in, rcv_input_layout layout, uint8_t* const ref_plane[3],
-                      const ptrdiff_t ref_stride[3], int by, uint8_t* unchanged);
+                      const ptrdiff_t ref_stride[3], int by, uint8_t* unchanged, int tolerance = 0);
 
 }  // namespace rcv

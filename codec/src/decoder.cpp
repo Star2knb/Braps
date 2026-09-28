@@ -15,6 +15,7 @@
 #include "crc32c.h"
 #include "format.h"
 #include "huffman.h"
+#include "nearlossless.h"
 #include "predict.h"
 #include "rcv/rcv.h"
 #include "skipmap.h"
@@ -52,6 +53,8 @@ struct rcv_decoder {
     Geometry frame_geo;        // geometry of the frame being decoded (slice count from its header)
     int frame_predictor;
     bool frame_p;              // the frame being decoded is a P-frame
+    int frame_near;            // its NEAR (0 = lossless), §5.5
+    NearTables near_tables[kMaxNear + 1];  // [1..3]
 
     // P-frame skip map (§6.3), unpacked. Allocated in rcv_decoder_create.
     uint8_t* skip_flags;       // blocks_x * blocks_y, 1 = skipped
@@ -120,32 +123,42 @@ struct HuffSource {
     size_t bytes_used() const { return (size_t(p - start) * 8 - size_t(count) + 7) / 8; }
 };
 
+// Sample reconstruction from a prediction and a symbol: lossless adds modulo 256; near-lossless
+// (§5.5) dequantises and clamps. Small value types, passed by value so they live in registers.
+struct LosslessRecon {
+    int operator()(int pred, uint8_t s) const { return (pred + s) & 0xFF; }
+};
+struct NearRecon {
+    const int16_t* dq;  // NearTables::dq of the frame's NEAR: (int8_t)s * (2n + 1), for every byte
+    int operator()(int pred, uint8_t s) const { return clamp255(pred + dq[s]); }
+};
+
 // Row reconstruction (inverse of §5.4 / Appendix A.2). The first row of a slice starts from 128
 // and uses the left neighbour; other rows start from the sample above.
-template <class Source>
-inline void row_first(uint8_t* x, int width, Source& next) {
-    uint8_t a = 128;
+template <class Recon, class Source>
+inline void row_first(uint8_t* x, int width, Recon recon, Source& next) {
+    int a = 128;
     for (int i = 0; i < width; ++i) {
-        a = uint8_t(a + next());
-        x[i] = a;
+        a = recon(a, next());
+        x[i] = uint8_t(a);
     }
 }
 
-template <class Source>
-inline void row_rest(uint8_t* x, const uint8_t* up, int width, int predictor, Source& next) {
-    int a = uint8_t(up[0] + next());
+template <class Recon, class Source>
+inline void row_rest(uint8_t* x, const uint8_t* up, int width, int predictor, Recon recon, Source& next) {
+    int a = recon(up[0], next());
     x[0] = uint8_t(a);
     if (predictor == kPredMed) {
         int c = up[0];
         for (int i = 1; i < width; ++i) {
             const int b = up[i];
-            a = (predict_med_clamp(a, b, c) + next()) & 0xFF;
+            a = recon(predict_med_clamp(a, b, c), next());
             x[i] = uint8_t(a);
             c = b;
         }
     } else {
         for (int i = 1; i < width; ++i) {
-            a = (a + next()) & 0xFF;
+            a = recon(a, next());
             x[i] = uint8_t(a);
         }
     }
@@ -154,34 +167,36 @@ inline void row_rest(uint8_t* x, const uint8_t* up, int width, int predictor, So
 // Rebuilds rows [r0, r1) of a plane (one slice) from a symbol source.
 // The source is copied to a local first: pixel stores go through uint8_t*, which may alias
 // anything, so a source reached by reference would be reloaded from memory on every symbol.
-template <class Source>
-void reconstruct(uint8_t* plane, ptrdiff_t stride, int width, int r0, int r1, int predictor, Source& src) {
+template <class Recon, class Source>
+void reconstruct(uint8_t* plane, ptrdiff_t stride, int width, int r0, int r1, int predictor, Recon recon,
+                 Source& src) {
     Source next = src;
-    row_first(plane + r0 * stride, width, next);
-    for (int j = r0 + 1; j < r1; ++j) row_rest(plane + j * stride, plane + (j - 1) * stride, width, predictor, next);
+    row_first(plane + r0 * stride, width, recon, next);
+    for (int j = r0 + 1; j < r1; ++j)
+        row_rest(plane + j * stride, plane + (j - 1) * stride, width, predictor, recon, next);
     src = next;
 }
 
 // P-frame row with some skipped blocks (§5.4): only samples of non-skipped blocks are coded, in
 // raster order. Skipped samples already hold the reference values and act as neighbours, exactly
 // as they did in the encoder. `up` is nullptr for the first row of a slice.
-template <class Source>
+template <class Recon, class Source>
 inline void row_masked(uint8_t* x, const uint8_t* up, int width, int bw, const uint8_t* flags, int predictor,
-                       Source& next) {
+                       Recon recon, Source& next) {
     for (int x0 = 0, b = 0; x0 < width; x0 += bw, ++b) {
         if (flags[b]) continue;
         const int x1 = x0 + bw < width ? x0 + bw : width;
         int i = x0;
         if (!up) {
-            uint8_t a = i == 0 ? uint8_t(128) : x[i - 1];
+            int a = i == 0 ? 128 : x[i - 1];
             for (; i < x1; ++i) {
-                a = uint8_t(a + next());
-                x[i] = a;
+                a = recon(a, next());
+                x[i] = uint8_t(a);
             }
             continue;
         }
         if (i == 0) {
-            x[0] = uint8_t(up[0] + next());
+            x[0] = uint8_t(recon(up[0], next()));
             i = 1;
         }
         int a = x[i - 1];
@@ -189,13 +204,13 @@ inline void row_masked(uint8_t* x, const uint8_t* up, int width, int bw, const u
             int c = up[i - 1];
             for (; i < x1; ++i) {
                 const int b_ = up[i];
-                a = (predict_med_clamp(a, b_, c) + next()) & 0xFF;
+                a = recon(predict_med_clamp(a, b_, c), next());
                 x[i] = uint8_t(a);
                 c = b_;
             }
         } else {
             for (; i < x1; ++i) {
-                a = (a + next()) & 0xFF;
+                a = recon(a, next());
                 x[i] = uint8_t(a);
             }
         }
@@ -204,9 +219,9 @@ inline void row_masked(uint8_t* x, const uint8_t* up, int width, int bw, const u
 
 // Rebuilds rows [r0, r1) of one slice of a P-frame: fully skipped rows are left alone, unskipped
 // rows take the fast paths, the rest go segment by segment.
-template <class Source>
+template <class Recon, class Source>
 void reconstruct_masked(uint8_t* plane, ptrdiff_t stride, int width, int r0, int r1, int predictor, int shift,
-                        const uint8_t* flags, const uint32_t* row_skipped, int blocks_x, Source& src) {
+                        const uint8_t* flags, const uint32_t* row_skipped, int blocks_x, Recon recon, Source& src) {
     Source next = src;  // local copy, see reconstruct()
     for (int j = r0; j < r1; ++j) {
         const int br = j >> shift;
@@ -216,11 +231,11 @@ void reconstruct_masked(uint8_t* plane, ptrdiff_t stride, int width, int r0, int
         const uint8_t* up = j == r0 ? nullptr : x - stride;
         if (nskip == 0) {
             if (up)
-                row_rest(x, up, width, predictor, next);
+                row_rest(x, up, width, predictor, recon, next);
             else
-                row_first(x, width, next);
+                row_first(x, width, recon, next);
         } else {
-            row_masked(x, up, width, 1 << shift, flags + size_t(br) * size_t(blocks_x), predictor, next);
+            row_masked(x, up, width, 1 << shift, flags + size_t(br) * size_t(blocks_x), predictor, recon, next);
         }
     }
     src = next;
@@ -229,19 +244,20 @@ void reconstruct_masked(uint8_t* plane, ptrdiff_t stride, int width, int r0, int
 // Two slices of one plane rebuilt in lockstep. Each slice is a serial chain (Huffman bit
 // position, then left neighbour), but the two chains are independent, so interleaving them
 // lets the CPU overlap them on one core. Rows beyond the shorter slice are finished alone.
+template <class Recon>
 void reconstruct_pair(uint8_t* plane, ptrdiff_t stride, int width, int r0a, int r1a, int r0b, int r1b,
-                      int predictor, HuffSource& src_a, HuffSource& src_b) {
+                      int predictor, Recon recon, HuffSource& src_a, HuffSource& src_b) {
     HuffSource sa = src_a, sb = src_b;  // locals, kept in registers (see reconstruct)
     const int rows = (r1a - r0a) < (r1b - r0b) ? (r1a - r0a) : (r1b - r0b);
     {
         uint8_t* xa = plane + r0a * stride;
         uint8_t* xb = plane + r0b * stride;
-        uint8_t a = 128, b = 128;
+        int a = 128, b = 128;
         for (int i = 0; i < width; ++i) {
-            a = uint8_t(a + sa());
-            xa[i] = a;
-            b = uint8_t(b + sb());
-            xb[i] = b;
+            a = recon(a, sa());
+            xa[i] = uint8_t(a);
+            b = recon(b, sb());
+            xb[i] = uint8_t(b);
         }
     }
     for (int k = 1; k < rows; ++k) {
@@ -249,16 +265,16 @@ void reconstruct_pair(uint8_t* plane, ptrdiff_t stride, int width, int r0a, int 
         uint8_t* xb = plane + (r0b + k) * stride;
         const uint8_t* ua = xa - stride;
         const uint8_t* ub = xb - stride;
-        int a = uint8_t(ua[0] + sa());
-        int b = uint8_t(ub[0] + sb());
+        int a = recon(ua[0], sa());
+        int b = recon(ub[0], sb());
         xa[0] = uint8_t(a);
         xb[0] = uint8_t(b);
         if (predictor == kPredMed) {
             int ca = ua[0], cb = ub[0];
             for (int i = 1; i < width; ++i) {
                 const int ba = ua[i], bb = ub[i];
-                a = (predict_med_clamp(a, ba, ca) + sa()) & 0xFF;
-                b = (predict_med_clamp(b, bb, cb) + sb()) & 0xFF;
+                a = recon(predict_med_clamp(a, ba, ca), sa());
+                b = recon(predict_med_clamp(b, bb, cb), sb());
                 xa[i] = uint8_t(a);
                 xb[i] = uint8_t(b);
                 ca = ba;
@@ -266,17 +282,17 @@ void reconstruct_pair(uint8_t* plane, ptrdiff_t stride, int width, int r0a, int 
             }
         } else {
             for (int i = 1; i < width; ++i) {
-                a = (a + sa()) & 0xFF;
-                b = (b + sb()) & 0xFF;
+                a = recon(a, sa());
+                b = recon(b, sb());
                 xa[i] = uint8_t(a);
                 xb[i] = uint8_t(b);
             }
         }
     }
     for (int j = r0a + rows; j < r1a; ++j)
-        row_rest(plane + j * stride, plane + (j - 1) * stride, width, predictor, sa);
+        row_rest(plane + j * stride, plane + (j - 1) * stride, width, predictor, recon, sa);
     for (int j = r0b + rows; j < r1b; ++j)
-        row_rest(plane + j * stride, plane + (j - 1) * stride, width, predictor, sb);
+        row_rest(plane + j * stride, plane + (j - 1) * stride, width, predictor, recon, sb);
     src_a = sa;
     src_b = sb;
 }
@@ -313,8 +329,14 @@ rcv_status decode_huffman_pair(rcv_decoder* d, HuffDecTable* luts, const uint8_t
     if (st != RCV_OK) return st;
     st = open_huffman(cb, size_b, g.chunk_samples(plane, s + 1), &luts[1], &b);
     if (st != RCV_OK) return st;
-    reconstruct_pair(d->ref_plane[plane], d->ref_stride[plane], g.plane_w[plane], g.slice_row(plane, s),
-                     g.slice_row(plane, s + 1), g.slice_row(plane, s + 1), g.slice_row(plane, s + 2), predictor, a, b);
+    uint8_t* dst = d->ref_plane[plane];
+    const ptrdiff_t stride = d->ref_stride[plane];
+    const int w = g.plane_w[plane];
+    const int ra = g.slice_row(plane, s), rb = g.slice_row(plane, s + 1), re = g.slice_row(plane, s + 2);
+    if (d->frame_near)
+        reconstruct_pair(dst, stride, w, ra, rb, rb, re, predictor, NearRecon{d->near_tables[d->frame_near].dq}, a, b);
+    else
+        reconstruct_pair(dst, stride, w, ra, rb, rb, re, predictor, LosslessRecon{}, a, b);
     st = close_huffman(a, size_a);
     if (st != RCV_OK) return st;
     return close_huffman(b, size_b);
@@ -322,16 +344,25 @@ rcv_status decode_huffman_pair(rcv_decoder* d, HuffDecTable* luts, const uint8_t
 
 // Rebuilds one chunk's rows from a source: all samples for an I-frame, only those of non-skipped
 // blocks for a P-frame.
-template <class Source>
-void rebuild_chunk(rcv_decoder* d, int plane, const Geometry& g, int slice, int predictor, Source& src) {
+template <class Recon, class Source>
+void rebuild_chunk_with(rcv_decoder* d, int plane, const Geometry& g, int slice, int predictor, Recon recon,
+                        Source& src) {
     uint8_t* dst = d->ref_plane[plane];
     const ptrdiff_t stride = d->ref_stride[plane];
     const int w = g.plane_w[plane], r0 = g.slice_row(plane, slice), r1 = g.slice_row(plane, slice + 1);
     if (d->frame_p)
         reconstruct_masked(dst, stride, w, r0, r1, predictor, g.block_shift[plane], d->skip_flags, d->row_skipped,
-                           g.blocks_x, src);
+                           g.blocks_x, recon, src);
     else
-        reconstruct(dst, stride, w, r0, r1, predictor, src);
+        reconstruct(dst, stride, w, r0, r1, predictor, recon, src);
+}
+
+template <class Source>
+void rebuild_chunk(rcv_decoder* d, int plane, const Geometry& g, int slice, int predictor, Source& src) {
+    if (d->frame_near)
+        rebuild_chunk_with(d, plane, g, slice, predictor, NearRecon{d->near_tables[d->frame_near].dq}, src);
+    else
+        rebuild_chunk_with(d, plane, g, slice, predictor, LosslessRecon{}, src);
 }
 
 // Decodes one chunk straight into the reference plane. The sample count is derived from geometry
@@ -410,7 +441,6 @@ rcv_status decode_coded_frame(rcv_decoder* d, const uint8_t* pkt, size_t size, b
     } else if (crc != 0) {
         return RCV_ERR_BITSTREAM;
     }
-    if (near_level != 0) return RCV_ERR_UNSUPPORTED;  // M7
 
     // P-frames start with the skip map (§6.3); the reference is not touched if it is invalid.
     const size_t map_size = p_frame ? skip_map_size(g) : 0;
@@ -465,6 +495,7 @@ rcv_status decode_coded_frame(rcv_decoder* d, const uint8_t* pkt, size_t size, b
     d->frame_geo = g;
     d->frame_predictor = predictor;
     d->frame_p = p_frame;
+    d->frame_near = near_level;
     d->pool.run(decode_job, d, njobs);
     for (int j = 0; j < njobs; ++j)  // first failure in job order, independent of scheduling
         if (d->job_status[j] != RCV_OK) return d->job_status[j];
@@ -577,6 +608,7 @@ rcv_status rcv_decoder_create(const uint8_t seq_header[32], uint8_t num_threads,
     rcv_decoder* d = new (std::nothrow) rcv_decoder{};
     if (!d) return RCV_ERR_OUT_OF_MEMORY;
     d->seq = h;
+    for (int n = 1; n <= kMaxNear; ++n) init_near_tables(n, &d->near_tables[n]);
     init_geometry(&d->geo, h.format, h.coded_w, h.coded_h, 1);
     size_t total = 0;
     for (int p = 0; p < 3; ++p) {

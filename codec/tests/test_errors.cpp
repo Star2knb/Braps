@@ -62,9 +62,7 @@ TEST_CASE("errors: encoder call validation") {
     CHECK(rcv_encode_duplicate(enc, out.data(), out.size(), nullptr) == RCV_ERR_NO_REFERENCE);
     CHECK(rcv_encode_frame(enc, &in, nullptr, out.data(), out.size() - 1, nullptr) == RCV_ERR_BUFFER_TOO_SMALL);
     rcv_encode_params params{};
-    params.near_level = 2;
-    CHECK(rcv_encode_frame(enc, &in, &params, out.data(), out.size(), nullptr) == RCV_ERR_UNSUPPORTED);
-    params.near_level = 4;
+    params.near_level = 4;  // NEAR is 0..3
     CHECK(rcv_encode_frame(enc, &in, &params, out.data(), out.size(), nullptr) == RCV_ERR_INVALID_ARG);
     rcv_frame_in bad = in;
     bad.stride[1] = 3;

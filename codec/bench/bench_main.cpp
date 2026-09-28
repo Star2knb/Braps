@@ -40,6 +40,7 @@ void usage() {
                  "                 [--predictor med|left|both] [--slices 8[,1,...]] (0 = auto)\n"
                  "                 [--isa auto|scalar|sse41|avx2|all[,...]] [--threads 1[,2,...]]\n"
                  "                 [--skip on|off|both]   (temporal skip / P-frames; default on)\n"
+                 "                 [--near 0[,1,2,3]]     (near-lossless NEAR per configuration; YUV only)\n"
                  "                 [--cpu N | --cpu -1] [--no-verify] [--no-decode] [--csv frames.csv]\n"
                  "                 [--compare NAME=sizes.txt]...\n"
                  "sizes.txt: one packet size per line, in frame order ('# enc_ms=X' line optional).\n");
@@ -55,6 +56,7 @@ struct Options {
     std::vector<rcv_isa> isas{RCV_ISA_AUTO};
     std::vector<int> threads{1};
     std::vector<int> skip{1};  // temporal skip on / off
+    std::vector<int> nears{0}; // NEAR per configuration (0 = lossless)
     bool rgb = false;          // --format gbr: input is packed BGRA, coded as GBR
     int cpu = -2;  // -2: last logical CPU, -1: no pinning
     bool verify = true;
@@ -106,6 +108,7 @@ bool parse_options(int argc, char** argv, Options* o) {
             else if (v == "gbr" || v == "rgb") o->rgb = true;
             else return false;
         }
+        else if (k == "--near") o->nears = parse_int_list(v);
         else if (k == "--skip") {
             if (v == "on") o->skip = {1};
             else if (v == "off") o->skip = {0};
@@ -227,6 +230,7 @@ struct Series {
     double external_enc_ms = -1;  // from '# enc_ms=' in a --compare file
     rcv::StageTimes stages;
     long verify_failures = 0;
+    int max_error = 0;  // largest |decoded - source| seen (near-lossless)
 };
 
 struct Metrics {
@@ -339,8 +343,8 @@ void pin_worker(void* user, int worker) {
 class RcvRun {
 public:
     RcvRun(int w, int h, bool rgb, double fps, int predictor, int slices, rcv_isa isa, int threads, bool skip,
-           const PinPlan* pins)
-        : w_(w), h_(h), threads_(threads), skip_(skip), rgb_(rgb) {
+           int near_level, const PinPlan* pins)
+        : w_(w), h_(h), threads_(threads), skip_(skip), rgb_(rgb), near_(near_level) {
         rcv_encoder_config_init(&cfg_);
         cfg_.coded_width = uint16_t(w);
         cfg_.coded_height = uint16_t(h);
@@ -355,6 +359,7 @@ public:
         cfg_.isa = isa;
         cfg_.num_threads = uint8_t(threads);
         cfg_.enable_skip = skip ? 1 : 0;
+        params_.near_level = uint8_t(near_level);
         if (pins && pins->count) {
             cfg_.on_worker_start = pin_worker;
             cfg_.user = const_cast<PinPlan*>(pins);
@@ -363,7 +368,8 @@ public:
         const rcv_isa shown = isa == RCV_ISA_AUTO ? rcv_cpu_isa() : isa;
         series.name = std::string("RCV1 ") + (predictor ? "MED" : "LEFT") +
                       (slices ? " S=" + std::to_string(slices) : std::string(" S=auto")) + " " + kIsa[shown] +
-                      " T=" + std::to_string(threads) + (skip ? "" : " noskip");
+                      " T=" + std::to_string(threads) + (skip ? "" : " noskip") +
+                      (near_level ? " NEAR=" + std::to_string(near_level) : std::string());
     }
     int threads() const { return threads_; }
     bool skip() const { return skip_; }
@@ -409,7 +415,7 @@ public:
         rcv_frame_info info{};
         const Clock::time_point t0 = Clock::now();
         rcv_status st = dup ? rcv_encode_duplicate(enc_, pkt_.data(), pkt_.size(), &info)
-                            : rcv_encode_frame(enc_, &in, nullptr, pkt_.data(), pkt_.size(), &info);
+                            : rcv_encode_frame(enc_, &in, &params_, pkt_.data(), pkt_.size(), &info);
         const double enc_ms = ms_since(t0);
         if (st != RCV_OK) {
             std::fprintf(stderr, "\n%s: frame %ld: encode failed: %s\n", series.name.c_str(), index,
@@ -446,7 +452,13 @@ public:
     }
 
     // Decoded frame equals the source; for BGRA only colour counts (alpha isn't stored).
-    bool same_output(const uint8_t* src) const {
+    bool same_output(const uint8_t* src) {
+        if (near_) {  // near-lossless: every sample within +-NEAR
+            int m = 0;
+            for (size_t k = 0; k < out_.size(); ++k) m = std::max(m, std::abs(int(out_[k]) - int(src[k])));
+            series.max_error = std::max(series.max_error, m);
+            return m <= near_;
+        }
         if (!rgb_) return std::memcmp(out_.data(), src, out_.size()) == 0;
         for (size_t k = 0; k < out_.size(); k += 4) {
             uint32_t a, b;
@@ -462,6 +474,8 @@ public:
 private:
     int w_, h_, threads_;
     bool skip_, rgb_;
+    int near_;
+    rcv_encode_params params_{};
     rcv_encoder_config cfg_{};
     rcv_encoder* enc_ = nullptr;
     rcv_decoder* dec_ = nullptr;
@@ -533,17 +547,18 @@ int main(int argc, char** argv) {
         for (int s : opt.slices)
             for (rcv_isa isa : opt.isas)
                 for (int t : opt.threads)
-                    for (int sk : opt.skip) {
-                        auto r = std::make_unique<RcvRun>(opt.w, opt.h, opt.rgb, opt.fps, p, s, isa, t, sk != 0,
-                                                          &pins);
-                        const rcv_status st = r->init();
-                        if (st != RCV_OK) {
-                            std::fprintf(stderr, "%s: init failed: %s\n", r->series.name.c_str(),
-                                         rcv_status_string(st));
-                            return 1;
+                    for (int sk : opt.skip)
+                        for (int nl : opt.nears) {
+                            auto r = std::make_unique<RcvRun>(opt.w, opt.h, opt.rgb, opt.fps, p, s, isa, t, sk != 0,
+                                                              nl, &pins);
+                            const rcv_status st = r->init();
+                            if (st != RCV_OK) {
+                                std::fprintf(stderr, "%s: init failed: %s\n", r->series.name.c_str(),
+                                             rcv_status_string(st));
+                                return 1;
+                            }
+                            runs.push_back(std::move(r));
                         }
-                        runs.push_back(std::move(r));
-                    }
     std::vector<Series> externals(opt.compare.size());
     for (size_t i = 0; i < opt.compare.size(); ++i)
         if (!load_sizes(opt.compare[i].first, opt.compare[i].second, &externals[i])) return 1;
@@ -635,9 +650,12 @@ int main(int argc, char** argv) {
     std::printf("\nRound trip:");
     for (const auto& r : runs) {
         failures += r->series.verify_failures;
+        char within[64];
+        std::snprintf(within, sizeof(within), "within bound (max error %d)", r->series.max_error);
         std::printf(" %s %s;", r->series.name.c_str(),
-                    !opt.verify ? "not verified"
+                    !opt.verify                 ? "not verified"
                     : r->series.verify_failures ? "FAILED"
+                    : r->series.max_error       ? within
                                                 : "bit-exact");
     }
     std::printf("\n");
