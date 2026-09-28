@@ -3,11 +3,22 @@
 set(RCV_SOURCES
     src/format.cpp
     src/huffman.cpp
+    src/huffman_avx2.cpp
+    src/cpu.cpp
     src/predict_scalar.cpp
+    src/predict_sse41.cpp
+    src/predict_avx2.cpp
     src/crc32c.cpp
     src/encoder.cpp
     src/decoder.cpp
 )
+
+# Per-file ISA flags (§3.2/§3.3): everything else stays at the x64 baseline. MSVC accepts
+# SSE4.1 intrinsics without a flag; clang-cl needs -msse4.1. Both take /arch:AVX2.
+set_source_files_properties(src/predict_avx2.cpp src/huffman_avx2.cpp PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+    set_source_files_properties(src/predict_sse41.cpp PROPERTIES COMPILE_OPTIONS "-msse4.1")
+endif()
 
 add_library(rcv STATIC ${RCV_SOURCES})
 target_include_directories(rcv PUBLIC include PRIVATE src)
@@ -32,6 +43,7 @@ add_executable(rcv_tests
     tests/test_roundtrip.cpp
     tests/test_errors.cpp
     tests/test_windows_h.cpp
+    tests/test_simd.cpp
 )
 # Tests exercise internal kernels too, so they see the private headers.
 target_include_directories(rcv_tests PRIVATE src)

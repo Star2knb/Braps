@@ -2,6 +2,7 @@
 #pragma once
 
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -73,9 +74,24 @@ inline rcv_frame_in frame_in(const Yuv& f) {
     return in;
 }
 
+// RCV_FORCE_ISA=scalar|sse41|avx2 re-runs the whole suite on one kernel level (plan §3.3).
+inline rcv_isa forced_isa() {
+    char* v = nullptr;
+    size_t len = 0;
+    rcv_isa isa = RCV_ISA_AUTO;
+    if (_dupenv_s(&v, &len, "RCV_FORCE_ISA") == 0 && v) {
+        if (!std::strcmp(v, "scalar")) isa = RCV_ISA_SCALAR;
+        else if (!std::strcmp(v, "sse41")) isa = RCV_ISA_SSE41;
+        else if (!std::strcmp(v, "avx2")) isa = RCV_ISA_AVX2;
+        std::free(v);
+    }
+    return isa;
+}
+
 inline rcv_encoder_config config_for(int w, int h, int predictor = 1, int slices = 0) {
     rcv_encoder_config c;
     rcv_encoder_config_init(&c);
+    c.isa = forced_isa();
     c.coded_width = uint16_t(w);
     c.coded_height = uint16_t(h);
     c.predictor = uint8_t(predictor);

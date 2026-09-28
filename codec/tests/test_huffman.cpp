@@ -51,14 +51,14 @@ void check_table(const uint32_t hist[256], tf::Rng& rng) {
     BitWriter bw(buf.data());
     for (uint8_t m : msg) bw.put(code[m], len[m]);
     const size_t bytes = bw.finish();
-    static HuffDecEntry lut[kLutSize];
-    REQUIRE(huff_build_decode_lut(len, lut));
+    static HuffDecTable lut;
+    REQUIRE(huff_build_decode_lut(len, &lut));
     BitReader br(buf.data(), buf.data() + bytes);
     for (uint8_t m : msg) {
         if (br.count() < 12) br.refill();
-        const HuffDecEntry e = lut[br.peek12()];
-        CHECK(e.sym == m);
-        CHECK(br.consume(e.len));
+        const uint32_t idx = br.peek12();
+        CHECK(lut.sym[idx] == m);
+        CHECK(br.consume(lut.len[idx]));
     }
 }
 
@@ -126,17 +126,17 @@ TEST_CASE("huffman: deterministic output") {
 }
 
 TEST_CASE("huffman: invalid tables are rejected") {
-    static HuffDecEntry lut[kLutSize];
+    static HuffDecTable lut;
     uint8_t len[256] = {};
-    CHECK(!huff_build_decode_lut(len, lut));          // empty
+    CHECK(!huff_build_decode_lut(len, &lut));          // empty
     len[0] = 1;
-    CHECK(!huff_build_decode_lut(len, lut));          // one symbol: incomplete
+    CHECK(!huff_build_decode_lut(len, &lut));          // one symbol: incomplete
     len[1] = 1;
-    CHECK(huff_build_decode_lut(len, lut));           // complete
+    CHECK(huff_build_decode_lut(len, &lut));           // complete
     len[2] = 1;
-    CHECK(!huff_build_decode_lut(len, lut));          // over-full
+    CHECK(!huff_build_decode_lut(len, &lut));          // over-full
     uint8_t long_len[256] = {};
     long_len[0] = 1;
     long_len[1] = 13;
-    CHECK(!huff_build_decode_lut(long_len, lut));     // > 12
+    CHECK(!huff_build_decode_lut(long_len, &lut));     // > 12
 }

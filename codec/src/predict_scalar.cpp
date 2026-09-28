@@ -1,6 +1,28 @@
 #include "predict.h"
 
+#include <cstring>
+
 namespace rcv {
+
+void histogram_add(const uint8_t* s, size_t n, uint32_t hist[256]) {
+    // Four sub-histograms so runs of the same symbol don't serialise on one counter.
+    uint32_t h[4][256] = {};
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) {
+        uint64_t v;
+        std::memcpy(&v, s + i, 8);
+        h[0][v & 0xFF]++;
+        h[1][(v >> 8) & 0xFF]++;
+        h[2][(v >> 16) & 0xFF]++;
+        h[3][(v >> 24) & 0xFF]++;
+        h[0][(v >> 32) & 0xFF]++;
+        h[1][(v >> 40) & 0xFF]++;
+        h[2][(v >> 48) & 0xFF]++;
+        h[3][v >> 56]++;
+    }
+    for (; i < n; ++i) h[0][s[i]]++;
+    for (int k = 0; k < 256; ++k) hist[k] += h[0][k] + h[1][k] + h[2][k] + h[3][k];
+}
 
 size_t residuals_lossless_scalar(const uint8_t* plane, ptrdiff_t stride, int width,
                                  int row_begin, int row_end, int predictor,

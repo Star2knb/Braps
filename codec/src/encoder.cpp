@@ -1,11 +1,12 @@
 // RCV1 encoder (codec plan §5, §6, §7).
-// M1 scope: scalar, single-threaded, lossless YUV420 I-frames, plus DUP packets.
+// Scope so far: single-threaded, lossless YUV420 I-frames plus DUP packets; residual kernels
+// dispatched by CPU (scalar / SSE4.1 / AVX2, all byte-identical).
 #include <chrono>
 #include <cstring>
 #include <new>
 
 #include "aligned_buffer.h"
-#include "bitio.h"
+#include "cpu.h"
 #include "crc32c.h"
 #include "format.h"
 #include "huffman.h"
@@ -27,6 +28,9 @@ struct rcv_encoder {
     uint32_t frame_number;
     uint32_t frames_since_i;
     bool has_ref;
+    rcv_isa isa;              // resolved kernel level
+    ResidualFn residuals;
+    HuffWriteFn huff_write;
     StageTimes* prof;         // optional, rcv_bench only
 };
 
@@ -96,9 +100,19 @@ rcv_status load_input(rcv_encoder* e, const rcv_frame_in* in) {
     return RCV_OK;
 }
 
+ResidualFn residual_kernel(rcv_isa isa) {
+    switch (isa) {
+    case RCV_ISA_AVX2: return residuals_lossless_avx2;
+    case RCV_ISA_SSE41: return residuals_lossless_sse41;
+    default: return residuals_lossless_scalar;
+    }
+}
+
 // Writes one chunk (§6.4) and returns its size (a multiple of 4).
-// `out` must have room for the RAW bound: 4 + align4(count).
-size_t encode_chunk(uint8_t* out, const uint8_t* syms, size_t count, const uint32_t hist[256],
+// The whole RAW bound [out, out + 4 + align4(count)) belongs to this chunk: chunks are written in
+// order and each is at most its RAW bound, so this range always lies inside the packet buffer.
+// Bytes past the returned size may be scribbled on; the next chunk overwrites them.
+size_t encode_chunk(uint8_t* out, const uint8_t* syms, size_t count, const uint32_t hist[256], HuffWriteFn write,
                     StageTimer& timer) {
     std::memset(out, 0, kChunkHeaderSize);
     if (count == 0) {
@@ -139,11 +153,11 @@ size_t encode_chunk(uint8_t* out, const uint8_t* syms, size_t count, const uint3
     huff_pack_lengths(len, out + kChunkHeaderSize);
     uint16_t code[256];
     huff_canonical_codes(len, code);  // always valid for lengths from huff_build_lengths
+    HuffEncTable table;
+    huff_make_enc_table(len, code, &table);
     timer.lap(&StageTimes::table_ns);
     uint8_t* bitstream = out + kChunkHeaderSize + kHuffTableSize;
-    BitWriter bw(bitstream);
-    for (size_t k = 0; k < count; ++k) bw.put(code[syms[k]], len[syms[k]]);
-    const size_t n = bw.finish();
+    const size_t n = write(syms, count, table, bitstream, out + raw_size);
     std::memset(bitstream + n, 0, align4(n) - n);
     timer.lap(&StageTimes::entropy_ns);
     return huff_size;
@@ -208,11 +222,17 @@ rcv_status rcv_encoder_create(const rcv_encoder_config* cfg, rcv_encoder** out) 
     if (!out) return RCV_ERR_INVALID_ARG;
     *out = nullptr;
     Geometry g;
-    const rcv_status st = validate_config(cfg, &g);
+    rcv_status st = validate_config(cfg, &g);
+    if (st != RCV_OK) return st;
+    rcv_isa isa;
+    st = resolve_isa(cfg->isa, &isa);  // once, here (§3.3)
     if (st != RCV_OK) return st;
 
     rcv_encoder* e = new (std::nothrow) rcv_encoder{};
     if (!e) return RCV_ERR_OUT_OF_MEMORY;
+    e->isa = isa;
+    e->residuals = residual_kernel(isa);
+    e->huff_write = isa == RCV_ISA_AVX2 ? huff_write_avx2 : huff_write_scalar;
     e->cfg = resolve_defaults(*cfg);
     e->geo = g;
     e->colour = pack_colour(e->cfg.colour_matrix, e->cfg.full_range, 0);
@@ -269,11 +289,10 @@ rcv_status rcv_encode_frame(rcv_encoder* e, const rcv_frame_in* in, const rcv_en
     for (int pl = 0; pl < 3; ++pl) {
         for (int s = 0; s < S; ++s) {
             uint32_t hist[256] = {};
-            const size_t n = residuals_lossless_scalar(e->ref_plane[pl], e->ref_stride[pl], g.plane_w[pl],
-                                                       g.slice_row(pl, s), g.slice_row(pl, s + 1),
-                                                       e->cfg.predictor, e->resid, hist);
+            const size_t n = e->residuals(e->ref_plane[pl], e->ref_stride[pl], g.plane_w[pl], g.slice_row(pl, s),
+                                          g.slice_row(pl, s + 1), e->cfg.predictor, e->resid, hist);
             timer.lap(&StageTimes::predict_ns);
-            const size_t cs = encode_chunk(p, e->resid, n, hist, timer);
+            const size_t cs = encode_chunk(p, e->resid, n, hist, e->huff_write, timer);
             put_u32(dir + 4 * (size_t(pl) * size_t(S) + size_t(s)), uint32_t(cs));
             p += cs;
         }

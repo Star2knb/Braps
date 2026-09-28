@@ -35,6 +35,7 @@ void usage() {
     std::fprintf(stderr,
                  "usage: rcv_bench -i corpus.yuv -s WxH [-r FPS] [--frames N]\n"
                  "                 [--predictor med|left|both] [--slices 8[,1,...]] (0 = auto)\n"
+                 "                 [--isa auto|scalar|sse41|avx2|all[,...]]\n"
                  "                 [--cpu N | --cpu -1] [--no-verify] [--csv frames.csv]\n"
                  "                 [--compare NAME=sizes.txt]...\n"
                  "sizes.txt: one packet size per line, in frame order ('# enc_ms=X' line optional).\n");
@@ -47,6 +48,7 @@ struct Options {
     long max_frames = 0;
     std::vector<int> predictors{1};
     std::vector<int> slices{8};
+    std::vector<rcv_isa> isas{RCV_ISA_AUTO};
     int cpu = -2;  // -2: last logical CPU, -1: no pinning
     bool verify = true;
     std::vector<std::pair<std::string, std::string>> compare;
@@ -85,6 +87,23 @@ bool parse_options(int argc, char** argv, Options* o) {
             else if (v == "both") o->predictors = {1, 0};
             else return false;
         } else if (k == "--slices") o->slices = parse_int_list(v);
+        else if (k == "--isa") {
+            o->isas.clear();
+            size_t pos = 0;
+            while (pos <= v.size()) {
+                const size_t comma = v.find(',', pos);
+                const std::string name = v.substr(pos, comma == std::string::npos ? std::string::npos : comma - pos);
+                if (name == "all") {
+                    for (int lvl = RCV_ISA_SCALAR; lvl <= int(rcv_cpu_isa()); ++lvl) o->isas.push_back(rcv_isa(lvl));
+                } else if (name == "auto") o->isas.push_back(RCV_ISA_AUTO);
+                else if (name == "scalar") o->isas.push_back(RCV_ISA_SCALAR);
+                else if (name == "sse41") o->isas.push_back(RCV_ISA_SSE41);
+                else if (name == "avx2") o->isas.push_back(RCV_ISA_AVX2);
+                else return false;
+                if (comma == std::string::npos) break;
+                pos = comma + 1;
+            }
+        }
         else if (k == "--cpu") o->cpu = std::atoi(v.c_str());
         else if (k == "--csv") o->csv = v;
         else if (k == "--compare") {
@@ -262,7 +281,7 @@ bool load_sizes(const std::string& name, const std::string& path, Series* s) {
 
 class RcvRun {
 public:
-    RcvRun(int w, int h, double fps, int predictor, int slices) : w_(w), h_(h) {
+    RcvRun(int w, int h, double fps, int predictor, int slices, rcv_isa isa) : w_(w), h_(h) {
         rcv_encoder_config_init(&cfg_);
         cfg_.coded_width = uint16_t(w);
         cfg_.coded_height = uint16_t(h);
@@ -270,8 +289,11 @@ public:
         cfg_.fps_den = 1;
         cfg_.predictor = uint8_t(predictor);
         cfg_.num_slices = uint8_t(slices);
+        cfg_.isa = isa;
+        static const char* kIsa[] = {"auto", "scalar", "SSE4.1", "AVX2"};
+        const rcv_isa shown = isa == RCV_ISA_AUTO ? rcv_cpu_isa() : isa;
         series.name = std::string("RCV1 ") + (predictor ? "MED" : "LEFT") +
-                      (slices ? " S=" + std::to_string(slices) : std::string(" S=auto"));
+                      (slices ? " S=" + std::to_string(slices) : std::string(" S=auto")) + " " + kIsa[shown];
     }
     ~RcvRun() {
         rcv_encoder_destroy(enc_);
@@ -341,7 +363,7 @@ private:
 };
 
 void print_stage_table(const std::vector<std::unique_ptr<RcvRun>>& runs) {
-    std::printf("\nEncoder stage breakdown (mean ms per coded frame, single thread, scalar):\n\n");
+    std::printf("\nEncoder stage breakdown (mean ms per coded frame, single thread):\n\n");
     std::printf("| Config | load | predict + histogram | table build | entropy write | other | total |\n");
     std::printf("|---|---|---|---|---|---|---|\n");
     for (const auto& r : runs) {
@@ -376,15 +398,16 @@ int main(int argc, char** argv) {
 
     std::vector<std::unique_ptr<RcvRun>> runs;
     for (int p : opt.predictors)
-        for (int s : opt.slices) {
-            auto r = std::make_unique<RcvRun>(opt.w, opt.h, opt.fps, p, s);
-            const rcv_status st = r->init();
-            if (st != RCV_OK) {
-                std::fprintf(stderr, "%s: init failed: %s\n", r->series.name.c_str(), rcv_status_string(st));
-                return 1;
+        for (int s : opt.slices)
+            for (rcv_isa isa : opt.isas) {
+                auto r = std::make_unique<RcvRun>(opt.w, opt.h, opt.fps, p, s, isa);
+                const rcv_status st = r->init();
+                if (st != RCV_OK) {
+                    std::fprintf(stderr, "%s: init failed: %s\n", r->series.name.c_str(), rcv_status_string(st));
+                    return 1;
+                }
+                runs.push_back(std::move(r));
             }
-            runs.push_back(std::move(r));
-        }
     std::vector<Series> externals(opt.compare.size());
     for (size_t i = 0; i < opt.compare.size(); ++i)
         if (!load_sizes(opt.compare[i].first, opt.compare[i].second, &externals[i])) return 1;
@@ -432,7 +455,7 @@ int main(int argc, char** argv) {
     std::printf("- Machine: %s, %lu logical CPUs, %s; Windows-reported clock %lu/%lu MHz before, %lu MHz after\n",
                 cpu_brand().c_str(), logical, power_state().c_str(), clk_before.current, clk_before.max,
                 clk_after.current);
-    std::printf("- Build: %s, MSVC %d; bench thread %s, priority HIGHEST; RCV1 uses 1 thread, scalar kernels\n",
+    std::printf("- Build: %s, MSVC %d; bench thread %s, priority HIGHEST; RCV1 uses 1 thread\n",
 #ifdef NDEBUG
                 "Release",
 #else

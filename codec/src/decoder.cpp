@@ -1,12 +1,15 @@
 // RCV1 decoder (codec plan §5.7, §6, Appendix A.2).
-// M1 scope: scalar, single-threaded; I-frames and DUP; I420 / NV12 output.
+// Scope so far: single-threaded; I-frames and DUP; I420 / NV12 output.
+// Entropy decoding and reconstruction run fused in one serial pass per chunk (the decoder is
+// inherently serial along a row, §5.4).
 // The decoder must never crash on bad input: every length is checked before use (§6.5).
+#include <stdlib.h>  // _byteswap_uint64
+
 #include <chrono>
 #include <cstring>
 #include <new>
 
 #include "aligned_buffer.h"
-#include "bitio.h"
 #include "crc32c.h"
 #include "format.h"
 #include "huffman.h"
@@ -21,8 +24,7 @@ struct rcv_decoder {
     uint8_t* ref_mem;
     uint8_t* ref_plane[3];
     ptrdiff_t ref_stride[3];
-    uint8_t* resid;            // decoded symbols of one chunk (sized for S = 1)
-    HuffDecEntry lut[kLutSize];
+    HuffDecTable lut[2];       // two, for decoding a pair of chunks in lockstep
     bool has_ref;
 };
 
@@ -34,35 +36,225 @@ uint32_t elapsed_us(Clock::time_point t0) {
     return uint32_t(std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t0).count());
 }
 
-// Decodes one chunk's symbols into d->resid. `count` is derived from geometry, never stored.
-rcv_status decode_chunk(rcv_decoder* d, const uint8_t* c, size_t size, size_t count) {
-    if (size < kChunkHeaderSize || c[2] != 0 || c[3] != 0) return RCV_ERR_BITSTREAM;
+// Symbol sources for the fused reconstruct loop.
+struct SingleSource {
+    uint8_t sym;
+    uint8_t operator()() const { return sym; }
+};
+
+struct RawSource {
+    const uint8_t* p;
+    uint8_t operator()() { return *p++; }
+};
+
+// MSB-first Huffman source with a 12-bit LUT. Bits are left-aligned in `buf`; `count` of them are
+// real. Refills 8 bytes at a time while at least 8 bytes of the chunk remain, byte by byte after
+// that, and never reads past the chunk. Any bits below `count` are the stream's next bits (or 0),
+// so re-reading them is harmless.
+//
+// Past the end of the chunk the buffer simply supplies zero bits and `count` goes negative. That
+// is only possible once every byte has been loaded (a refill always tops up to > 12 bits while
+// bytes remain, and a code is <= 12 bits), and it is checked once after the chunk (overrun()),
+// so the per-symbol path has no bounds branch.
+struct HuffSource {
+    const HuffDecTable* lut;
+    const uint8_t* start;
+    const uint8_t* p;
+    const uint8_t* end;
+    uint64_t buf = 0;
+    int count = 0;
+
+    void refill() {
+        if (end - p >= 8) {
+            uint64_t v;
+            std::memcpy(&v, p, 8);
+            buf |= _byteswap_uint64(v) >> count;  // 0 <= count < 12 here
+            p += (63 - count) >> 3;
+            count |= 56;
+        } else {
+            while (count <= 56 && p < end) {  // count >= 0 whenever bytes remain
+                buf |= uint64_t(*p++) << (56 - count);
+                count += 8;
+            }
+        }
+    }
+    uint8_t operator()() {
+        if (count < kLutBits) refill();
+        const unsigned idx = unsigned(buf >> 52);
+        const unsigned len = lut->len[idx];
+        buf <<= len;
+        count -= int(len);
+        return lut->sym[idx];
+    }
+    bool overrun() const { return count < 0; }  // a symbol needed bits past the end of the chunk
+    size_t bytes_used() const { return (size_t(p - start) * 8 - size_t(count) + 7) / 8; }
+};
+
+// Row reconstruction (inverse of §5.4 / Appendix A.2). The first row of a slice starts from 128
+// and uses the left neighbour; other rows start from the sample above.
+template <class Source>
+inline void row_first(uint8_t* x, int width, Source& next) {
+    uint8_t a = 128;
+    for (int i = 0; i < width; ++i) {
+        a = uint8_t(a + next());
+        x[i] = a;
+    }
+}
+
+template <class Source>
+inline void row_rest(uint8_t* x, const uint8_t* up, int width, int predictor, Source& next) {
+    int a = uint8_t(up[0] + next());
+    x[0] = uint8_t(a);
+    if (predictor == kPredMed) {
+        int c = up[0];
+        for (int i = 1; i < width; ++i) {
+            const int b = up[i];
+            a = (predict_med_clamp(a, b, c) + next()) & 0xFF;
+            x[i] = uint8_t(a);
+            c = b;
+        }
+    } else {
+        for (int i = 1; i < width; ++i) {
+            a = (a + next()) & 0xFF;
+            x[i] = uint8_t(a);
+        }
+    }
+}
+
+// Rebuilds rows [r0, r1) of a plane (one slice) from a symbol source.
+// The source is copied to a local first: pixel stores go through uint8_t*, which may alias
+// anything, so a source reached by reference would be reloaded from memory on every symbol.
+template <class Source>
+void reconstruct(uint8_t* plane, ptrdiff_t stride, int width, int r0, int r1, int predictor, Source& src) {
+    Source next = src;
+    row_first(plane + r0 * stride, width, next);
+    for (int j = r0 + 1; j < r1; ++j) row_rest(plane + j * stride, plane + (j - 1) * stride, width, predictor, next);
+    src = next;
+}
+
+// Two slices of one plane rebuilt in lockstep. Each slice is a serial chain (Huffman bit
+// position, then left neighbour), but the two chains are independent, so interleaving them
+// lets the CPU overlap them on one core. Rows beyond the shorter slice are finished alone.
+void reconstruct_pair(uint8_t* plane, ptrdiff_t stride, int width, int r0a, int r1a, int r0b, int r1b,
+                      int predictor, HuffSource& src_a, HuffSource& src_b) {
+    HuffSource sa = src_a, sb = src_b;  // locals, kept in registers (see reconstruct)
+    const int rows = (r1a - r0a) < (r1b - r0b) ? (r1a - r0a) : (r1b - r0b);
+    {
+        uint8_t* xa = plane + r0a * stride;
+        uint8_t* xb = plane + r0b * stride;
+        uint8_t a = 128, b = 128;
+        for (int i = 0; i < width; ++i) {
+            a = uint8_t(a + sa());
+            xa[i] = a;
+            b = uint8_t(b + sb());
+            xb[i] = b;
+        }
+    }
+    for (int k = 1; k < rows; ++k) {
+        uint8_t* xa = plane + (r0a + k) * stride;
+        uint8_t* xb = plane + (r0b + k) * stride;
+        const uint8_t* ua = xa - stride;
+        const uint8_t* ub = xb - stride;
+        int a = uint8_t(ua[0] + sa());
+        int b = uint8_t(ub[0] + sb());
+        xa[0] = uint8_t(a);
+        xb[0] = uint8_t(b);
+        if (predictor == kPredMed) {
+            int ca = ua[0], cb = ub[0];
+            for (int i = 1; i < width; ++i) {
+                const int ba = ua[i], bb = ub[i];
+                a = (predict_med_clamp(a, ba, ca) + sa()) & 0xFF;
+                b = (predict_med_clamp(b, bb, cb) + sb()) & 0xFF;
+                xa[i] = uint8_t(a);
+                xb[i] = uint8_t(b);
+                ca = ba;
+                cb = bb;
+            }
+        } else {
+            for (int i = 1; i < width; ++i) {
+                a = (a + sa()) & 0xFF;
+                b = (b + sb()) & 0xFF;
+                xa[i] = uint8_t(a);
+                xb[i] = uint8_t(b);
+            }
+        }
+    }
+    for (int j = r0a + rows; j < r1a; ++j)
+        row_rest(plane + j * stride, plane + (j - 1) * stride, width, predictor, sa);
+    for (int j = r0b + rows; j < r1b; ++j)
+        row_rest(plane + j * stride, plane + (j - 1) * stride, width, predictor, sb);
+    src_a = sa;
+    src_b = sb;
+}
+
+bool chunk_header_ok(const uint8_t* c, size_t size) {
+    return size >= kChunkHeaderSize && c[2] == 0 && c[3] == 0;
+}
+
+// Validates a HUFFMAN chunk's header and code lengths and sets up its bit source.
+rcv_status open_huffman(const uint8_t* c, size_t size, size_t count, HuffDecTable* lut, HuffSource* src) {
+    if (c[1] != 0 || count == 0 || size < kChunkHeaderSize + kHuffTableSize) return RCV_ERR_BITSTREAM;
+    uint8_t len[256];
+    huff_unpack_lengths(c + kChunkHeaderSize, len);
+    if (!huff_build_decode_lut(len, lut)) return RCV_ERR_BITSTREAM;
+    const uint8_t* bits = c + kChunkHeaderSize + kHuffTableSize;
+    *src = HuffSource{lut, bits, bits, c + size};
+    return RCV_OK;
+}
+
+// After decoding: no symbol ran past the chunk, and the chunk is exactly the bitstream padded to a
+// multiple of 4 bytes.
+rcv_status close_huffman(const HuffSource& src, size_t size) {
+    if (src.overrun()) return RCV_ERR_BITSTREAM;
+    if (size != kChunkHeaderSize + kHuffTableSize + align4(src.bytes_used())) return RCV_ERR_BITSTREAM;
+    return RCV_OK;
+}
+
+// Decodes two neighbouring HUFFMAN chunks (slices s and s+1 of one plane) in lockstep.
+rcv_status decode_huffman_pair(rcv_decoder* d, const uint8_t* ca, size_t size_a, const uint8_t* cb, size_t size_b,
+                               int plane, const Geometry& g, int s, int predictor) {
+    if (!chunk_header_ok(ca, size_a) || !chunk_header_ok(cb, size_b)) return RCV_ERR_BITSTREAM;
+    HuffSource a, b;
+    rcv_status st = open_huffman(ca, size_a, g.chunk_samples(plane, s), &d->lut[0], &a);
+    if (st != RCV_OK) return st;
+    st = open_huffman(cb, size_b, g.chunk_samples(plane, s + 1), &d->lut[1], &b);
+    if (st != RCV_OK) return st;
+    reconstruct_pair(d->ref_plane[plane], d->ref_stride[plane], g.plane_w[plane], g.slice_row(plane, s),
+                     g.slice_row(plane, s + 1), g.slice_row(plane, s + 1), g.slice_row(plane, s + 2), predictor, a, b);
+    st = close_huffman(a, size_a);
+    if (st != RCV_OK) return st;
+    return close_huffman(b, size_b);
+}
+
+// Decodes one chunk straight into the reference plane. The sample count comes from geometry,
+// never from the packet.
+rcv_status decode_chunk(rcv_decoder* d, const uint8_t* c, size_t size, int plane, const Geometry& g, int slice,
+                        int predictor) {
+    if (!chunk_header_ok(c, size)) return RCV_ERR_BITSTREAM;
+    const size_t count = g.chunk_samples(plane, slice);
+    uint8_t* dst = d->ref_plane[plane];
+    const ptrdiff_t stride = d->ref_stride[plane];
+    const int w = g.plane_w[plane], r0 = g.slice_row(plane, slice), r1 = g.slice_row(plane, slice + 1);
     switch (c[0]) {
     case kChunkHuffman: {
-        if (c[1] != 0 || count == 0 || size < kChunkHeaderSize + kHuffTableSize) return RCV_ERR_BITSTREAM;
-        uint8_t len[256];
-        huff_unpack_lengths(c + kChunkHeaderSize, len);
-        if (!huff_build_decode_lut(len, d->lut)) return RCV_ERR_BITSTREAM;
-        BitReader br(c + kChunkHeaderSize + kHuffTableSize, c + size);
-        for (size_t k = 0; k < count; ++k) {
-            if (br.count() < kLutBits) br.refill();
-            const HuffDecEntry e = d->lut[br.peek12()];
-            if (!br.consume(e.len)) return RCV_ERR_BITSTREAM;  // bitstream ended early
-            d->resid[k] = e.sym;
-        }
-        // The chunk must be exactly the bitstream padded to a multiple of 4 bytes.
-        const size_t used = (br.bits_consumed() + 7) / 8;
-        if (size != kChunkHeaderSize + kHuffTableSize + align4(used)) return RCV_ERR_BITSTREAM;
+        HuffSource src;
+        const rcv_status st = open_huffman(c, size, count, &d->lut[0], &src);
+        if (st != RCV_OK) return st;
+        reconstruct(dst, stride, w, r0, r1, predictor, src);
+        return close_huffman(src, size);
+    }
+    case kChunkSingle: {
+        if (count == 0 || size != kChunkHeaderSize) return RCV_ERR_BITSTREAM;
+        SingleSource src{c[1]};
+        reconstruct(dst, stride, w, r0, r1, predictor, src);
         return RCV_OK;
     }
-    case kChunkSingle:
-        if (count == 0 || size != kChunkHeaderSize) return RCV_ERR_BITSTREAM;
-        std::memset(d->resid, c[1], count);
-        return RCV_OK;
-    case kChunkRaw:
+    case kChunkRaw: {
         if (c[1] != 0 || count == 0 || size != kChunkHeaderSize + align4(count)) return RCV_ERR_BITSTREAM;
-        std::memcpy(d->resid, c + kChunkHeaderSize, count);
+        RawSource src{c + kChunkHeaderSize};
+        reconstruct(dst, stride, w, r0, r1, predictor, src);
         return RCV_OK;
+    }
     case kChunkEmpty:
         if (c[1] != 0 || count != 0 || size != kChunkHeaderSize) return RCV_ERR_BITSTREAM;
         return RCV_OK;
@@ -117,15 +309,21 @@ rcv_status decode_i_frame(rcv_decoder* d, const uint8_t* pkt, size_t size) {
     d->has_ref = false;
     const uint8_t* chunk = payload + dir_size;
     for (int pl = 0; pl < 3; ++pl) {
-        for (int s = 0; s < slices; ++s) {
-            const size_t cs = get_u32(payload + 4 * (size_t(pl) * slices + size_t(s)));
-            const int r0 = g.slice_row(pl, s);
-            const int r1 = g.slice_row(pl, s + 1);
-            const rcv_status st = decode_chunk(d, chunk, cs, g.chunk_samples(pl, s));
+        auto chunk_size = [&](int s) { return size_t(get_u32(payload + 4 * (size_t(pl) * slices + size_t(s)))); };
+        for (int s = 0; s < slices;) {
+            const size_t cs = chunk_size(s);
+            rcv_status st;
+            if (s + 1 < slices && chunk[0] == kChunkHuffman && chunk[cs] == kChunkHuffman) {
+                const size_t cs2 = chunk_size(s + 1);  // sizes are >= 4 (checked above)
+                st = decode_huffman_pair(d, chunk, cs, chunk + cs, cs2, pl, g, s, predictor);
+                chunk += cs + cs2;
+                s += 2;
+            } else {
+                st = decode_chunk(d, chunk, cs, pl, g, s, predictor);
+                chunk += cs;
+                s += 1;
+            }
             if (st != RCV_OK) return st;
-            reconstruct_lossless_scalar(d->ref_plane[pl], d->ref_stride[pl], g.plane_w[pl], r0, r1,
-                                        predictor, d->resid);
-            chunk += cs;
         }
     }
     d->has_ref = true;
@@ -232,8 +430,7 @@ rcv_status rcv_decoder_create(const uint8_t seq_header[32], uint8_t num_threads,
         total += size_t(d->ref_stride[p]) * size_t(d->geo.plane_h[p]);
     }
     d->ref_mem = static_cast<uint8_t*>(aligned_alloc64(total));
-    d->resid = static_cast<uint8_t*>(aligned_alloc64(align64(max_chunk_samples(d->geo))));
-    if (!d->ref_mem || !d->resid) {
+    if (!d->ref_mem) {
         rcv_decoder_destroy(d);
         return RCV_ERR_OUT_OF_MEMORY;
     }
@@ -250,7 +447,6 @@ rcv_status rcv_decoder_create(const uint8_t seq_header[32], uint8_t num_threads,
 void rcv_decoder_destroy(rcv_decoder* d) {
     if (!d) return;
     aligned_free64(d->ref_mem);
-    aligned_free64(d->resid);
     delete d;
 }
 

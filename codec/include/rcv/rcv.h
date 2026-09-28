@@ -93,6 +93,9 @@ RCV_API void        rcv_encoder_config_init(rcv_encoder_config* cfg);
 RCV_API rcv_status  rcv_parse_sequence_header(const uint8_t seq_header[32], rcv_sequence_info* out);
 /* --- Addition: short English name for a status code. --- */
 RCV_API const char* rcv_status_string(rcv_status status);
+/* --- Addition: best kernel level this CPU + OS can run (never RCV_ISA_AUTO). A config asking for
+ *     a higher level than this fails with RCV_ERR_UNSUPPORTED. --- */
+RCV_API rcv_isa     rcv_cpu_isa(void);
 
 /* Encoder */
 RCV_API rcv_status rcv_encoder_create(const rcv_encoder_config* cfg, rcv_encoder** out);

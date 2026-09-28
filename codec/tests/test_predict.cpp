@@ -6,16 +6,19 @@
 
 using namespace rcv;
 
-TEST_CASE("predict: MED equals median(a, b, a+b-c) for all 2^24 triples") {
-    long mismatches = 0;
+TEST_CASE("predict: MED equals median(a, b, a+b-c) and the clamp form for all 2^24 triples") {
+    long mismatches = 0, clamp_mismatches = 0;
     for (int a = 0; a < 256; ++a)
         for (int b = 0; b < 256; ++b)
             for (int c = 0; c < 256; ++c) {
                 int v[3] = {a, b, a + b - c};  // unclamped integer gradient
                 std::sort(v, v + 3);
-                if (predict_med(uint8_t(a), uint8_t(b), uint8_t(c)) != v[1]) ++mismatches;
+                const int med = predict_med(uint8_t(a), uint8_t(b), uint8_t(c));
+                if (med != v[1]) ++mismatches;
+                if (predict_med_clamp(a, b, c) != med) ++clamp_mismatches;  // decoder's form
             }
     CHECK(mismatches == 0);
+    CHECK(clamp_mismatches == 0);
 }
 
 TEST_CASE("predict: residuals and reconstruction are inverse (both predictors)") {

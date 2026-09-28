@@ -134,6 +134,31 @@ TEST_CASE("roundtrip: chunk modes (SINGLE, RAW, HUFFMAN)") {
     for (int m : modes_of(make_yuv(256, 256, Content::Natural, 9))) CHECK(m == rcv::kChunkHuffman);
 }
 
+TEST_CASE("roundtrip: mixed chunk modes across slices (pair + single decode paths)") {
+    // Bands of flat (SINGLE), natural (HUFFMAN) and noise (RAW) content, so neighbouring slices
+    // mix modes; heights give slices of unequal row counts.
+    for (int h : {96, 130, 250}) {
+        Yuv f = make_yuv(200, h, Content::Natural, uint64_t(h));
+        const Yuv noise = make_yuv(200, h, Content::Noise, uint64_t(h) + 1);
+        for (int i = 0; i < 3; ++i)
+            for (int y = 0; y < f.ph(i); ++y) {
+                const int band = (y * 6 / f.ph(i)) % 3;  // 0 flat, 1 natural, 2 noise
+                for (int x = 0; x < f.pw(i); ++x) {
+                    if (band == 0) f.at(i, x, y) = 128;
+                    if (band == 2) f.at(i, x, y) = noise.at(i, x, y);
+                }
+            }
+        const int by = (h + 15) / 16;
+        for (int s = 1; s <= by; ++s) {
+            roundtrip(f, 1, s);
+            roundtrip(f, 0, s);
+        }
+        std::set<int> modes;
+        for (int m : chunk_modes(encode_one(config_for(f.w, f.h, 1, by), f))) modes.insert(m);
+        CHECK(modes.count(rcv::kChunkSingle) && modes.count(rcv::kChunkHuffman) && modes.count(rcv::kChunkRaw));
+    }
+}
+
 TEST_CASE("roundtrip: frame sequence with DUP through one encoder/decoder") {
     const int w = 96, h = 64;
     rcv_encoder_config cfg = config_for(w, h);

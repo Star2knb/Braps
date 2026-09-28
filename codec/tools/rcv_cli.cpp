@@ -169,7 +169,15 @@ int cmd_encode(const Args& a) {
         return 2;
     }
     cfg.predictor = pred == "med" ? 1 : 0;
-    const std::string isa = a.get("--isa", "auto");
+    std::string isa = a.get("--isa", "");
+    if (isa.empty()) {  // RCV_FORCE_ISA is read only by tests and this CLI (plan §3.3)
+        char* env = nullptr;
+        size_t len = 0;
+        if (_dupenv_s(&env, &len, "RCV_FORCE_ISA") == 0 && env) {
+            isa = env;
+            std::free(env);
+        }
+    }
     cfg.isa = isa == "scalar" ? RCV_ISA_SCALAR : isa == "sse41" ? RCV_ISA_SSE41 : isa == "avx2" ? RCV_ISA_AVX2 : RCV_ISA_AUTO;
     rcv_encode_params params{};
     params.near_level = uint8_t(std::atoi(a.get("--near", "0").c_str()));
@@ -182,6 +190,8 @@ int cmd_encode(const Args& a) {
         return 1;
     }
     std::unique_ptr<rcv_encoder, void (*)(rcv_encoder*)> enc_guard(enc, rcv_encoder_destroy);
+    static const char* kIsaNames[] = {"auto", "scalar", "SSE4.1", "AVX2"};
+    std::fprintf(stderr, "kernels: %s\n", kIsaNames[cfg.isa == RCV_ISA_AUTO ? rcv_cpu_isa() : cfg.isa]);
 
     File in = open_file(a.get("-i"), false);
     File out = open_file(a.get("-o"), true);
