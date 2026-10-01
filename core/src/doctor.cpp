@@ -206,9 +206,10 @@ std::vector<CheckResult> check_volume(const Config& cfg, const std::filesystem::
             size.height = int(dm.dmPelsHeight);
         }
         const RateEstimate r = estimate_write_rate(size.width, size.height, cfg.record.fps, cfg.record.format == "rgb");
-        const double minutes = r.typical_mbps > 0 ? gb * 1024 / r.typical_mbps / 60 : 0;
-        const std::string d = fmt("%.0f GB free (about %.0f min at %dx%d@%d)", gb, minutes, size.width, size.height,
-                                  cfg.record.fps);
+        // Recording time at the conservative rate: at least this long.
+        const double minutes = r.required_mbps > 0 ? double(free_bytes.QuadPart) / 1e6 / r.required_mbps / 60 : 0;
+        const std::string d = fmt("%.0f GB free (at least %.0f min at %dx%d@%d)", gb, minutes, size.width,
+                                  size.height, cfg.record.fps);
         if (gb < cfg.log.critical_space_gb)
             out.push_back(fail("Free space", d, "free up space or choose another drive (record.out_dir)"));
         else if (gb < cfg.log.low_space_gb)
@@ -218,8 +219,8 @@ std::vector<CheckResult> check_volume(const Config& cfg, const std::filesystem::
 
         // No disk benchmark until `rec bench-disk` exists (recorder M5): state what the drive must sustain.
         out.push_back(warn("Disk speed",
-                           fmt("not measured; %dx%d@%d lossless needs ~%.0f MB/s, up to ~%.0f MB/s in detailed scenes",
-                               size.width, size.height, cfg.record.fps, r.typical_mbps, r.detailed_mbps),
+                           fmt("not measured; %dx%d@%d needs ~%.0f MB/s (plan estimate; ~%.0f MB/s typical)",
+                               size.width, size.height, cfg.record.fps, r.required_mbps, r.typical_mbps),
                            "measure it with rec bench-disk (arrives in recorder milestone M5)"));
     }
     return out;
@@ -276,10 +277,9 @@ CheckResult check_ffmpeg() {
 }  // namespace
 
 RateEstimate estimate_write_rate(int width, int height, int fps, bool rgb) {
-    // Whole-file ratios measured by the codec at 60 fps: Minecraft 5.7 (YUV) / 7.4 (RGB) with skip and
-    // DUPs; Warframe 1.7 real-frame (YUV). Detailed RGB is assumed no better than YUV.
-    const double raw_mb = double(width) * height * (rgb ? 3.0 : 1.5) * fps / (1024.0 * 1024);
-    return {raw_mb / (rgb ? 7.4 : 5.7), raw_mb / 1.7};
+    // MB = 10^6 bytes, as in the plan (720p60 ~ 33 MB/s, 1080p60 ~ 75 MB/s).
+    const double raw_mb = double(width) * height * (rgb ? 3.0 : 1.5) * fps / 1e6;
+    return {raw_mb / 2.49, raw_mb / (rgb ? 7.4 : 5.7)};
 }
 
 std::vector<CheckResult> run_doctor(const Config& cfg) {

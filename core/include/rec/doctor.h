@@ -20,10 +20,11 @@ struct CheckResult {
 
 std::vector<CheckResult> run_doctor(const Config& cfg);
 
-// Estimated write rate for a configuration, MB/s: simple scenes (Minecraft-like, with temporal
-// skip) and detailed scenes (Warframe-like), from the codec's measured ratios (codec M9 report).
+// Write rate for a configuration, MB/s. `required` is the plan's startup-check estimate (§9:
+// raw rate / 2.49, the FRAPS ratio), the figure a disk must sustain; `typical` uses the codec's
+// measured whole-file ratio on Minecraft (5.7:1 YUV, 7.4:1 RGB; codec M9 report).
 struct RateEstimate {
-    double typical_mbps = 0, detailed_mbps = 0;
+    double required_mbps = 0, typical_mbps = 0;
 };
 RateEstimate estimate_write_rate(int width, int height, int fps, bool rgb);
 

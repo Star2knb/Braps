@@ -106,7 +106,8 @@ TEST_CASE("doctor: runs every check; output folder in a temp dir passes") {
         }
     CHECK(!std::filesystem::exists(dir.path() / "not yet"));  // doctor changes nothing
 
-    const RateEstimate e = estimate_write_rate(1280, 720, 60, false);
-    CHECK(e.typical_mbps > 10 && e.typical_mbps < 20);
-    CHECK(e.detailed_mbps > 40 && e.detailed_mbps < 60);
+    const RateEstimate e = estimate_write_rate(1280, 720, 60, false);  // plan §9: ~33 MB/s
+    CHECK(e.required_mbps > 33 && e.required_mbps < 34);
+    CHECK(e.typical_mbps > 14 && e.typical_mbps < 15);
+    CHECK(estimate_write_rate(1920, 1080, 60, false).required_mbps > 74);  // plan §9: ~75 MB/s
 }
