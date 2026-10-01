@@ -297,3 +297,47 @@ explicitly.
 files in `third_party/README.md`): CLI11 v2.7.2, toml++ v3.4.0, spdlog v1.17.0, MinHook v1.3.4, and
 kiero2 at commit `8f57dd9` — the commit reviewed in recorder plan §4.6.1, still `master` on
 2026-10-01. Only sources, headers and licences are kept; vendored files are never edited.
+
+**D-048 — x86 builds.** Presets `x86-debug` / `x86-release` use the x64-hosted x86 compiler
+(`vcvarsamd64_x86`; `build.bat` picks it from the preset name) into `build/x86-*`. The x86 tree
+builds only what must be 32-bit — `rec_common` and `rec_inject32` now, `rec_hook32.dll` and the 32-bit
+test app later; the codec stays x64 only. Windows API settings (`UNICODE`, `NOMINMAX`,
+`WIN32_LEAN_AND_MEAN`, `_WIN32_WINNT=0x0A00`) are attached to the recorder targets through
+`rec_common`, not globally, so the codec and its tools build exactly as before.
+
+**D-049 — Event registry.** All codes live in one X-macro table in `common/include/rec/events.h`
+(id, code, name, description); level and subsystem are derived from the code and checked at compile
+time. The whole code is the identifier because the plan uses 1301 twice (`I1301` display refresh,
+`W1301` pacing error), so hook log records will carry level + number. Three codes beyond the plan's
+catalogue: `I7004 command` (every rec invocation, with its arguments), `I7005 doctor_result`,
+`I7006 config_changed`.
+
+**D-050 — Host logging details.** One spdlog async logger per subsystem (`hook`, `ipc`, `encoder`,
+`writer`, `audio`, `system`, `cli` — the plan's `[writer ]` column), sharing the sinks; one logger
+thread at below-normal priority (§3.2). The queue (32,768 messages) blocks when full instead of
+dropping: host threads log rarely (warnings, one summary per second), and a silently lost warning
+would defeat R9; the hook never uses spdlog (§10.2). Level names are written by a custom formatter
+(`INFO `, `WARN `, `ERROR`, `FATAL`). The session log is a distributing sink present in every logger,
+filled while a recording is open. spdlog's asynchronous `flush()` only posts a request, so closing
+a session or flushing waits on a barrier (a flush posted to a private logger on the same single
+queue); the test checks that a 2,000-line burst lands completely in the session file.
+
+**D-051 — Configuration.** `rec.toml` lives in `%LOCALAPPDATA%\rec\` next to the logs (per
+machine, since it will cache disk benchmarks per volume); `--config` points elsewhere. A missing
+file means defaults; `rec config set/reset` write every key in the plan's order (strings as TOML
+literal strings, so Windows paths need no escaping). A bad or unknown entry is reported and its
+default kept; only an unparsable file stops a command. Command-line recording options are applied
+as config keys, so they go through the same type and range checks.
+
+**D-052 — rec doctor.** Read-only: the output folder is tested with a temporary delete-on-close
+file in it or, if it doesn't exist yet, in the nearest existing parent. Disk speed is reported as a
+warning until `rec bench-disk` exists (M5), together with the rate the settings need: the plan's
+§9 estimate (raw rate ÷ 2.49, the FRAPS ratio; 33 MB/s at 720p60), which also gives the minimum
+recording time for the free space, plus the typical rate from the codec's measured Minecraft ratio
+(5.7:1). Identical
+adapters/encoders listed twice by Windows (seen here with a virtual-display driver) are shown once.
+
+**D-053 — CLI conventions.** Exit codes: 0 success, 1 error, 2 command not implemented yet (the
+message names the milestone). Every command is logged (`I7004`) and every failure goes to the log
+as well as the console. Recorder tests reuse the codec's test harness and main (D-003), so no test
+framework download is needed.

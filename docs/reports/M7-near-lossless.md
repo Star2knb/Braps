@@ -10,7 +10,7 @@ skip compare, decoder support; YUV420 only · **Tools:** `rcv_bench --near`, `rc
 | A2 Near-lossless bound | max \|decoded − source\| ≤ NEAR, every sample | exactly 1 / 2 / 3 at NEAR 1 / 2 / 3 on all 1,597 Minecraft frames; tests: every NEAR × prediction × sample (196,608 cases), I-frames over sizes/contents/predictors/slices, P-frame chains, per-frame NEAR switching | **met** |
 | Per-frame NEAR switching (M7 gate) | decodes correctly | sequence switching NEAR every frame (0,1,3,2,…) stays within each frame's bound; lossless frames after near ones are exact | **met** |
 | A3 with near-lossless | identical bytes | scalar/SSE4.1/AVX2 × 1–4 threads; NV12 = I420 | **met** |
-| A7 Near-lossless speed, 1 thread, 1360×744 | ≤ 8.0 ms | 8.72 ms p50 measured **under load** (control 1.13× slower than idle) → ≈ 7.7 ms estimated idle | **probably met — needs a clean run** |
+| A7 Near-lossless speed, 1 thread, 1360×744 | ≤ 8.0 ms | 8.72 ms p50 measured **under load** (control 1.13× slower than idle) → ≈ 7.7 ms estimated idle. **Clean run (M9): 8.15 / 8.09 ms**, control 4% slow → ≈ 7.8 ms | **at the limit** — see [M9](M9-final.md) |
 
 ## Compression — Minecraft 1360×744, 1,597 frames, 2 threads, temporal skip on
 

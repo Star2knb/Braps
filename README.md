@@ -17,16 +17,28 @@ unchanged in [legacy/](legacy/) for reference; it is not part of the V2 build.
 | RCV1 codec | M5 — temporal skip (P-frames), auto-DUP, keyframe logic | done — [report](docs/reports/M5-skip.md): Minecraft files 41% smaller than FRAPS |
 | RCV1 codec | M6 — lossless RGB (GBR format, BGRA input/output) | done — [report](docs/reports/M6-rgb.md) |
 | RCV1 codec | M7 — near-lossless mode, per-frame NEAR switching | done — [report](docs/reports/M7-near-lossless.md): NEAR 1 = 8.4:1, NEAR 3 = 11.7:1 whole file |
-| RCV1 codec | M8 — hardening: validation audit, CRC-32C, no-allocation test, fuzzing | next |
-| Recorder | M0 | not started |
+| RCV1 codec | M8 — hardening: validation audit, CRC-32C, no-allocation test, fuzzing | done — [report](docs/reports/M8-hardening.md) |
+| RCV1 codec | M9 — final report, all criteria | done — [report](docs/reports/M9-final.md): files 41% smaller than FRAPS, 1.7 ms/frame on 2 threads |
+| Recorder | M0 — layout, CMake x64/x86, CLI skeleton, logging, `rec doctor` | done — [report](docs/reports/recorder-M0.md) |
+| Recorder | M1 — test app, injection, kiero2 + MinHook `Present` hook (measuring only), `rec list` | next |
 
 ## Build
 Requires Visual Studio (2022 or 2026) with "Desktop development with C++".
 
 ```
-build.bat release        (or: debug, clang-debug)
+build.bat release        (or: debug, clang-debug; x86-release / x86-debug for the 32-bit parts)
 build\release\codec\rcv_tests.exe
+build\release\tests\rec_tests.exe
 ```
+
+## rec
+```
+rec doctor                           check this PC for recording
+rec config show                      every setting (%LOCALAPPDATA%\rec\rec.toml)
+rec config set record.fps 50         change one setting; rec config reset restores the defaults
+rec --help                           all commands (launch, attach, convert, ... arrive with later milestones)
+```
+Logs: `%LOCALAPPDATA%\rec\logs\rec.log`.
 
 ## rcv_cli
 ```

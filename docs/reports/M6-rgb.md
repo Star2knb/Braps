@@ -10,7 +10,7 @@ P-frames and DUP on RGB · **Tools:** `rcv_bench --format gbr`, `codec/bench/com
 | A1 on RGB vectors (M6 gate) | bit-exact | every frame of the 1,597-frame Minecraft clip as BGRA, skip on and off; tests: 6 sizes incl. odd (2×2 … 321×179) × 6 contents × 2 predictors × 3 slice counts; P/DUP sequences | **met** |
 | A3 on RGB | identical bytes | scalar / SSE4.1 / AVX2 × 1–4 threads; BGRX with random alpha = BGRA | **met** |
 | Colour kernels | equal to scalar | BGRA→GBR and GBR→BGRA, widths 1–130 | **met** |
-| Speed | (no RGB target in the plan) | **not yet measured cleanly** — see below | pending |
+| Speed | (no RGB target in the plan) | measured on the quiet machine in [M9](M9-final.md): encode **7.86 ms** (1 thread) / **4.10 ms** (2 threads), decode 12.6 / 7.9 ms | measured |
 
 ## Compression — Minecraft as RGB (1,597 frames, 1360×744)
 
@@ -33,9 +33,14 @@ All codecs see the same BGRA pixels (converted from the FRAPS recording by FFmpe
   smoother than a true RGB capture. Real RGB numbers need captures from the recorder (D3D/OpenGL
   readback), which the codec can now take directly.
 
-## Speed — pending a quiet machine
+## Speed
 
-The speed runs were contaminated: **Warframe, Roblox and Discord were running** during the
+**Measured on the quiet machine in [M9](M9-final.md):** encode 7.86 ms p50 on 1 thread, 4.10 ms on
+2 (skip off; 8.84 / 4.02 ms with skip on), decode 12.6 / 7.9 ms — 2.6× the YUV time. The estimate
+below (≈ 5 ms), derived from a loaded session, was too optimistic: under heavy load the YUV and RGB
+runs did not slow down by the same factor.
+
+The original speed runs were contaminated: **Warframe, Roblox and Discord were running** during the
 measurements (Warframe had used 962 s of CPU). The YUV control benchmark, 3.0 ms/frame on the quiet
 machine in M5, measured 14.3 ms under the same load, so every absolute timing from that session is
 ~4–5× too slow and is not reported.
