@@ -26,6 +26,7 @@ enum class Subsystem : uint8_t { Hook = 1, Transport = 2, Encoder = 3, Disk = 4,
     X(LocateFailed, "E1105", "locate_failed", "Address lookup failed; that API stays unhooked")             \
     X(VtablePointerOutsideModule, "W1106", "vtable_pointer_outside_module",                                 \
       "Vtable pointer outside the expected module; hook skipped")                                           \
+    X(HookException, "E1107", "hook_exception", "Exception inside the hook; capture disabled (added in M1)") \
     X(GpuBacklog, "W1201", "gpu_backlog", "All staging slots pending; frame skipped")                       \
     X(RingFull, "W1202", "ring_full", "Shared frame ring full; frame dropped")                               \
     X(SlowHook, "W1203", "slow_hook", "Hook cost above slow_hook_ms")                                       \

@@ -341,3 +341,77 @@ adapters/encoders listed twice by Windows (seen here with a virtual-display driv
 message names the milestone). Every command is logged (`I7004`) and every failure goes to the log
 as well as the console. Recorder tests reuse the codec's test harness and main (D-003), so no test
 framework download is needed.
+
+## Recorder M1
+
+**D-054 — Output folder.** `rec.exe`, `rec_hook64.dll` and `rec_testapp.exe` are built into
+`<build>/bin` (e.g. `build\release\bin`), because the host looks for the hook DLL next to itself.
+Codec and test binaries stay where they were. `rec` depends on the hook target, so one build makes
+both.
+
+**D-055 — Static CRT in the hook.** `rec_hook64.dll` (and later `rec_hook32.dll`) link the CRT
+statically (`/MT`), as do MinHook and kiero2, so the DLL never depends on a Visual C++ runtime that
+the game may lack or have in a different version. It therefore cannot link `rec_common` (built `/MD`
+for the host); `rec_common_headers` is an interface library with the same include path and Windows
+settings, and the hook uses only header-only parts of `common` (events, protocol).
+
+**D-056 — kiero2 integration.** Only the D3D11 backend is compiled (the plan's list is D3D9 / D3D11 /
+D3D12 as they arrive; the `Implementation_*` numbers depend on include order, so
+`hook/kiero_wrap.hpp` and the `KIERO_IMPL_FIRST_SLOT` in `third_party/CMakeLists.txt` must change
+together). `hook/kiero_config.h` is force-included into kiero2's sources to send `KIERO_DBG_MSG` and
+`KIERO_ASSERT` to the log ring. `locate` runs under SEH on the install thread; entries 8 (`Present`)
+and 22 (`Present1`) are read by index and checked to lie inside the image of `dxgi.dll` (W1106).
+`ResizeBuffers` is not hooked yet: nothing holds the back buffer until M2.
+*Plan inconsistency:* §4.4 says the D3D11 lookup also covers D3D10 games, but kiero2 needs `d3d11.dll`
+to be loaded and §4.1 forbids loading it ourselves, so a D3D10-only game (no `d3d11.dll`) is not
+hooked. The hook waits, logging I1103, and the status line says so.
+
+**D-057 — Hook log records.** The hook sends events as text: the 48 bytes of `arg[]` + `tag` hold up
+to 47 characters of detail and `code` + `level` identify the event, so the host prints
+`I1101 backend_selected D3D11 1280x720 fmt=87 locate=28ms` and counts it like its own events. No
+numeric arguments are needed yet. Added `E1107 hook_exception` (an exception inside the Present guard;
+capture/measuring is disabled, the game goes on).
+
+**D-058 — Which swap chain.** The first swap chain at least 160 px on each side that presents is
+measured (§4.3); presents of others (overlays) are counted in `present_ignored`. If the measured
+chain is silent for one second, the next chain to present takes over (the game recreated its swap
+chain). `DXGI_PRESENT_TEST` calls are not frames. A nested call (Present calling Present1 through the
+vtable) is counted once, using a per-thread depth in a TLS slot from `TlsAlloc` rather than
+`thread_local`, because the DLL is loaded and unloaded while the game runs. The detours preserve
+`GetLastError`.
+
+**D-059 — Detach.** Disable the hooks, wait for the in-detour counter to reach zero, wait 250 ms (a
+thread that has left its last counted instruction still has to execute the `ret` inside our DLL), look
+again, then uninitialise MinHook and `FreeLibraryAndExitThread`. If a thread is still inside Present
+after 2 s (a hung game) the DLL stays loaded with the hooks off, rather than risk the game. A
+re-attach to a still-loaded hook takes over its shared memory (`attach_count`); a second `rec` that is
+still alive is refused.
+
+**D-060 — Injection.** `CreateRemoteThread(LoadLibraryW)` as in the plan; `launch` creates the
+process suspended and injects before the first thread runs (a launched game that loads Direct3D late
+gets I1103 and the deferred install). If injection fails the suspended process is terminated, since
+the user asked for a game with the hook. Elevated targets (E1003) are recognised from the token when
+`OpenProcess` is denied. 32-bit targets are refused with a message until `rec_inject32` (M7).
+
+**D-061 — Anti-cheat block now, not at M7.** Injection ships with the refusal (E1004), `--force` to
+override. Sources: the target's modules, all running processes, loaded kernel drivers, and for
+`launch` the file and folder names in the game's folder to two levels. List = `safety.anticheat_blocklist`
+plus built-in names (`builtin_anticheat_names()`). Matching: equal names (extension ignored), or for
+entries of 6+ characters an occurrence at the start of a name or after a non-alphanumeric character;
+plain substring matching flagged `WindscribeService.exe` for "BEService". For a launched game the
+modules are scanned again 3 s after start; if an anti-cheat module appeared the hook is removed (E1004).
+Consequence of scanning the whole system as the plan says: a machine with an anti-cheat driver or
+service running (Vanguard's `vgk`, for example) needs `--force` for every game.
+
+**D-062 — Control block.** Added to the protocol: the measured swap chain's size and format,
+`present_ignored`, and `hook_cost_total_ns` (the host derives the average cost per Present from deltas;
+the hook keeps no history). Host heartbeat period 250 ms, hook declares the host lost after 3 s.
+
+**D-063 — Commands.** `launch` and `attach` take `--force` and `--duration S` (detach and exit after S
+seconds; used by the test scripts). Ctrl+C detaches and exits; the game keeps running either way.
+`rec detach` with no arguments removes the hook from every process that has it. `rec list` shows
+processes with D3D9/10/11/12, OpenGL or Vulkan loaded (DXGI alone is not enough).
+
+**D-064 — Test app.** `rec_testapp` draws with `ClearView` on rectangles (no shaders yet): a 32-bit
+frame-counter barcode and moving colour bars. d3d11.dll and dxgi.dll are delay-loaded so that
+`rec launch` can be tested on the deferred install (`--late-load-ms`).

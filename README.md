@@ -20,7 +20,8 @@ unchanged in [legacy/](legacy/) for reference; it is not part of the V2 build.
 | RCV1 codec | M8 — hardening: validation audit, CRC-32C, no-allocation test, fuzzing | done — [report](docs/reports/M8-hardening.md) |
 | RCV1 codec | M9 — final report, all criteria | done — [report](docs/reports/M9-final.md): files 41% smaller than FRAPS, 1.7 ms/frame on 2 threads |
 | Recorder | M0 — layout, CMake x64/x86, CLI skeleton, logging, `rec doctor` | done — [report](docs/reports/recorder-M0.md) |
-| Recorder | M1 — test app, injection, kiero2 + MinHook `Present` hook (measuring only), `rec list` | next |
+| Recorder | M1 — test app, injection, kiero2 + MinHook `Present` hook (measuring only), `rec list` | done — [report](docs/reports/recorder-M1.md) |
+| Recorder | M2 — D3D11 capture (copy, scale, NV12 shader, staging ring), shared frame ring, F9 hotkey | next |
 
 ## Build
 Requires Visual Studio (2022 or 2026) with "Desktop development with C++".
@@ -30,13 +31,37 @@ build.bat release        (or: debug, clang-debug; x86-release / x86-debug for th
 build\release\codec\rcv_tests.exe
 build\release\tests\rec_tests.exe
 ```
+The recorder programs (`rec.exe`, `rec_hook64.dll`, `rec_testapp.exe`) are built into `build\release\bin`;
+`rec.exe` looks for the hook DLL next to itself.
 
 ## rec
 ```
 rec doctor                           check this PC for recording
 rec config show                      every setting (%LOCALAPPDATA%\rec\rec.toml)
 rec config set record.fps 50         change one setting; rec config reset restores the defaults
-rec --help                           all commands (launch, attach, convert, ... arrive with later milestones)
+rec list                             processes with Direct3D / OpenGL / Vulkan loaded
+rec launch game.exe [-- game args]   start a game with the hook in before it creates its device
+rec attach --pid N | --name X.exe    hook a running game
+rec detach [--pid N | --name X.exe]  remove the hook (default: from every game that has it)
+rec --help                           all commands (record, convert, ... arrive with later milestones)
+```
+Since M1 the hook only measures: `launch`/`attach` show the game's frame rate and the hook's own cost
+per frame; recording arrives with M2. Ctrl+C removes the hook and exits; the game keeps running.
+Options: `--duration S` (detach and exit after S seconds), `--force` (see below).
+
+**Anti-cheat.** Injecting into a game protected by anti-cheat can get your account banned. `rec` looks
+for known anti-cheat components (the game's loaded modules, its folder, running processes, kernel
+drivers; your own list is `safety.anticheat_blocklist`) and refuses with E1004 if it finds any.
+`--force` overrides this, only for games you own and know are safe offline. Don't use it on games with
+Easy Anti-Cheat, BattlEye, Vanguard or Hyperion. Only 64-bit games for now; 32-bit arrives with M7.
+
+Test app and scripts (build first):
+```
+build
+eleasein
+build\release\bin\rec_testapp.exe --vsync --seconds 60          a D3D11 window standing in for a game
+powershell -File tests\m1_attach_detach.ps1                       100 attach/detach cycles against it
+powershell -File tests\m1_robustness.ps1                          host killed, no-D3D process, Present1, anti-cheat
 ```
 Logs: `%LOCALAPPDATA%\rec\logs\rec.log`.
 

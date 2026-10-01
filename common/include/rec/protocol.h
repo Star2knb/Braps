@@ -34,6 +34,9 @@ enum class HookState : uint32_t {
     Detached,      // hooks removed; the DLL unloads next
 };
 
+// ControlBlock::error_code values that are not event numbers.
+constexpr uint32_t kErrProtocolMismatch = 1;  // the block's magic, version or size is not ours
+
 // Host -> hook commands (with the cmd event).
 enum class Command : uint32_t { None = 0, Detach = 1 };
 
@@ -71,7 +74,13 @@ struct alignas(64) ControlBlock {
     std::atomic<uint32_t> hook_cost_ns;    // our own time in the last Present (excluding the original)
     std::atomic<uint32_t> hook_cost_max_ns;
     std::atomic<uint32_t> attach_count;    // times a host attached to this DLL instance
-    uint32_t reserved[40];
+    // The swap chain being measured (the first one to present), set when `backend` is.
+    std::atomic<uint32_t> backbuffer_width;
+    std::atomic<uint32_t> backbuffer_height;
+    std::atomic<uint32_t> backbuffer_format;  // DXGI_FORMAT
+    std::atomic<uint32_t> present_ignored;    // Present calls from other swap chains (overlays)
+    std::atomic<uint64_t> hook_cost_total_ns;  // sum of hook_cost over present_count calls (host takes averages)
+    uint32_t reserved[34];
 };
 
 constexpr uint32_t kLogMagic = 0x474C4552;  // "RELG"
@@ -155,6 +164,8 @@ static_assert(sizeof(ControlBlock) == 256);
 static_assert(offsetof(ControlBlock, qpc_frequency) == 16);
 static_assert(offsetof(ControlBlock, host_heartbeat_qpc) == 32);
 static_assert(offsetof(ControlBlock, present_count) == 64);
+static_assert(offsetof(ControlBlock, backbuffer_width) == 96);
+static_assert(offsetof(ControlBlock, hook_cost_total_ns) == 112);
 static_assert(offsetof(LogRing, head) == 64 && offsetof(LogRing, seq) == 256);
 static_assert(sizeof(LogRing) == 256 + kLogCapacity * 8 + kLogCapacity * 64);
 

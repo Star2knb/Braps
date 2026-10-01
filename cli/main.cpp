@@ -9,6 +9,7 @@
 
 #include <CLI/CLI.hpp>
 
+#include "hook_commands.h"
 #include "rec/config.h"
 #include "rec/doctor.h"
 #include "rec/log.h"
@@ -17,7 +18,7 @@
 
 namespace {
 
-constexpr const char* kVersion = "0.1.0 (recorder milestone M0)";
+constexpr const char* kVersion = "0.2.0 (recorder milestone M1)";
 
 std::string u8(const std::filesystem::path& p) { return rec::to_utf8(p.wstring()); }
 
@@ -26,7 +27,8 @@ std::string u8(const std::filesystem::path& p) { return rec::to_utf8(p.wstring()
 struct RecordArgs {
     std::optional<int> fps, queue_mb, split_gb;
     std::optional<std::string> size, encoder, format, audio, mic, out, hotkey;
-    bool lock = true, sound = true;
+    bool lock = true, sound = true, force = false;
+    int duration = 0;
     CLI::Option* lock_opt = nullptr;
     CLI::Option* sound_opt = nullptr;
 
@@ -43,6 +45,8 @@ struct RecordArgs {
         sound_opt = cmd->add_flag("--sound,!--no-sound", sound, "start/stop sound cue");
         cmd->add_option("--queue-mb", queue_mb, "packet queue size in MB");
         cmd->add_option("--split-gb", split_gb, "split files every N GB (0 = only on FAT32)");
+        cmd->add_flag("--force", force, "hook even if anti-cheat is found (only for games you own and know are safe offline)");
+        cmd->add_option("--duration", duration, "detach and exit after this many seconds (0 = until Ctrl+C)")->check(CLI::NonNegativeNumber);
     }
 
     // Applies the given options onto cfg; false with a message on the first invalid one.
@@ -134,7 +138,9 @@ int main(int argc, char** argv) {
     attach->add_option("--name", name, "process name, e.g. javaw.exe")->excludes(pid_opt);
     attach_args.add_to(attach);
 
-    auto* detach = app.add_subcommand("detach", "unhook the game");
+    auto* detach = app.add_subcommand("detach", "unhook the game (default: every game that has the hook)");
+    detach->add_option("--pid", pid, "process id");
+    detach->add_option("--name", name, "process name");
 
     std::string bench_path, bench_size = "2GB";
     auto* bench_disk = app.add_subcommand("bench-disk", "measure sustained disk write speed");
@@ -222,14 +228,17 @@ int main(int argc, char** argv) {
         } else if (!ra.apply(&cfg, &error)) {
             status = fail(std::string("rec ") + (*launch ? "launch" : "attach") + ": " + error);
         } else {
-            std::printf("Recording settings:\n");
+            std::printf("Recording settings (recording itself arrives in recorder milestone M2):\n");
             print_record_settings(cfg);
-            status = not_yet(*launch ? "launch" : "attach", "M1");
+            rec_cli::HookCommandOptions options;
+            options.force = ra.force;
+            options.duration_s = ra.duration;
+            status = *launch ? rec_cli::cmd_launch(cfg, exe, game_args, options) : rec_cli::cmd_attach(cfg, pid, name, options);
         }
     } else if (*list) {
-        status = not_yet("list", "M1");
+        status = rec_cli::cmd_list();
     } else if (*detach) {
-        status = not_yet("detach", "M1");
+        status = rec_cli::cmd_detach(pid, name);
     } else if (*bench_disk) {
         status = not_yet("bench-disk", "M5");
     } else if (*bench_overhead) {

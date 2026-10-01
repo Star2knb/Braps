@@ -16,17 +16,25 @@ if(MSVC)
 endif()
 enable_testing()
 
+# The hook DLLs live inside other people's processes: static CRT, and so does everything they link.
+set(REC_HOOK_CRT "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
 add_subdirectory(third_party)
 add_subdirectory(common)
 
 if(CMAKE_SIZEOF_VOID_P EQUAL 8)
-    # x64: codec, host (rec_core + rec.exe), tests; later the 64-bit hook DLL and test app.
+    # x64: codec, host (rec_core + rec.exe), the 64-bit hook DLL, the test app, tests.
+    # rec.exe, rec_hook64.dll and rec_testapp.exe all land in <build>/bin: the host looks for the
+    # hook DLL next to itself.
     add_subdirectory(codec)
     add_subdirectory(core)
+    add_subdirectory(hook)
     add_subdirectory(cli)
+    add_subdirectory(testapp)
     add_subdirectory(tests)
 else()
-    # x86 (x86-* presets): only the 32-bit parts, which talk to the x64 host through `common`
+    # x86 (x86-* presets): only the 32-bit parts (hook DLL, injector helper), which talk to the x64 host through `common`
     # (recorder plan §2, X2). The codec is x64 only (codec plan §3.2).
+    add_subdirectory(hook)
     add_subdirectory(inject32)
 endif()
