@@ -290,3 +290,10 @@ CRC, RAW/SINGLE/HUFFMAN chunks, I/P/DUP). Build details: the libFuzzer that ship
 Studio is built for the static CRT, so the target uses `/MT` and disables the STL's ASan container
 annotations to match it; CMake links with `lld-link` directly, so the sanitizer runtimes are named
 explicitly.
+
+## Recorder
+
+**D-047 — Third-party versions.** Vendored in `third_party/` at pinned versions (details and kept
+files in `third_party/README.md`): CLI11 v2.7.2, toml++ v3.4.0, spdlog v1.17.0, MinHook v1.3.4, and
+kiero2 at commit `8f57dd9` — the commit reviewed in recorder plan §4.6.1, still `master` on
+2026-10-01. Only sources, headers and licences are kept; vendored files are never edited.
