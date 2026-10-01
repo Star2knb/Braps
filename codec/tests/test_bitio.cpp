@@ -1,6 +1,7 @@
 #include <vector>
 
 #include "bitio.h"
+#include "cpu.h"
 #include "crc32c.h"
 #include "testfw.h"
 
@@ -62,5 +63,18 @@ TEST_CASE("bitio: reader never runs past the end") {
 TEST_CASE("crc32c: check value") {
     const uint8_t s[] = {'1', '2', '3', '4', '5', '6', '7', '8', '9'};
     CHECK(crc32c(s, sizeof(s)) == 0xE3069283u);
+    CHECK(crc32c_scalar(s, sizeof(s)) == 0xE3069283u);
     CHECK(crc32c(s, 0) == 0);
+}
+
+TEST_CASE("crc32c: SSE4.2 equals the table version (lengths 0..300, every alignment)") {
+    if (!cpu_has_sse42()) return;
+    tf::Rng rng(5);
+    std::vector<uint8_t> buf(320);
+    for (auto& b : buf) b = rng.byte();
+    CHECK(crc32c_sse42(buf.data(), 9) == crc32c_scalar(buf.data(), 9));
+    for (size_t off = 0; off < 8; ++off)
+        for (size_t n = 0; n <= 300; ++n) CHECK(crc32c_sse42(buf.data() + off, n) == crc32c_scalar(buf.data() + off, n));
+    const uint8_t s[] = {'1', '2', '3', '4', '5', '6', '7', '8', '9'};
+    CHECK(crc32c_sse42(s, sizeof(s)) == 0xE3069283u);
 }

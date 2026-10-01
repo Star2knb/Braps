@@ -33,6 +33,7 @@ bool ThreadPool::start(int threads, StartFn on_start, void* user) {
     stop();
     threads_ = threads < 1 ? 1 : threads > kMaxThreads ? kMaxThreads : threads;
     quit_.store(false);
+    started_.store(0);
     try {
         workers_.reserve(size_t(threads_ - 1));
         for (int i = 1; i < threads_; ++i) workers_.emplace_back(&ThreadPool::worker_main, this, i, on_start, user);
@@ -41,6 +42,9 @@ bool ThreadPool::start(int threads, StartFn on_start, void* user) {
         threads_ = 1;
         return false;
     }
+    // Wait until every worker is running: a new thread's start-up allocates (the CRT's per-thread
+    // data), and that must be over before *_create returns, not during the first frame (A11).
+    for (int s; (s = started_.load()) != threads_ - 1;) started_.wait(s);
     return true;
 }
 
@@ -55,6 +59,8 @@ void ThreadPool::stop() {
 
 void ThreadPool::worker_main(int index, StartFn on_start, void* user) {
     if (on_start) on_start(user, index);
+    started_.fetch_add(1);
+    started_.notify_all();
     uint32_t seen = 0;
     for (;;) {
         if (!spin_until_changed(wake_, seen)) wake_.wait(seen);

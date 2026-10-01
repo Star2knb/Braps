@@ -426,6 +426,7 @@ rcv_status decode_coded_frame(rcv_decoder* d, const uint8_t* pkt, size_t size, b
     const uint32_t crc = get_u32(pkt + 28);
 
     if (flags & ~kKnownFlags) return RCV_ERR_BITSTREAM;
+    if ((pkt[17] & 0x80) || pkt[18] || pkt[19]) return RCV_ERR_BITSTREAM;  // reserved bits/bytes
     if (format > RCV_FMT_GBR || format != d->seq.format) return RCV_ERR_BITSTREAM;
     if (near_level > 3 || (near_level != 0) != ((flags & kFlagNear) != 0)) return RCV_ERR_BITSTREAM;
     if (near_level != 0 && format == RCV_FMT_GBR) return RCV_ERR_BITSTREAM;

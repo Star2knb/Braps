@@ -36,6 +36,12 @@ rcv_isa detect_isa() {
     return RCV_ISA_SCALAR;
 }
 
+bool cpu_has_sse42() {
+    int r[4];
+    __cpuid(r, 1);
+    return (r[2] >> 20) & 1;
+}
+
 rcv_status resolve_isa(rcv_isa requested, rcv_isa* out) {
     const rcv_isa best = detect_isa();
     if (requested == RCV_ISA_AUTO) {

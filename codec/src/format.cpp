@@ -21,6 +21,10 @@ void write_seq_header(const SeqHeader& h, uint8_t* o) {
 
 rcv_status parse_seq_header(const uint8_t* in, SeqHeader* h) {
     if (get_u32(in) != kSeqMagic || in[4] != kVersion) return RCV_ERR_BITSTREAM;
+    // Reserved fields must be zero (colour bit 7, offset 15, offsets 26-31).
+    if ((in[14] & 0x80) || in[15]) return RCV_ERR_BITSTREAM;
+    for (int i = 26; i < 32; ++i)
+        if (in[i]) return RCV_ERR_BITSTREAM;
     h->format = in[5];
     h->coded_w = get_u16(in + 6);
     h->coded_h = get_u16(in + 8);

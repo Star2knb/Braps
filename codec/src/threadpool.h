@@ -29,7 +29,8 @@ public:
     ThreadPool& operator=(const ThreadPool&) = delete;
 
     // Starts threads - 1 workers; the thread calling run() is worker 0. on_start runs first on
-    // each worker thread (workers 1..threads-1), e.g. to set priority and affinity.
+    // each worker thread (workers 1..threads-1), e.g. to set priority and affinity. Returns once
+    // every worker has started and its on_start has returned.
     // Allocates and may fail: call only from *_create. Returns false if a thread can't be created.
     bool start(int threads, StartFn on_start, void* user);
     void stop();
@@ -59,6 +60,7 @@ private:
     alignas(64) std::atomic<int> remaining_{0};  // jobs of the current dispatch not yet finished
     alignas(64) std::atomic<uint32_t> wake_{0};  // bumped per dispatch; idle workers wait on it
     std::atomic<bool> quit_{false};
+    std::atomic<int> started_{0};  // workers that have finished starting up
 };
 
 #ifdef _MSC_VER
