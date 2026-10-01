@@ -46,3 +46,14 @@ build\release\codec\rcv_bench.exe -i corpus\minecraft_1360x744.yuv -s 1360x744 -
 powershell -File codec\bench\compare_baselines.ps1 -Yuv corpus\minecraft_1360x744.yuv -Size 1360x744 -Fraps "Minecraft ....avi"
 ```
 `rcv_bench` pins itself to one CPU and prints the machine's power state; run on AC power.
+
+## Fuzzing
+The decoder fuzzer (libFuzzer + ASan + UBSan) builds with the clang-cl preset:
+```
+build.bat clang-debug
+build\clang-debug\codec\rcv_fuzz_seeds.exe corpus\fuzz_seeds
+cd corpus
+..\build\clang-debug\codec\rcv_fuzz.exe -max_total_time=3600 -timeout=10 -artifact_prefix=fuzz_artifacts\ fuzz_corpus fuzz_seeds
+```
+Create `fuzz_corpus` and `fuzz_artifacts` first; a crash is saved to `fuzz_artifacts\` and can be
+replayed with `rcv_fuzz.exe <file>`.

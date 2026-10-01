@@ -251,3 +251,42 @@ index out of range or overflow.
 **D-041 — Verifying near-lossless streams.** `rcv_cli verify` allows the largest NEAR seen so far
 (header byte 9; a DUP carries none) and reports the maximum error per plane; `rcv_bench --near`
 checks every frame against its own NEAR.
+
+## M8
+
+**D-042 — CRC-32C.** The SSE4.2 `crc32` instruction, one 8-byte stream, chosen once at load time
+from CPUID (the checksum is identical either way; the table version remains for CPUs without
+SSE4.2). Measured 0.16 ms per MB against 2.5 ms for the table, so a 3-stream interleave with CRC
+combining isn't worth its complexity, especially as the checksum is off by default.
+
+**D-043 — Reserved fields.** The decoder rejects non-zero reserved bits and bytes: sequence header
+colour bit 7, byte 15 and bytes 26–31; frame header colour bit 7 and bytes 18–19 (chunk header
+bytes 2–3 already were, D-008 covers code tables). The encoder always writes zeros, and a future
+format change bumps the version, so strictness costs nothing and keeps garbage from passing as valid.
+
+**D-044 — Thread start-up belongs to create.** `ThreadPool::start` returns only when every worker is
+running and its `on_worker_start` hook has returned. A new thread allocates on its first run (the
+CRT's per-thread data, ~2 KB), which otherwise could land inside the first encode or decode call;
+the debug allocation test found this (A11). It also guarantees the caller's priority/affinity
+settings are in place before the first frame.
+
+**D-045 — Allocation test method (A11).** `test_alloc.cpp` replaces every global `operator new` and
+`operator delete` in the test binary with counting versions; the codec allocates only through
+`operator new` (`aligned_buffer.h`), so this sees all of its allocations in every build. Debug
+builds also install `_CrtSetAllocHook`, which sees every CRT heap allocation from any module and
+thread (malloc, `_aligned_malloc`, the CRT's own blocks). Counted: encode I/P/DUP/forced-I/near/
+RAW/SINGLE frames, `rcv_encode_duplicate`, rejected calls, decode to every output layout and to none,
+corrupt packets, NO_REFERENCE after a reset; 1 and 4 threads, I420/NV12/BGRA input, CRC on and off.
+
+**D-046 — Fuzzing (A12).** `rcv_fuzz` (clang-debug preset only) fuzzes the decoder with libFuzzer,
+ASan and UBSan (`-fno-sanitize-recover=all`, so UBSan findings are crashes). Input: a sequence
+header, an options byte (decoder threads, output layout, padded strides), then up to 16
+length-prefixed packets, so P-frames and DUPs see real references. Sizes above 65,536 samples are
+skipped to keep each input fast; every packet and output plane is copied into an exactly-sized heap
+block so ASan catches any access past it. The harness also traps if the sequence-header parser and
+`rcv_decoder_create` disagree, or on an unexpected status. Seeds come from `rcv_fuzz_seeds` (56
+valid streams: both formats, odd and even sizes, both predictors, 1/default/max slices, NEAR 0–3,
+CRC, RAW/SINGLE/HUFFMAN chunks, I/P/DUP). Build details: the libFuzzer that ships with Visual
+Studio is built for the static CRT, so the target uses `/MT` and disables the STL's ASan container
+annotations to match it; CMake links with `lld-link` directly, so the sanitizer runtimes are named
+explicitly.
