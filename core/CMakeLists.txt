@@ -10,8 +10,16 @@ add_library(rec_core STATIC
     src/inject.cpp
     src/hooklink.cpp
     src/watch.cpp
+    src/frame_tools.cpp
+    src/hotkeys.cpp
+    src/session.cpp
+    src/disk_file.cpp
+    src/avi.cpp
+    src/pipeline.cpp
+    src/avi_tools.cpp
+    src/scheduling.cpp
 )
 target_include_directories(rec_core PUBLIC include)
 target_link_libraries(rec_core
-    PUBLIC rec_common spdlog
-    PRIVATE tomlplusplus rcv dxgi mfplat mfuuid ole32 shell32 psapi)
+    PUBLIC rec_common spdlog rcv
+    PRIVATE tomlplusplus dxgi mfplat mfuuid ole32 shell32 psapi user32 winmm)

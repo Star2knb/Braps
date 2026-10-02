@@ -9,16 +9,18 @@
 
 #include <CLI/CLI.hpp>
 
+#include "file_commands.h"
 #include "hook_commands.h"
 #include "rec/config.h"
 #include "rec/doctor.h"
 #include "rec/log.h"
 #include "rec/options.h"
 #include "rec/paths.h"
+#include "rec/version.h"
 
 namespace {
 
-constexpr const char* kVersion = "0.2.0 (recorder milestone M1)";
+const char* const kVersion = rec::kVersionLabel;
 
 std::string u8(const std::filesystem::path& p) { return rec::to_utf8(p.wstring()); }
 
@@ -28,7 +30,9 @@ struct RecordArgs {
     std::optional<int> fps, queue_mb, split_gb;
     std::optional<std::string> size, encoder, format, audio, mic, out, hotkey;
     bool lock = true, sound = true, force = false;
-    int duration = 0;
+    int duration = 0, record_for = 0;
+    std::string save_frame;
+    int save_frame_index = 30;
     CLI::Option* lock_opt = nullptr;
     CLI::Option* sound_opt = nullptr;
 
@@ -47,6 +51,11 @@ struct RecordArgs {
         cmd->add_option("--split-gb", split_gb, "split files every N GB (0 = only on FAT32)");
         cmd->add_flag("--force", force, "hook even if anti-cheat is found (only for games you own and know are safe offline)");
         cmd->add_option("--duration", duration, "detach and exit after this many seconds (0 = until Ctrl+C)")->check(CLI::NonNegativeNumber);
+        cmd->add_option("--record-for", record_for, "record this many seconds as soon as the game presents, then exit (for scripts)")
+            ->check(CLI::NonNegativeNumber)
+            ->group("");
+        cmd->add_option("--save-frame", save_frame, "write one captured frame of the recording as a PNG (test aid)")->group("");
+        cmd->add_option("--save-frame-index", save_frame_index, "which captured frame to save (0-based, default 30)")->check(CLI::NonNegativeNumber)->group("");
     }
 
     // Applies the given options onto cfg; false with a message on the first invalid one.
@@ -161,8 +170,12 @@ int main(int argc, char** argv) {
     convert->add_option("--crf", crf, "x264 quality");
     convert->add_option("--out", convert_out, "output file");
 
+    bool verify_testapp = false;
+    std::string verify_source;
     auto* verify = app.add_subcommand("verify", "decode every frame and check the file structure");
     verify->add_option("in", in_file, "recording (.avi)")->required();
+    verify->add_flag("--testapp", verify_testapp, "also read rec_testapp's frame-counter barcode and check continuity");
+    verify->add_option("--source", verify_source, "the game's window size for the barcode, e.g. 1366x745 (default: from the file)");
     auto* repair = app.add_subcommand("repair", "rebuild a recording's indexes after a crash");
     repair->add_option("in", in_file, "recording (.avi)")->required();
 
@@ -228,11 +241,14 @@ int main(int argc, char** argv) {
         } else if (!ra.apply(&cfg, &error)) {
             status = fail(std::string("rec ") + (*launch ? "launch" : "attach") + ": " + error);
         } else {
-            std::printf("Recording settings (recording itself arrives in recorder milestone M2):\n");
+            std::printf("Recording settings:\n");
             print_record_settings(cfg);
             rec_cli::HookCommandOptions options;
             options.force = ra.force;
             options.duration_s = ra.duration;
+            options.record_for_s = ra.record_for;
+            options.save_frame = ra.save_frame;
+            options.save_frame_index = uint64_t(ra.save_frame_index);
             status = *launch ? rec_cli::cmd_launch(cfg, exe, game_args, options) : rec_cli::cmd_attach(cfg, pid, name, options);
         }
     } else if (*list) {
@@ -244,9 +260,9 @@ int main(int argc, char** argv) {
     } else if (*bench_overhead) {
         status = not_yet("bench-overhead", "M4");
     } else if (*convert) {
-        status = not_yet("convert", "M3");
+        status = rec_cli::cmd_convert(in_file, convert_to, crf, convert_out);
     } else if (*verify) {
-        status = not_yet("verify", "M3");
+        status = rec_cli::cmd_verify(in_file, verify_testapp, verify_source);
     } else if (*repair) {
         status = not_yet("repair", "M7");
     }

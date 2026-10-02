@@ -12,6 +12,9 @@ namespace rec_cli {
 struct HookCommandOptions {
     bool force = false;   // --force: go ahead although anti-cheat was found
     int duration_s = 0;   // --duration: detach and exit after this many seconds
+    int record_for_s = 0;           // --record-for: record this long as soon as the game presents, then exit (scripts)
+    std::string save_frame;         // --save-frame: write one captured frame as a PNG (test aid)
+    uint64_t save_frame_index = 30; // ... frame number (0-based)
 };
 
 int cmd_list();

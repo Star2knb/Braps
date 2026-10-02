@@ -13,6 +13,7 @@
 #include "rec/log.h"
 #include "rec/paths.h"
 #include "rec/procscan.h"
+#include "rec/scheduling.h"
 #include "rec/watch.h"
 
 namespace rec_cli {
@@ -77,6 +78,10 @@ int hook_and_watch(const rec::Target& target, rec::HookLink& link, const rec::Co
     watch.duration_s = options.duration_s;
     watch.force = options.force;
     watch.blocklist = cfg.safety.anticheat_blocklist;
+    watch.config = &cfg;
+    watch.record_for_s = options.record_for_s;
+    if (!options.save_frame.empty()) watch.save_frame = rec::from_utf8(options.save_frame);
+    watch.save_frame_index = options.save_frame_index;
     const rec::WatchEnd end = rec::watch_hooked_game(target, link, watch, g_stop);
     std::printf("%s\n", end_text(end));
     return end == rec::WatchEnd::HookFailed ? 1 : end == rec::WatchEnd::AnticheatFound ? 1 : 0;
@@ -122,6 +127,7 @@ int cmd_list() {
 
 int cmd_launch(const rec::Config& cfg, const std::string& exe, const std::vector<std::string>& game_args,
                const HookCommandOptions& options) {
+    rec::disable_power_throttling();
     const std::filesystem::path path = std::filesystem::absolute(rec::from_utf8(exe));
     std::error_code ec;
     if (!std::filesystem::exists(path, ec)) return fail("rec launch: can't find " + exe);
@@ -169,6 +175,7 @@ int cmd_launch(const rec::Config& cfg, const std::string& exe, const std::vector
 
 int cmd_attach(const rec::Config& cfg, std::optional<unsigned> pid_arg, const std::optional<std::string>& name,
                const HookCommandOptions& options) {
+    rec::disable_power_throttling();
     std::string error;
     uint32_t pid = 0;
     if (!resolve_pid(pid_arg, name, &pid, &error)) return fail("rec attach: " + error);

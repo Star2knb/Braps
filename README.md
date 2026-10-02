@@ -21,7 +21,9 @@ unchanged in [legacy/](legacy/) for reference; it is not part of the V2 build.
 | RCV1 codec | M9 — final report, all criteria | done — [report](docs/reports/M9-final.md): files 41% smaller than FRAPS, 1.7 ms/frame on 2 threads |
 | Recorder | M0 — layout, CMake x64/x86, CLI skeleton, logging, `rec doctor` | done — [report](docs/reports/recorder-M0.md) |
 | Recorder | M1 — test app, injection, kiero2 + MinHook `Present` hook (measuring only), `rec list` | done — [report](docs/reports/recorder-M1.md) |
-| Recorder | M2 — D3D11 capture (copy, scale, NV12 shader, staging ring), shared frame ring, F9 hotkey | next |
+| Recorder | M2 — D3D11 capture (scale + NV12 shader, staging ring), shared frame ring, F9 hotkey and cue | done — [report](docs/reports/recorder-M2.md): 0.3 ms median hook time per captured frame, stop in 0.1–0.3 s |
+| Recorder | M3 — RCV1 encoder, timeline with DUP filling, lock/free pacing, AVI writer, `rec verify`, `rec convert` | done — [report](docs/reports/recorder-M3.md): lossless 720p60 recordings, 9.2:1 on the test app, nothing lost; Minecraft not yet tried |
+| Recorder | M4 — OpenGL backend (PBO read-back) and host BGRA→I420 conversion; overhead A/B against FRAPS | next |
 
 ## Build
 Requires Visual Studio (2022 or 2026) with "Desktop development with C++".
@@ -43,11 +45,30 @@ rec list                             processes with Direct3D / OpenGL / Vulkan l
 rec launch game.exe [-- game args]   start a game with the hook in before it creates its device
 rec attach --pid N | --name X.exe    hook a running game
 rec detach [--pid N | --name X.exe]  remove the hook (default: from every game that has it)
-rec --help                           all commands (record, convert, ... arrive with later milestones)
+rec verify FILE.avi [--testapp]      check a recording: structure, indexes, every frame decoded
+rec convert FILE.avi [--to mp4|mkv] [--crf 16] [--out FILE]   decode and encode with FFmpeg (video only)
+rec --help                           all commands (repair, bench-disk, ... arrive with later milestones)
 ```
-Since M1 the hook only measures: `launch`/`attach` show the game's frame rate and the hook's own cost
-per frame; recording arrives with M2. Ctrl+C removes the hook and exits; the game keeps running.
-Options: `--duration S` (detach and exit after S seconds), `--force` (see below).
+`launch`/`attach` show the game's frame rate and the hook's own cost per frame. **F9 starts and stops
+recording** (hotkey and sound cue configurable with `--hotkey` / `--no-sound`). Each recording is a
+lossless RCV1 video in an AVI file, `<Game> YYYY-MM-DD HH-MM-SS-cc.avi` in `record.out_dir` (default
+`%USERPROFILE%\Videos\rec`, or `--out DIR`), with `.frames.csv` (one row per frame), `.summary.json` and
+`.log` beside it. Works with Direct3D 11 games, windowed or fullscreen, 64-bit. By default the game is
+**locked** to the recording's frame rate (`--no-lock` lets it run free); frames the game didn't present
+on time become repeated frames, so the file always has a constant frame rate. Ctrl+C stops a running
+recording, removes the hook and exits; the game keeps running.
+Options: `--duration S` (detach and exit after S seconds), `--force` (see below), `--record-for S` (start
+a recording by itself, for scripts), `--save-frame file.png` (write one captured frame as a picture).
+No audio yet (M6), no OpenGL / D3D9 / D3D12 / Vulkan (M4, M8, M10), no 32-bit games (M7).
+
+**Disk.** Recordings are written with large unbuffered writes and are already compressed, so `rec` creates
+them without NTFS compression even in a compressed folder (letting NTFS compress them again cut a drive's
+speed from ~390 MB/s to ~27 MB/s and starved the encoder). Lossless 720p60 needs 5–15 MB/s in games, more in
+busy scenes; `rec doctor` shows the drive and free space.
+
+**CPU.** A game can use every core and starve the recorder, which then loses frames. `rec`'s encoder
+threads run at above-normal priority and opt out of Windows power throttling (`record.encoder_priority =
+"normal"` turns the priority off).
 
 **Anti-cheat.** Injecting into a game protected by anti-cheat can get your account banned. `rec` looks
 for known anti-cheat components (the game's loaded modules, its folder, running processes, kernel
@@ -62,6 +83,8 @@ eleasein
 build\release\bin\rec_testapp.exe --vsync --seconds 60          a D3D11 window standing in for a game
 powershell -File tests\m1_attach_detach.ps1                       100 attach/detach cycles against it
 powershell -File tests\m1_robustness.ps1                          host killed, no-D3D process, Present1, anti-cheat
+powershell -File tests\m2_capture.ps1                             capture, F9 in a window and in fullscreen, leaks (presses F9!)
+powershell -File tests\m3_record.ps1 [-SoakMinutes 5]             recordings: nothing lost, freeze, slower game, verify, FFmpeg
 ```
 Logs: `%LOCALAPPDATA%\rec\logs\rec.log`.
 

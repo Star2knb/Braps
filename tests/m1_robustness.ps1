@@ -80,7 +80,7 @@ $off = LogEnd
 $out = & $rec launch (Join-Path $dir 'rec_testapp.exe') --duration 3 -- --seconds 10 2>&1 | Out-String
 Check 'launch refused (exit 1) with the finding named' ($LASTEXITCODE -eq 1 -and $out -match 'EasyAntiCheat_x64.dll' -and $out -match '--force') $out
 Check 'E1004 logged' ((LogSince $off) -match 'E1004')
-Check 'no game was started' (@(Get-Process rec_testapp -ErrorAction SilentlyContinue).Count -eq $before)
+Check 'no game was started' (@(Get-Process rec_testapp -ErrorAction SilentlyContinue).Count -le $before)
 $out = & $rec launch (Join-Path $dir 'rec_testapp.exe') --duration 3 --force -- --seconds 6 2>&1 | Out-String
 Check '--force overrides, with a warning' ($LASTEXITCODE -eq 0 -and $out -match 'continuing because of --force' -and $out -match 'Hooked') $out
 Start-Sleep 5

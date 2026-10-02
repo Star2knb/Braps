@@ -26,7 +26,7 @@ TEST_CASE("config: defaults are the plan's and pass validation") {
     CHECK(c.hotkeys.toggle == "F9");
     CHECK(c.rate.levels.size() == 4);
     CHECK(c.safety.anticheat_blocklist.size() == 5);
-    CHECK(config_keys().size() == 24);
+    CHECK(config_keys().size() == 25);
 }
 
 TEST_CASE("config: save and load round trip, missing file gives defaults") {

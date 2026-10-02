@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cwchar>
 
+#include "capture_d3d11.h"
 #include "dxgi_hook.h"
 #include "hlog.h"
 #include "hook_state.h"
@@ -202,6 +203,7 @@ void try_install(bool* installed, bool* waiting_logged) {
         set_state(proto::HookState::Detached);
         ExitThread(0);
     }
+    capture_shutdown();
     MH_Uninitialize();
     unregister_notification();
     log_text(Level::Info, "detached");

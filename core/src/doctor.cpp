@@ -172,7 +172,14 @@ CheckResult check_output_dir(const std::filesystem::path& dir) {
     CloseHandle(h);  // deletes the probe
     if (!ok) return fail("Output folder", shown + ": write failed", "rec config set record.out_dir <folder>");
     std::error_code ec;
-    return pass("Output folder", shown + (std::filesystem::is_directory(dir, ec) ? " (writable)" : " (will be created)"));
+    const DWORD attributes = GetFileAttributesW(base.c_str());
+    if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_ENCRYPTED))
+        return warn("Output folder", shown + ": encrypted (EFS)", "recordings written here are slow; choose another folder: rec config set record.out_dir <folder>");
+    std::string detail = shown + (std::filesystem::is_directory(dir, ec) ? " (writable)" : " (will be created)");
+    // NTFS compression on the folder is not a problem for rec (it writes its files uncompressed), but it is
+    // for anything else written there, and it is a likely reason for slow video if another tool records here.
+    if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_COMPRESSED)) detail += ", NTFS-compressed: rec writes recordings uncompressed";
+    return pass("Output folder", detail);
 }
 
 std::vector<CheckResult> check_volume(const Config& cfg, const std::filesystem::path& dir) {

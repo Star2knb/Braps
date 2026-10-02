@@ -8,6 +8,7 @@
 
 #include <atomic>
 
+#include "capture_d3d11.h"
 #include "hlog.h"
 #include "hook_state.h"
 #include "locate.h"
@@ -52,6 +53,20 @@ uint32_t api_of(IDXGISwapChain* sc, const char** name) {
     return proto::kApiDXGI;
 }
 
+// Refresh rate of the monitor the game window is on (the frame-rate cap, §6.2); 0 if unknown.
+uint32_t refresh_rate_of(const DXGI_SWAP_CHAIN_DESC& desc) {
+    if (!desc.Windowed && desc.BufferDesc.RefreshRate.Denominator)
+        return uint32_t(double(desc.BufferDesc.RefreshRate.Numerator) / double(desc.BufferDesc.RefreshRate.Denominator) + 0.5);
+    HMONITOR monitor = MonitorFromWindow(desc.OutputWindow, MONITOR_DEFAULTTONEAREST);
+    MONITORINFOEXW info{};
+    info.cbSize = sizeof(info);
+    if (!monitor || !GetMonitorInfoW(monitor, &info)) return 0;
+    DEVMODEW mode{};
+    mode.dmSize = sizeof(mode);
+    if (!EnumDisplaySettingsW(info.szDevice, ENUM_CURRENT_SETTINGS, &mode)) return 0;
+    return mode.dmDisplayFrequency > 1 ? mode.dmDisplayFrequency : 0;
+}
+
 // Decides whether `sc` is (now) the swap chain to measure. If it is, publishes its description.
 bool adopt_swapchain(IDXGISwapChain* sc, uint64_t now) {
     if (sc == g_rejected) return false;
@@ -75,41 +90,62 @@ bool adopt_swapchain(IDXGISwapChain* sc, uint64_t now) {
     c->backbuffer_height.store(desc.BufferDesc.Height);
     c->backbuffer_format.store(uint32_t(desc.BufferDesc.Format));
     c->last_present_qpc.store(0);  // no frame interval across a change of chain
+    const uint32_t hz = refresh_rate_of(desc);
+    c->display_refresh_hz.store(hz);
     c->backend.store(api, std::memory_order_release);
+    if (hz) log_event(Ev::DisplayRefresh, "monitor refresh %u Hz", hz);
     log_event(Ev::BackendSelected, "%s %ux%u fmt=%u locate=%llums", name, desc.BufferDesc.Width,
               desc.BufferDesc.Height, uint32_t(desc.BufferDesc.Format), g_locate_us / 1000);
     return true;
 }
 
 // The measuring itself. Runs inside the SEH guard of measure().
-void measure_inner(IDXGISwapChain* sc, uint64_t now) {
+uint64_t measure_inner(IDXGISwapChain* sc, uint64_t now) {
     proto::ControlBlock* c = g.ctl;
     if (sc != g_main.load(std::memory_order_acquire) && !adopt_swapchain(sc, now)) {
         c->present_ignored.fetch_add(1, std::memory_order_relaxed);
-        return;
+        return 0;
     }
     const uint64_t previous = c->last_present_qpc.exchange(now, std::memory_order_relaxed);
-    if (previous) c->frame_time_us.store(uint32_t((now - previous) * 1000000ull / uint64_t(g.qpc_freq)), std::memory_order_relaxed);
-    c->present_count.fetch_add(1, std::memory_order_relaxed);
+    uint32_t frame_time_us = 0;
+    if (previous) {
+        frame_time_us = uint32_t((now - previous) * 1000000ull / uint64_t(g.qpc_freq));
+        c->frame_time_us.store(frame_time_us, std::memory_order_relaxed);
+    }
+    const uint64_t count = c->present_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    // The back buffer's size changes with the window and with fullscreen switches: keep it current for the host.
+    if ((count & 31) == 0) {
+        DXGI_SWAP_CHAIN_DESC desc{};
+        if (SUCCEEDED(sc->GetDesc(&desc))) {
+            c->backbuffer_width.store(desc.BufferDesc.Width, std::memory_order_relaxed);
+            c->backbuffer_height.store(desc.BufferDesc.Height, std::memory_order_relaxed);
+        }
+    }
+    // Recording: one atomic load unless the host asked for it.
+    if (c->backend.load(std::memory_order_relaxed) == proto::kApiD3D11) return capture_on_present(sc, now, frame_time_us);
+    return 0;
 }
 
 // An exception in our code disables measuring for good and the game carries on (§13.2).
 void on_exception(DWORD code) {
     g.enabled.store(false, std::memory_order_release);
+    capture_on_exception();
     g.ctl->error_code.store(event_number(Ev::HookException), std::memory_order_relaxed);
     log_event(Ev::HookException, "exception 0x%08lX in Present", code);
 }
 
 void measure(IDXGISwapChain* sc) {
     const uint64_t t0 = qpc();
+    uint64_t held = 0;  // the deliberate wait of lock mode
     __try {
-        measure_inner(sc, t0);
+        held = measure_inner(sc, t0);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
         on_exception(GetExceptionCode());
         return;
     }
     // Our own cost: entry to just before the original Present. (The part after it is a decrement.)
-    const uint32_t cost_ns = uint32_t((qpc() - t0) * 1000000000ull / uint64_t(g.qpc_freq));
+    const uint64_t spent = qpc() - t0;
+    const uint32_t cost_ns = uint32_t((spent > held ? spent - held : 0) * 1000000000ull / uint64_t(g.qpc_freq));
     proto::ControlBlock* c = g.ctl;
     c->hook_cost_ns.store(cost_ns, std::memory_order_relaxed);
     c->hook_cost_total_ns.fetch_add(cost_ns, std::memory_order_relaxed);

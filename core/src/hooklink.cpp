@@ -189,6 +189,11 @@ HookStats HookLink::sample() {
     s.error_code = c->error_code.load();
     s.ignored = c->present_ignored.load();
     s.hook_cost_max_us = double(c->hook_cost_max_ns.exchange(0)) / 1000.0;
+    s.capture_state = proto::CaptureState(c->capture_state.load());
+    s.display_refresh_hz = c->display_refresh_hz.load();
+    s.frames_captured = c->frames_captured.load();
+    s.gpu_backlog = c->gpu_backlog_skips.load();
+    s.ring_drops = c->ring_full_drops.load();
 
     const uint64_t now = qpc_now();
     const uint64_t beat = c->hook_heartbeat_qpc.load();

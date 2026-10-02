@@ -54,6 +54,14 @@ These are one machine, one synthetic scene; nothing here says how a real game be
   Matching now requires the entry at the start of a name or after a non-alphanumeric character (D-061);
   covered by a test.
 
+## On a real game (added after M2 started)
+
+`rec attach --name Minecraft.Windows.exe --duration 60`, run twice by the user on Minecraft Bedrock
+(a local world): both times the hook went in, selected D3D11 (back buffer 1366x745, format 28), ran for
+60 s and detached cleanly; the user reported the game stayed smooth. The first run had FRAPS loaded in the
+game (`I1102 overlays_detected fraps64.dll`: two Present hooks chained without trouble), the second
+did not. The frame-rate and hook-cost numbers shown in the terminal were not captured.
+
 ## Known limits
 
 - **Not tried on a real game.** Everything above is the synthetic test app, a console process and

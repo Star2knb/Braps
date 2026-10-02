@@ -25,6 +25,9 @@ struct HookStats {
     double hook_cost_us = 0;   // average own time per Present since the previous sample
     double hook_cost_max_us = 0;  // worst since the previous sample
     bool hook_alive = false;   // the hook's heartbeat is recent
+    proto::CaptureState capture_state = proto::CaptureState::Off;
+    uint32_t display_refresh_hz = 0;
+    uint64_t frames_captured = 0, gpu_backlog = 0, ring_drops = 0;
 };
 
 class HookLink {
@@ -40,6 +43,7 @@ public:
     static std::unique_ptr<HookLink> open_existing(uint32_t game_pid, std::string* error);
 
     uint32_t game_pid() const { return pid_; }
+    proto::ControlBlock* control() { return ctl_; }
 
     // The host that owned the objects before a takeover (0 if none): lets the caller refuse to take
     // a game away from another rec that is still running.

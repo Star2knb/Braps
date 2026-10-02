@@ -37,6 +37,7 @@ enum class Subsystem : uint8_t { Hook = 1, Transport = 2, Encoder = 3, Disk = 4,
     X(BackbufferResized, "I1208", "backbuffer_resized", "Back buffer resized")                              \
     X(DeviceRemoved, "E1209", "device_removed", "Device removed or reset")                                  \
     X(GameStall, "W1210", "game_stall", "Game frame time above 4 x T or 250 ms")                            \
+    X(CaptureFailed, "E1211", "capture_failed", "Frame capture failed; capture disabled (added in M2)")     \
     X(DisplayRefresh, "I1301", "display_refresh", "Display refresh rate (frame-rate cap)")                  \
     X(PacingError, "W1301", "pacing_error", "Capture tick more than 1 ms late")                             \
     X(HostLost, "E1401", "host_lost", "Host stopped responding; capture idle")                              \
@@ -46,6 +47,7 @@ enum class Subsystem : uint8_t { Hook = 1, Transport = 2, Encoder = 3, Disk = 4,
     X(RateLevelChange, "W3101", "rate_level_change", "Rate-control level changed")                          \
     X(EncoderOverloaded, "W3102", "encoder_overloaded", "Average encode time above budget")                 \
     X(SlowEncode, "W3103", "slow_encode", "Frame encode longer than the frame interval")                    \
+    X(PacketQueueFull, "W3104", "packet_queue_full", "Packet queue full; frame dropped (added in M3)")      \
     X(DiskMayBeTooSlow, "W4001", "disk_may_be_too_slow", "Disk benchmark below 1.2x the needed rate")       \
     X(SlowWrite, "W4101", "slow_write", "Write latency above slow_write_ms")                                  \
     X(VerySlowWrite, "E4102", "very_slow_write", "Write latency above very_slow_write_ms")                  \

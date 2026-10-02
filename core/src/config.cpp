@@ -30,6 +30,7 @@ const Field kFields[] = {
     REC_FIELD("record", "lock", Kind::Bool, record.lock),
     REC_FIELD("record", "encoder", Kind::Str, record.encoder),
     REC_FIELD("record", "format", Kind::Str, record.format),
+    REC_FIELD("record", "encoder_priority", Kind::Str, record.encoder_priority),
     REC_FIELD("record", "out_dir", Kind::Str, record.out_dir),
     REC_FIELD("record", "split_gb", Kind::Int, record.split_gb),
     REC_FIELD("record", "queue_mb", Kind::Int, record.queue_mb),
@@ -198,6 +199,8 @@ std::vector<std::string> validate_config(const Config& c) {
         e.push_back("record.size = \"" + c.record.size + "\": use WxH with even sizes from 16 to 8192, or native");
     if (!one_of(c.record.encoder, {"rcv", "rcv-strict", "hw"}))
         e.push_back("record.encoder = \"" + c.record.encoder + "\": use rcv, rcv-strict or hw");
+    if (!one_of(c.record.encoder_priority, {"normal", "above-normal"}))
+        e.push_back("record.encoder_priority = \"" + c.record.encoder_priority + "\": use normal or above-normal");
     if (!one_of(c.record.format, {"yuv420", "rgb"}))
         e.push_back("record.format = \"" + c.record.format + "\": use yuv420 or rgb");
     if (c.record.out_dir.empty()) e.push_back("record.out_dir is empty");

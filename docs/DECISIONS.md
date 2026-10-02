@@ -415,3 +415,194 @@ processes with D3D9/10/11/12, OpenGL or Vulkan loaded (DXGI alone is not enough)
 **D-064 — Test app.** `rec_testapp` draws with `ClearView` on rectangles (no shaders yet): a 32-bit
 frame-counter barcode and moving colour bars. d3d11.dll and dxgi.dll are delay-loaded so that
 `rec launch` can be tested on the deferred install (`--late-load-ms`).
+
+## Recorder M2
+
+**D-065 — Protocol version 2.** The control block grew to 512 bytes: the recording configuration
+(tick rate, output size, slot counts, `t0`), the session state the host wants (`host_state`: idle /
+recording / stopping) and the state the hook reports (`capture_state`), and the capture counters.
+The host writes the configuration and then publishes it with `host_state` (release/acquire). Each
+recording has its own frame ring and semaphore, named by `rec_generation`
+(`Local\rec_<pid>_f<generation>`), so a new recording never meets the objects of the last one.
+A hook of version 1 left in a game is refused by a version 2 host ("not compatible").
+
+**D-066 — NV12 slot layout.** In a ring slot the UV plane follows the Y plane directly (offset
+`64 + w*h`, no padding), so the whole frame is one contiguous `w x 3h/2` block, which is how the GPU
+pass produces it and how the worker copies it.
+
+**D-067 — One conversion pass.** The plan's two passes (Y, then UV) became one draw into a single
+`R8_UNORM` target of `w x 3h/2` texels: rows below `h` are luma, the next `h/2` rows are the
+interleaved chroma bytes (Cb on even columns, Cr on odd). Measured: fewer state changes and one
+staging copy instead of two cut the GPU-issue time of the hook from ~440 µs to ~280 µs per frame. The
+chroma bytes are sampled four times each (twice the chroma work of two passes; negligible on the GPU).
+The shader is the BT.601 full-range formula of the codec plan §4.3; on the test app's colour bars the
+captured values differ from the formula by at most 1/255 (checked on every frame of the test).
+
+**D-068 — Staging slots: default 6, range 2–8.** The plan's default of 3 gave W1201 about 14 times a
+second on a vsync-locked 60 fps game: the GPU finishes our copy 4–5 `Present`s after we issue it (the
+flip-model frame queue lets the CPU run up to 3 frames ahead), so one capture per frame needs 5–6
+slots in flight. `record.staging_slots` defaults to 6 now; each slot is one NV12 texture (1.4 MB at
+720p).
+
+**D-069 — Copy worker thread (the plan's optional optimisation, enabled).** Reading mapped staging
+memory costs ~600 µs per 720p frame on this laptop's Intel GPU (the driver maps its pages on demand;
+streaming loads did not help), which on the render thread would alone exceed the P2 target. So the
+render thread only `Map`s (DO_NOT_WAIT, after the query says the GPU is done), a worker thread copies
+into the shared ring, and the next `Present` unmaps and publishes the slot (one more `Present` of
+latency). The worker touches only memory, never D3D, and its copy runs under SEH so a mapping that
+disappears (device removed) disables capture instead of killing the game. The `hook_cost_us` of a frame
+counts the render thread's time only; the worker's ~0.6 ms per frame (about 4% of one core at 60 fps)
+runs on another thread inside the game's process and is reported here, not in P2.
+
+**D-070 — Not disturbing the game.** Our draw runs inside our own `ID3DDeviceContextState` swapped in
+with `SwapDeviceContextState` (swapping costs ~4 µs) and swapped back, so the game's pipeline state is
+untouched. The sequence is also bracketed by `ID3D11Multithread::Enter/Leave` when the device has it,
+so a game that presents from a different thread than it renders on can't have its immediate-context
+calls interleaved with ours; an exception inside the sequence releases the lock before the hook
+disables itself.
+
+**D-071 — Source formats.** The back buffer is copied to a typeless texture and viewed as UNORM, so the
+values are the encoded ones the screen shows (an sRGB view would linearise them). B8G8R8A8, R8G8B8A8
+(UNORM, sRGB, typeless) and R10G10B10A2 are handled; R16G16B16A16_FLOAT is clamped and sRGB-encoded in
+the shader (W1204); an MSAA back buffer is resolved first; anything else disables capture (E1205).
+Added `E1211 capture_failed` for failures during capture (stage and HRESULT in the text; a removed
+device logs E1209 instead).
+
+**D-072 — One frame per tick, free mode.** The tick of a `Present` is `round((now - t0) * fps / freq)`;
+a frame is captured if its tick is greater than the last captured one. That is the plan's free mode
+without a lock. When the game runs at the recording rate, jitter of ±1 ms around a tick boundary makes
+some ticks get no frame (the host will fill them with DUPs in M3) and none get two; observed 0–8% of
+ticks empty depending on the phase between the game and the tick grid. Lock mode (M3) removes that.
+
+**D-073 — Size and rate.** Output size = `record.size` (or the back buffer for `native`), shrunk to fit
+inside the back buffer with its aspect ratio, rounded down to even; the picture is letterboxed into it.
+Rate = `record.fps` but not above the refresh rate of the monitor the game window is on (I1301 logs
+it). The hook republishes the back buffer's size every 32 `Present`s (fullscreen switches change it);
+if the game resizes during a recording the picture is rescaled into the same output (I1208), but the
+test app's barcode check uses the size at the start, so it reports unreadable frames then (resize
+handling proper is M7).
+
+**D-074 — Hotkey and cues.** A thread with a message loop calls `RegisterHotKey` (with `MOD_NOREPEAT`);
+if the key is taken it installs a `WH_KEYBOARD_LL` hook on the same thread and logs E7003. Presses within
+300 ms of the last one are ignored (W7002), as is a press while stopping. The start, stop and error
+sounds are generated in memory (two short sine tones; 22 kHz mono WAV) and played with `PlaySound`, so
+no resource files are needed. The F9 press is logged as I7001.
+
+**D-075 — What "recording" means in M2.** Until the encoder and AVI writer (M3), a recording is a
+capture test: frames travel hook → ring → host, are hashed, timed and (for `rec_testapp`) checked
+against the barcode and the colour bars, and the summary is printed and logged. Nothing is written to
+disk. Test aids: `--record-for S`, `--save-frame PNG [--save-frame-index N]`, `rec_testapp --fullscreen`.
+
+## Recorder M3
+
+**D-076 — Pipeline.** Receiver thread (the session's) → timeline → RCV1 encoder (NV12 input, straight
+from the ring slot: no copy; the codec's own pool gives 2 threads on a 4-thread CPU) → packet arena
+(`record.queue_mb`, default 256 MB, a byte ring in which every packet is contiguous) → writer thread
+(above normal priority) → AVI writer → disk writer (two 8 MB sector-aligned buffers, unbuffered and
+overlapped, one write in flight while the next fills). The receiver blocks up to 1 s when the arena is
+full, then drops the frame (W3104, a DROP row in the telemetry) so the ring doesn't back up into the
+game; the real answer to a slow disk is the rate controller (M5). `--encoder hw` and `--format rgb`
+are refused with a message naming the milestone that adds them (M9, M4).
+
+**D-077 — Timeline.** The first captured frame's tick is the start of the video (there is nothing to
+repeat before it); every later tick gets exactly one output frame. A frame whose tick is ahead of the
+next expected one is preceded by DUPs for the missing ticks; a frame whose tick was filled already
+arrived too late and is dropped (W2301). A stall (no frame for 250 ms) is filled with DUPs by the host
+on its own, but only ticks older than 150 ms, because frames reach the host up to ~100 ms after their
+tick; stopping pads DUPs to the stop tick. The codec's own "identical frame" DUPs are counted apart
+from the filled ones.
+
+**D-078 — Frames lost to stall latency.** The hook reads finished GPU copies back only when the game
+calls Present, and a copy finishes about 5 Presents (80 ms) after it was issued. When the game stops
+presenting (a freeze, a loading screen), the last ~5 frames before the stop stay in the pipeline until
+it resumes, by which time their ticks have been filled with DUPs, so they are dropped on arrival. The
+video therefore freezes ~80 ms before the game did. Serving the read-backs from another thread would
+mean using the game's immediate context off its render thread (not thread-safe unless the game turned
+on multithread protection), and a second device with shared textures is a much bigger design, so this
+stays. `rec verify --testapp` counts these frames apart ("lost to stall latency", at most 8, only just
+after a run of 15 or more DUPs) from real losses.
+
+**D-079 — Lock mode.** The pacer runs in the Present hook (plan §6.2): before capturing it holds the
+game until the next tick (a high-resolution waitable timer for the bulk, a spin for the last 0.2 ms);
+the hold is not counted as the hook's cost. Two changes to the plan's rule, both from measurement:
+(1) the tick grid starts at the first captured frame (the plan's grid starts when F9 is pressed): with
+the plan's rule a game running at exactly the recording rate, entering at a bad phase, stays late by that
+phase for as long as it runs (p99 pacing error up to 15 ms in short recordings), because the pacer only
+ever waits for early frames; (2) the grid follows the game's phase by half the lateness of each late
+frame, never earlier, never more than one tick from where it started, so the game ends up arriving just
+ahead of the grid and is held for the difference, while the video stays tied to the wall clock (without
+the cap a game slower than the grid slowed the whole timeline down: 551 frames in 12 s instead of 720).
+The tick is decided after the wait, so an oversleeping timer (seen: 65 ms once) or a hitch gives DUPs,
+not a frame stamped with the wrong tick. The host follows the grid through `ControlBlock::grid0_qpc`
+for its stall and stop arithmetic. Free mode (`--no-lock`) is M2's rule on the F9-time grid.
+
+**D-080 — AVI OpenDML.** Header region (avih, strl with strh/strf+extradata/indx super index,
+odml/dmlh, INFO with ISFT and ICMT carrying "game= source=WxH fps=", JUNK) padded to a multiple of 4096
+bytes and rewritten once, when the recording ends; further RIFF 'AVIX' blocks every ~1 GB with their
+own ix00 index; super index capacity 256 blocks; legacy idx1 for the first block; AVIIF_KEYFRAME from
+the codec's `is_keyframe`. The disk writer reopens the file with a second synchronous handle for
+read-modify-write of sectors already on disk (header at the end; the RIFF and LIST sizes of a finished
+block), allocates 1 GiB ahead, and truncates to the real length at close. The periodic index flush for
+crash safety (§11.3) is M7.
+
+**D-081 — Slow writes.** The plan's 50 ms (W4101) and 250 ms (E4102) thresholds describe a write; but
+an 8 MiB write at the 100–150 MB/s this laptop's disk does takes 55–80 ms, so the fixed thresholds
+warned about every healthy write. A write now counts as slow only if it also ran at less than three
+times the rate the recording produces data (after the first second of the recording): a disk stalling
+to 25 MB/s while the recording needs 10 MB/s is reported, a disk delivering 100 MB/s is not. The
+thresholds stay configurable (`log.slow_write_ms`, `log.very_slow_write_ms`).
+
+**D-082 — Telemetry CSV.** The plan's 19 columns in the plan's order, plus `pacing_error_ms` (how late
+after its tick the capture began, lock mode) appended. `present_qpc_us` is microseconds since tick 0
+of the grid at the first frame. `map_copy_ms` is empty (not measured per frame), `convert_ms` is 0
+(NV12 needs no host conversion), `audio_drift_ms` is empty until M6. `write_latency_ms` is the latency of
+the write that carried the frame's bytes; `ring_fill_pct` and `packet_queue_pct` are the fills when the
+frame was handled. Frames dropped by the host get a DROP row without an index. CSV rows are written
+by the writer thread in blocks.
+
+**D-083 — Summary JSON.** §10.5's fields, plus the file name, the grid and pacing figures; events are
+the warnings and errors logged during the recording, by code. `seconds_at_rate_level` is all level 0
+until the rate controller (M5); the audio fields are placeholders until M6.
+
+**D-084 — verify and convert.** `rec verify` walks the RIFF structure and checks avih/strh/dmlh
+counts, the super index, every ix00 against the chunks, idx1 against the first block; decodes every
+frame (key flags must match the packets, the first frame must be an I-frame); with `--testapp` reads
+the barcode and counts missing / repeated / out-of-order frames and DUPs that change the picture; and
+reads the `.frames.csv` beside the file (ticks consecutive, capture lateness). `rec convert` pipes the
+decoded I420 frames to `ffmpeg -f rawvideo -pix_fmt yuvj420p` (full range) and writes H.264 in limited
+range, BT.601 tagged, at the file's frame rate (so the DUP-filled timeline survives): `--to mp4|mkv
+--crf N --out PATH`. Video only until M6.
+
+**D-085 — Files.** `<Game> YYYY-MM-DD HH-MM-SS-cc.avi` plus `.frames.csv`, `.summary.json`, `.log`
+in `record.out_dir`; the name is reserved by creating the .avi exclusively, because two recordings
+starting in the same hundredth of a second (two games, two rec instances) once chose the same name.
+Frame hashing and the test-pattern checks of M2 now run only for `rec_testapp` (they cost host CPU).
+
+**D-086 — Recordings are written uncompressed on NTFS-compressed drives.** On the development laptop the
+whole C: drive is NTFS-compressed (the root has the Compressed attribute, so every folder and new file
+inherits it). RCV1 video is compressed already, and NTFS compressing it again in the kernel on every write
+cost most of the disk's speed: the same noisy test video (5.3:1, the compression Minecraft gets) was written
+at 27 MB/s with 26 very-slow writes (E4102) per 15 s into a compressed folder and at 390 MB/s with none into
+one with compression off; flat test content (9:1) hid it (127 MB/s) because NTFS compresses redundant data
+quickly. The first fullscreen Minecraft recording on this machine lost 34 frames (W1202) to encoder stalls
+of 50–116 ms with the packet queue empty, while a user-mode CPU hog (3 busy processes) could not reproduce
+them: the kernel compression work is the likely cause. Now the disk writer switches compression off on every
+file it creates (`FSCTL_SET_COMPRESSION`, COMPRESSION_FORMAT_NONE, before the first write) and logs that it
+did; `rec doctor` states it; a file in an EFS-encrypted folder is warned about (not changed). The small
+companion files (csv, json, log) are left as the folder has them.
+
+**D-087 — Frame ring depth.** `record.frame_slots` now defaults to 16 (was the plan's 8): 267 ms of frames
+at 60 fps instead of 133 ms, 22 MB at 720p. The host's encoder can fall behind for a while (a 116 ms stall
+used up the old ring); the extra slots cost memory only and nothing for the game.
+
+**D-088 — Encoder priority and power throttling.** The second fullscreen Minecraft recording (disk fixed,
+230-488 MB/s) still dropped 92 frames: encode time rose to 10-29 ms average (max 191 ms) for ~12 s while the
+game's frame times stayed normal and the packet queue was empty, so the host's encoder threads were being
+starved of CPU by the foreground game. The encoder worker threads and the receiver thread now run at
+above-normal priority (`record.encoder_priority`, `normal` | `above-normal`, default above-normal; the host
+needs about a quarter of one core at 720p60, so it cannot hurt the game noticeably), and `rec.exe` and those
+threads opt out of Windows power throttling (EcoQoS), which can otherwise lower a background process's
+priority and clock. Verified with the stress script (4 busy processes at above-normal priority on 4 logical
+CPUs: encode avg 6.3 vs 5.5 ms unloaded, 0 frames filled). Not verified on the real game yet. If it is still
+not enough, the answer is the M5 rate controller: drop frames on purpose (as DUPs) when the CPU is
+overloaded, instead of losing them at random.

@@ -17,11 +17,14 @@ struct Config {
         bool lock = true;
         std::string encoder = "rcv";    // rcv | rcv-strict | hw
         std::string format = "yuv420";  // yuv420 | rgb
+        // CPU priority of the host's encoder threads: a busy game can otherwise starve them for 100+ ms and
+        // the recording loses frames. above-normal: they take ~25% of a core and win it back from the game.
+        std::string encoder_priority = "above-normal";  // normal | above-normal
         std::string out_dir = "%USERPROFILE%\\Videos\\rec";
         int split_gb = 0;  // 0 = automatic (FAT32 only)
         int queue_mb = 256;
-        int staging_slots = 3;
-        int frame_slots = 8;
+        int staging_slots = 6;  // the GPU finishes a copy about 4 Presents late (deep frame queue)
+        int frame_slots = 16;  // frames the host can fall behind by (16 = 267 ms at 60 fps); 1.4 MB each at 720p
     } record;
     struct Hotkeys {
         std::string toggle = "F9";

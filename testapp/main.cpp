@@ -7,8 +7,9 @@
 // The frame-time pattern is configurable, so freezes, spikes and jitter can be provoked on demand.
 // Once a second it prints its own frame rate; recorder measurements are compared against that.
 //
-//   rec_testapp [--width W] [--height H] [--fps-cap N] [--vsync] [--present1]
+//   rec_testapp [--width W] [--height H] [--fps-cap N] [--vsync] [--present1] [--fullscreen]
 //               [--pattern steady|jitter|spikes|freeze] [--freeze-ms N] [--seconds N] [--title T]
+//               [--noise N]          (N random rectangles per frame: hard-to-compress content)
 //               [--late-load-ms N]   (wait before the first Direct3D call; d3d11.dll is delay-loaded)
 #include <d3d11_1.h>
 #include <dxgi1_2.h>
@@ -31,6 +32,8 @@ struct Options {
     int fps_cap = 0;          // 0: no cap (vsync, if asked, still applies)
     bool vsync = false;
     bool present1 = false;    // call IDXGISwapChain1::Present1 instead of Present
+    bool fullscreen = false;  // exclusive fullscreen (SetFullscreenState)
+    int noise = 0;            // random small rectangles per frame: video that compresses like a game, not like flat colour
     std::string pattern = "steady";
     int freeze_ms = 3000;
     int seconds = 0;          // 0: until the window is closed
@@ -155,7 +158,7 @@ void hue_to_rgb(float hue, float* rgba) {  // hue in [0, 1)
     rgba[3] = 1.0f;
 }
 
-void draw_frame(Gfx* gfx, uint32_t frame) {
+void draw_frame(Gfx* gfx, uint32_t frame, int noise) {
     const LONG w = LONG(gfx->width), h = LONG(gfx->height);
     const float black[4] = {0, 0, 0, 1}, white[4] = {1, 1, 1, 1};
 
@@ -173,6 +176,17 @@ void draw_frame(Gfx* gfx, uint32_t frame) {
     const LONG y = bar_top + (h - bar_top - side) / 2 + LONG(std::sin(double(frame) * 0.05) * double(h) * 0.15);
     const float square[4] = {0.05f, 0.05f, 0.05f, 1};
     clear_rect(gfx, square, x, y, x + side, y + side);
+
+    // Noise: many small rectangles of random colour, different every frame (below the barcode).
+    uint32_t rng = frame * 2654435761u + 977u;
+    for (int i = 0; i < noise; ++i) {
+        rng = rng * 1664525u + 1013904223u;
+        const float color[4] = {float((rng >> 8) & 255) / 255.0f, float((rng >> 16) & 255) / 255.0f, float((rng >> 24) & 255) / 255.0f, 1.0f};
+        rng = rng * 1664525u + 1013904223u;
+        const LONG rx = LONG((rng >> 4) % uint32_t(w - 24)), ry = bar_top + LONG((rng >> 14) % uint32_t(h - bar_top - 24));
+        const LONG side2 = 4 + LONG((rng >> 28));
+        clear_rect(gfx, color, rx, ry, rx + side2, ry + side2);
+    }
 
     // Barcode: 32 blocks, most significant bit on the left, 1 = white.
     const LONG bar_h = h / 6;
@@ -197,7 +211,7 @@ bool parse(int argc, wchar_t** argv, Options* o) {
             }
             return argv[++i];
         };
-        if (a == "--width" || a == "--height" || a == "--fps-cap" || a == "--freeze-ms" || a == "--seconds" || a == "--late-load-ms") {
+        if (a == "--width" || a == "--height" || a == "--fps-cap" || a == "--freeze-ms" || a == "--seconds" || a == "--late-load-ms" || a == "--noise") {
             const wchar_t* v = next(a.c_str());
             if (!v) return false;
             const int n = _wtoi(v);
@@ -210,6 +224,7 @@ bool parse(int argc, wchar_t** argv, Options* o) {
             else if (a == "--fps-cap") o->fps_cap = n;
             else if (a == "--freeze-ms") o->freeze_ms = n;
             else if (a == "--late-load-ms") o->late_load_ms = n;
+            else if (a == "--noise") o->noise = n;
             else o->seconds = n;
         } else if (a == "--pattern") {
             const wchar_t* v = next("--pattern");
@@ -227,6 +242,8 @@ bool parse(int argc, wchar_t** argv, Options* o) {
             o->vsync = true;
         } else if (a == "--present1") {
             o->present1 = true;
+        } else if (a == "--fullscreen") {
+            o->fullscreen = true;
         } else {
             std::fprintf(stderr, "rec_testapp: unknown option %s\n", a.c_str());
             return false;
@@ -265,9 +282,11 @@ int wmain(int argc, wchar_t** argv) {
         std::fprintf(stderr, "rec_testapp: cannot create the D3D11 device and swap chain\n");
         return 1;
     }
-    std::printf("rec_testapp pid %lu: D3D11 %dx%d, pattern %s%s%s%s\n", GetCurrentProcessId(), opt.width, opt.height,
+    if (opt.fullscreen && FAILED(gfx.swapchain->SetFullscreenState(TRUE, nullptr)))
+        std::fprintf(stderr, "rec_testapp: could not switch to fullscreen\n");
+    std::printf("rec_testapp pid %lu: D3D11 %dx%d, pattern %s%s%s%s%s\n", GetCurrentProcessId(), opt.width, opt.height,
                 opt.pattern.c_str(), opt.vsync ? ", vsync" : "", opt.fps_cap ? ", capped" : "",
-                opt.present1 ? ", Present1" : "");
+                opt.present1 ? ", Present1" : "", opt.fullscreen ? ", fullscreen" : "");
     std::fflush(stdout);
 
     HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
@@ -307,7 +326,7 @@ int wmain(int argc, wchar_t** argv) {
         }
 
         gfx.context->OMSetRenderTargets(1, gfx.rtv.GetAddressOf(), nullptr);
-        draw_frame(&gfx, frame);
+        draw_frame(&gfx, frame, opt.noise);
 
         const UINT sync = opt.vsync ? 1 : 0;
         if (opt.present1) {
@@ -335,6 +354,7 @@ int wmain(int argc, wchar_t** argv) {
         }
         if (opt.seconds && ms_between(start, t) >= opt.seconds * 1000.0) break;
     }
+    if (opt.fullscreen) gfx.swapchain->SetFullscreenState(FALSE, nullptr);  // give the display mode back
     std::printf("rec_testapp: exit after %u frames\n", frame);
     if (timer) CloseHandle(timer);
     return 0;
