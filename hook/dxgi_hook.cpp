@@ -183,6 +183,10 @@ bool create_hook(const char* name, void* target, void* detour, void** original) 
 }  // namespace
 
 bool install_dxgi_hooks() {
+    if (g.ctl->debug_kiero_fail & (proto::kApiDXGI | proto::kApiD3D11)) {  // --debug-kiero-fail d3d11
+        log_event(Ev::LocateFailed, "D3D11 lookup failed on purpose (--debug-kiero-fail)");
+        return false;
+    }
     SwapChainAddrs addrs;
     if (!locate_dxgi(&addrs, &g_locate_us)) return false;
 

@@ -376,6 +376,12 @@ void GlCapture::submit(const FrameInfo& info, void* target) {
     const int sw = rc.right - rc.left, sh = rc.bottom - rc.top;
     if (sw < 16 || sh < 16) return;  // minimised
 
+    if (ready && (g.ctl->debug_flags.load(std::memory_order_relaxed) & proto::kDebugDeviceRemoved) && k.present_index > 120) {
+        g.ctl->debug_flags.fetch_and(~uint32_t(proto::kDebugDeviceRemoved));  // --debug-device-removed, once
+        log_event(Ev::DeviceRemoved, "debug: context lost, objects made again");
+        release();
+        if (!core_start_worker()) return fail_gl(c, "restart copy worker", 0);
+    }
     if (ready && current != ctx) {  // the game swaps with a different context: our objects belong to the old one
         log_event(Ev::GlContextChanged, "context %p -> %p", static_cast<void*>(ctx), static_cast<void*>(current));
         release();

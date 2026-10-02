@@ -365,6 +365,13 @@ void Capture::submit(const FrameInfo& info, void* target) {
     ComPtr<ID3D11Device> game_dev;
     HRESULT hr = sc->GetDevice(IID_PPV_ARGS(&game_dev));
     if (FAILED(hr)) return fail(c, hr, "GetDevice");
+    if (c.dev && (g.ctl->debug_flags.load(std::memory_order_relaxed) & proto::kDebugDeviceRemoved) && core().present_index > 120) {
+        // --debug-device-removed: behave as if Present had returned DXGI_ERROR_DEVICE_REMOVED, once. Everything made
+        // on the device is dropped and made again below; the frames in flight are lost.
+        g.ctl->debug_flags.fetch_and(~uint32_t(proto::kDebugDeviceRemoved));
+        log_event(Ev::DeviceRemoved, "debug: device removed, objects made again");
+        release_gpu(c);
+    }
     if (game_dev.Get() != c.dev.Get()) {
         // First frame of the recording, or the game made a new device.
         release_gpu(c);

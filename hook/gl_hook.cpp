@@ -134,6 +134,10 @@ bool create_hook(const char* name, void* target, void* detour, void** original) 
 }  // namespace
 
 bool install_gl_hooks() {
+    if (g.ctl->debug_kiero_fail & proto::kApiOpenGL) {  // --debug-kiero-fail opengl
+        log_event(Ev::LocateFailed, "OpenGL lookup failed on purpose (--debug-kiero-fail)");
+        return false;
+    }
     HMODULE gl = GetModuleHandleW(L"opengl32.dll");
     HMODULE gdi = GetModuleHandleW(L"gdi32.dll");
     void* wgl = gl ? reinterpret_cast<void*>(GetProcAddress(gl, "wglSwapBuffers")) : nullptr;

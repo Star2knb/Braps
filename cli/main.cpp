@@ -33,6 +33,12 @@ struct RecordArgs {
     int duration = 0, record_for = 0;
     std::string save_frame;
     int save_frame_index = 30;
+    // Fault injection (recorder plan §14.3).
+    double debug_throttle_disk = 0;
+    std::vector<int> debug_write_stall;
+    int debug_encoder_delay = 0, debug_drop_readback = 0;
+    bool debug_hook_throw = false, debug_fill_disk = false, debug_device_removed = false, debug_no_rate_control = false;
+    std::string debug_kiero_fail;
     CLI::Option* lock_opt = nullptr;
     CLI::Option* sound_opt = nullptr;
 
@@ -56,6 +62,16 @@ struct RecordArgs {
             ->group("");
         cmd->add_option("--save-frame", save_frame, "write one captured frame of the recording as a PNG (test aid)")->group("");
         cmd->add_option("--save-frame-index", save_frame_index, "which captured frame to save (0-based, default 30)")->check(CLI::NonNegativeNumber)->group("");
+        const char* const faults = "Fault injection (testing)";
+        cmd->add_option("--debug-throttle-disk", debug_throttle_disk, "the writer behaves like a disk of this many MB/s")->check(CLI::PositiveNumber)->group(faults);
+        cmd->add_option("--debug-write-stall", debug_write_stall, "MS EVERY_S: every EVERY_S seconds one write takes MS longer")->expected(2)->group(faults);
+        cmd->add_option("--debug-encoder-delay", debug_encoder_delay, "MS: every frame takes this much longer to encode")->check(CLI::NonNegativeNumber)->group(faults);
+        cmd->add_option("--debug-drop-readback", debug_drop_readback, "N: the hook loses one finished read-back in N")->check(CLI::NonNegativeNumber)->group(faults);
+        cmd->add_flag("--debug-hook-throw", debug_hook_throw, "the hook throws inside its guard")->group(faults);
+        cmd->add_flag("--debug-fill-disk", debug_fill_disk, "free space shrinks by 1 GB per second")->group(faults);
+        cmd->add_flag("--debug-device-removed", debug_device_removed, "the backend acts as if the device was removed, once")->group(faults);
+        cmd->add_option("--debug-kiero-fail", debug_kiero_fail, "d3d11 | opengl: that API's address lookup fails")->group(faults);
+        cmd->add_flag("--debug-no-rate-control", debug_no_rate_control, "switch the rate controller off")->group(faults);
     }
 
     // Applies the given options onto cfg; false with a message on the first invalid one.
@@ -74,9 +90,48 @@ struct RecordArgs {
         if (sound_opt && sound_opt->count() && !set("hotkeys.sound", sound ? "true" : "false")) return false;
         if (queue_mb && !set("record.queue_mb", std::to_string(*queue_mb))) return false;
         if (split_gb && !set("record.split_gb", std::to_string(*split_gb))) return false;
+        rec::Config::Debug& d = cfg->debug;
+        d.throttle_disk_mb_s = debug_throttle_disk;
+        if (!debug_write_stall.empty()) {
+            if (debug_write_stall[0] < 1 || debug_write_stall[1] < 1) {
+                *error = "--debug-write-stall wants two positive numbers: MS EVERY_S";
+                return false;
+            }
+            d.write_stall_ms = debug_write_stall[0];
+            d.write_stall_every_s = debug_write_stall[1];
+        }
+        d.encoder_delay_ms = debug_encoder_delay;
+        d.drop_readback = debug_drop_readback;
+        d.hook_throw = debug_hook_throw;
+        d.fill_disk = debug_fill_disk;
+        d.device_removed = debug_device_removed;
+        d.no_rate_control = debug_no_rate_control;
+        if (!debug_kiero_fail.empty()) {
+            if (debug_kiero_fail != "d3d11" && debug_kiero_fail != "dxgi" && debug_kiero_fail != "opengl" && debug_kiero_fail != "gl") {
+                *error = "--debug-kiero-fail wants d3d11 or opengl";
+                return false;
+            }
+            d.kiero_fail = debug_kiero_fail == "dxgi" ? "d3d11" : debug_kiero_fail == "gl" ? "opengl" : debug_kiero_fail;
+        }
         return true;
     }
 };
+
+void print_debug_flags(const rec::Config& c) {
+    const rec::Config::Debug& d = c.debug;
+    if (!d.any()) return;
+    std::printf("  FAULT INJECTION:");
+    if (d.throttle_disk_mb_s > 0) std::printf(" disk throttled to %.0f MB/s;", d.throttle_disk_mb_s);
+    if (d.write_stall_ms > 0) std::printf(" a %d ms write stall every %d s;", d.write_stall_ms, d.write_stall_every_s);
+    if (d.encoder_delay_ms > 0) std::printf(" encoder delayed by %d ms;", d.encoder_delay_ms);
+    if (d.drop_readback > 0) std::printf(" 1 read-back in %d lost;", d.drop_readback);
+    if (d.hook_throw) std::printf(" hook will throw;");
+    if (d.fill_disk) std::printf(" disk fills up;");
+    if (d.device_removed) std::printf(" device will be removed;");
+    if (!d.kiero_fail.empty()) std::printf(" %s lookup fails;", d.kiero_fail.c_str());
+    if (d.no_rate_control) std::printf(" rate controller off;");
+    std::printf("\n");
+}
 
 void print_record_settings(const rec::Config& c) {
     std::printf("  %s @ %d fps, %s, encoder %s, %s, audio %s%s, hotkey %s%s\n  output: %s\n", c.record.size.c_str(),
@@ -243,6 +298,7 @@ int main(int argc, char** argv) {
         } else {
             std::printf("Recording settings:\n");
             print_record_settings(cfg);
+            print_debug_flags(cfg);
             rec_cli::HookCommandOptions options;
             options.force = ra.force;
             options.duration_s = ra.duration;
@@ -256,9 +312,9 @@ int main(int argc, char** argv) {
     } else if (*detach) {
         status = rec_cli::cmd_detach(pid, name);
     } else if (*bench_disk) {
-        status = not_yet("bench-disk", "M5");
+        status = rec_cli::cmd_bench_disk(cfg, bench_path, bench_size);
     } else if (*bench_overhead) {
-        status = not_yet("bench-overhead", "M4");
+        status = not_yet("bench-overhead", "a later milestone (skipped in M4 at the user's request)");
     } else if (*convert) {
         status = rec_cli::cmd_convert(in_file, convert_to, crf, convert_out);
     } else if (*verify) {

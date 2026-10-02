@@ -93,12 +93,14 @@ std::string format_recording_line(const std::string& exe_name, const HookStats& 
     if (s.fps > 0) std::snprintf(fps, sizeof(fps), "%.1f", s.fps);
     char free_text[24] = "";
     if (live.free_gb >= 0) std::snprintf(free_text, sizeof(free_text), " | free %.0f GB", live.free_gb);
-    char buf[420];
+    static const char* const kLevel[] = {"lossless", "NEAR 1", "NEAR 2", "NEAR 3", "DROPPING (disk)"};
+    const char* level = live.cpu_overloaded ? "DROPPING (CPU)" : kLevel[live.rate_level < 0 || live.rate_level > 4 ? 0 : live.rate_level];
+    char buf[440];
     std::snprintf(buf, sizeof(buf),
-                  "\u25CF %s %s %s %ux%u->%ux%u @%u%s | game %s fps | hook %.2f ms | enc %.1f ms | ratio %.1f | lossless | queue %d%% | disk %.0f MB/s | "
+                  "\u25CF %s %s %s %ux%u->%ux%u @%u%s | game %s fps | hook %.2f ms | enc %.1f ms | ratio %.1f | %s | queue %d%% | disk %.0f MB/s | "
                   "drops %llu | %llu frames (%llu DUP)%s",
                   stopping ? "STOPPING" : ("REC " + clock_text(live.seconds)).c_str(), exe_name.c_str(), backend_name(s.backend), s.width, s.height,
-                  plan.width, plan.height, plan.fps, locked ? " lock" : "", fps, live.avg_cost_ms, live.encode_ms, live.ratio, live.queue_pct,
+                  plan.width, plan.height, plan.fps, locked ? " lock" : "", fps, live.avg_cost_ms, live.encode_ms, live.ratio, level, live.queue_pct,
                   live.write_mb_s, (unsigned long long)(live.gpu_backlog + live.ring_drops), (unsigned long long)live.output_frames,
                   (unsigned long long)live.dup_filled, free_text);
     return buf;

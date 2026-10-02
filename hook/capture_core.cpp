@@ -247,6 +247,15 @@ proto::SlotHeader* core_acquire_slot() {
 
 void core_publish(proto::SlotHeader* slot, const FrameInfo& info, proto::Layout layout, uint32_t stride0, uint32_t stride1, uint64_t t_begin) {
     Core& c = core();
+    // --debug-drop-readback N: the read-back of every N-th frame "fails". The slot goes back, the frame is counted as
+    // skipped (W1201), and the host fills its tick with a DUP.
+    const uint32_t drop_every = g.ctl->debug_drop_readback;
+    if (drop_every && ++c.debug_reads % drop_every == 0) {
+        slot->state.store(uint32_t(proto::SlotState::Free), std::memory_order_release);
+        g.ctl->gpu_backlog_skips.fetch_add(1, std::memory_order_relaxed);
+        ++c.warn_backlog;
+        return;
+    }
     slot->seq = ++c.seq;
     slot->tick = info.tick;
     slot->present_qpc = info.present_qpc;
@@ -300,6 +309,13 @@ uint64_t core_on_present(Backend& b, void* target, uint64_t now, uint32_t frame_
         return 0;
     }
 
+    if (recording && c.present_index > 120 && (ctl->debug_flags.load(std::memory_order_relaxed) & proto::kDebugHookThrow)) {
+        // --debug-hook-throw: an exception inside the guard of the Present hook. The guard turns it into E1107 and
+        // switches the hook off; the game goes on. The exception skips the destructor of `guard`, so release it here.
+        ctl->debug_flags.fetch_and(~uint32_t(proto::kDebugHookThrow));
+        g_busy.store(false, std::memory_order_release);
+        RaiseException(0xE0DEB006u, 0, 0, nullptr);
+    }
     b.service();
     uint64_t held = 0;
     if (recording && now >= c.t0) {

@@ -75,6 +75,14 @@ bool EncodePipeline::start(const PipelineConfig& config, std::string* error) {
     }
     max_packet_ = rcv_max_packet_size(&ecfg_);
 
+    cfg_.rate.frame_ms = 1000.0 / double(cfg_.fps);
+    rate_.configure(cfg_.rate);
+    rate_.hooks.user = this;
+    rate_.hooks.level_changed = [](void* u, int from, int to, const RateInputs& in) { static_cast<EncodePipeline*>(u)->on_rate_level(from, to, in); };
+    rate_.hooks.cpu_overload_started = [](void* u, const RateInputs& in) { static_cast<EncodePipeline*>(u)->on_cpu_overload(true, in); };
+    rate_.hooks.cpu_overload_ended = [](void* u, const RateInputs& in) { static_cast<EncodePipeline*>(u)->on_cpu_overload(false, in); };
+    file_.set_debug(cfg_.debug_disk_mb_s, cfg_.debug_stall_ms, cfg_.debug_stall_every_s);
+
     cap_ = (std::max)(size_t(cfg_.queue_mb) << 20, 4 * max_packet_);
     arena_ = static_cast<uint8_t*>(VirtualAlloc(nullptr, cap_, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
     if (!arena_) {
@@ -203,7 +211,7 @@ void EncodePipeline::emit_dup(uint64_t tick, bool stall) {
     row.type = 'D';
     row.tick = tick;
     row.packet_bytes = info.packet_size;
-    row.near_level = cfg_.near_level;
+    row.near_level = cur_near_;
     commit(info.packet_size, true, false, row);
     ++stats_.dup_filled;
     dup_filled_live_.fetch_add(1);
@@ -242,6 +250,27 @@ void EncodePipeline::on_frame(const FrameMeta& meta, const uint8_t* y, uint32_t 
         push_drop(meta, "late");
         return;
     }
+    // The rate controller (§9): the disk (packet queue) asks for harder compression, then for dropped frames; a CPU that
+    // can't keep up (frame ring filling, encoding too slow) asks for dropped frames only. A dropped frame is a DUP, which
+    // the next frame that gets through writes for its tick.
+    RateDecision rd;
+    rd.near_level = cfg_.near_level;
+    if (cfg_.rate_control) {
+        RateInputs ri;
+        ri.now_ms = (now() - start_qpc_) * 1000 / freq_;
+        ri.queue_pct = queue_fill_pct();
+        ri.ring_pct = meta.ring_fill_pct;
+        ri.encode_avg_ms = double(encode_us_.load()) / 1000.0;
+        ri.write_mb_s = write_mb_s();
+        rd = rate_.decide(ri);
+        cur_near_ = rd.near_level;
+        rate_level_live_.store(rate_.level());
+        if (rd.drop) {
+            ++stats_.dropped_rate;
+            push_drop(meta, "rate");
+            return;
+        }
+    }
     while (next_tick_ < meta.tick) emit_dup(next_tick_++, false);
 
     uint8_t* out = reserve(1000);
@@ -257,9 +286,10 @@ void EncodePipeline::on_frame(const FrameMeta& meta, const uint8_t* y, uint32_t 
     in.stride[0] = int32_t(y_stride);
     in.stride[1] = int32_t(uv_stride);
     rcv_encode_params params{};
-    params.near_level = uint8_t(cfg_.near_level);
+    params.near_level = uint8_t(rd.near_level);
     rcv_frame_info info{};
     const int64_t t0 = qpc_now();
+    if (cfg_.debug_encoder_delay_ms > 0) Sleep(DWORD(cfg_.debug_encoder_delay_ms));  // --debug-encoder-delay
     const rcv_status st = rcv_encode_frame(enc_, &in, &params, out, max_packet_, &info);
     const double encode_ms = double(qpc_now() - t0) * 1000.0 / double(qpc_frequency());
     if (st != RCV_OK) {
@@ -269,6 +299,18 @@ void EncodePipeline::on_frame(const FrameMeta& meta, const uint8_t* y, uint32_t 
         return;
     }
     encode_ms_.push_back(encode_ms);
+    if (encode_ms > 1000.0 / double(cfg_.fps)) {  // W3103: a frame that took longer than the frame interval
+        ++stats_.slow_encodes;
+        const int64_t now_ms = (now() - start_qpc_) * 1000 / freq_;
+        if (now_ms - last_slow_encode_log_ms_ >= 1000) {
+            logging::event(Ev::SlowEncode, "{:.1f} ms for tick {} (frame interval {:.1f} ms){}", encode_ms, meta.tick, 1000.0 / double(cfg_.fps),
+                           slow_encode_suppressed_ ? " [+" + std::to_string(slow_encode_suppressed_) + " more since the last message]" : "");
+            last_slow_encode_log_ms_ = now_ms;
+            slow_encode_suppressed_ = 0;
+        } else {
+            ++slow_encode_suppressed_;
+        }
+    }
     {
         const uint32_t now_us = uint32_t(encode_ms * 1000.0), old_us = encode_us_.load();
         encode_us_.store(old_us ? (old_us * 7 + now_us) / 8 : now_us);  // smoothed over ~8 frames
@@ -289,7 +331,7 @@ void EncodePipeline::on_frame(const FrameMeta& meta, const uint8_t* y, uint32_t 
     row.convert_ms = meta.convert_ms;
     row.packet_bytes = info.packet_size;
     row.ratio = info.packet_size ? float(double(cfg_.width) * cfg_.height * 1.5 / info.packet_size) : -1.0f;
-    row.near_level = cfg_.near_level;
+    row.near_level = rd.near_level;
     row.skipped_pct = info.blocks_total ? 100.0f * float(info.blocks_skipped) / float(info.blocks_total) : -1.0f;
     commit(info.packet_size, true, info.is_keyframe != 0, row);
     next_tick_ = meta.tick + 1;
@@ -320,6 +362,30 @@ void EncodePipeline::on_idle(int64_t now_qpc) {
     while (next_tick_ < limit) emit_dup(next_tick_++, true);
 }
 
+void EncodePipeline::on_rate_level(int from, int to, const RateInputs& in) {
+    rate_level_live_.store(to);
+    static const char* const kNames[] = {"lossless", "NEAR 1", "NEAR 2", "NEAR 3", "dropping frames"};
+    logging::event(Ev::RateLevelChange, "{} -> {} ({} -> {}) queue={}% ring={}% disk={:.0f}MB/s", from, to, kNames[from], kNames[to], in.queue_pct,
+                   in.ring_pct, in.write_mb_s);
+}
+
+void EncodePipeline::on_cpu_overload(bool started, const RateInputs& in) {
+    cpu_overload_live_.store(started);
+    if (!started) {
+        logging::get(Subsystem::Encoder).info("encoder keeping up again (ring {}%)", in.ring_pct);
+        return;
+    }
+    // It can flip several times a second while the controller matches the frame rate to what the CPU can do.
+    if (in.now_ms - last_overload_log_ms_ < 1000) {
+        ++overload_suppressed_;
+        return;
+    }
+    logging::event(Ev::EncoderOverloaded, "encode avg {:.1f} ms of a {:.1f} ms frame, ring {}%: dropping frames{}", in.encode_avg_ms, cfg_.rate.frame_ms,
+                   in.ring_pct, overload_suppressed_ ? " (" + std::to_string(overload_suppressed_) + " more since the last message)" : "");
+    last_overload_log_ms_ = in.now_ms;
+    overload_suppressed_ = 0;
+}
+
 bool EncodePipeline::finish(int64_t stop_qpc, std::string* error) {
     if (!started_ok_) return false;
     if (started_ && !failed_.load() && stop_qpc > cfg_.t0_qpc) {
@@ -335,6 +401,10 @@ bool EncodePipeline::finish(int64_t stop_qpc, std::string* error) {
     if (writer_.joinable()) writer_.join();
     started_ok_ = false;
 
+    {
+        const auto ms = rate_.ms_at_level((now() - start_qpc_) * 1000 / freq_);
+        for (size_t i = 0; i < ms.size(); ++i) stats_.seconds_at_level[i] = ms[i] / 1000.0;
+    }
     stats_.output_frames = output_frames_.load();
     stats_.file_bytes = file_bytes_.load();
     stats_.disk = file_.stats();

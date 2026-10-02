@@ -9,6 +9,8 @@ add_executable(rec_tests
     test_avi.cpp
     test_pipeline.cpp
     test_convert.cpp
+    test_rate.cpp
+    test_monitor.cpp
 )
 target_include_directories(rec_tests PRIVATE ${PROJECT_SOURCE_DIR}/codec/tests)
 target_link_libraries(rec_tests PRIVATE rec_core)

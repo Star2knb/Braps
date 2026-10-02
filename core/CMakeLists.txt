@@ -19,6 +19,9 @@ add_library(rec_core STATIC
     src/avi_tools.cpp
     src/scheduling.cpp
     src/convert.cpp
+    src/rate.cpp
+    src/diskbench.cpp
+    src/monitor.cpp
 )
 target_include_directories(rec_core PUBLIC include)
 target_link_libraries(rec_core

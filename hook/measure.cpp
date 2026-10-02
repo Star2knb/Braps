@@ -41,6 +41,8 @@ void note_exception(DWORD code) {
     g.enabled.store(false, std::memory_order_release);
     capture_on_exception();
     g.ctl->error_code.store(event_number(Ev::HookException), std::memory_order_relaxed);
+    g.ctl->capture_error_code.store(event_number(Ev::HookException), std::memory_order_relaxed);
+    g.ctl->capture_state.store(uint32_t(proto::CaptureState::Error), std::memory_order_release);  // the host ends the recording
     log_event(Ev::HookException, "exception 0x%08lX in Present", code);
 }
 

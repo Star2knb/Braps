@@ -664,3 +664,47 @@ bindings) and `--offscreen` (a visible window parked at -20000,-20000 and never 
 need a real client area, a minimised window has none, and they must not disturb a game the user is playing).
 d3d11.dll, dxgi.dll and opengl32.dll are all delay-loaded, so a Direct3D run never loads opengl32.dll and an
 OpenGL run never loads Direct3D. `tests/m4_opengl.ps1` runs the checks.
+
+**D-094 — `rec bench-disk` and its cache.** The benchmark writes with the recorder's own writer (`DiskFile`, 8 MiB
+unbuffered overlapped writes, incompressible data) and reports the sustained speed (bytes over wall time, first
+write issued to last finished), the p99 and the worst latency of one write. The result is cached per volume
+(keyed by the volume serial number) in `%LOCALAPPDATA%\rec\diskbench.toml`, not in `rec.toml` as the plan says:
+`rec config reset` and hand edits of the config should not lose a measurement, and the config is for settings.
+The environment variable `REC_DATA_DIR` replaces `%LOCALAPPDATA%\rec` for the config, logs and cache, so tests
+and scripts leave the user's own files alone. Startup check (§9): the needed rate is the plan's estimate
+(`W x H x 1.5 x fps / 2.49`); if the cached speed is under 1.2x of it, W4001 is logged when the recording starts.
+`rec doctor` shows the cached figure (PASS, or WARN under 1.2x, or WARN "not measured").
+
+**D-095 — Rate controller** (plan §9; `rate.cpp`, pure logic, 8 unit tests; `pipeline.cpp` applies it).
+Levels from the packet-queue fill: 0 lossless, 1-3 NEAR 1-3 at 40/60/75%, 4 = replace incoming frames with DUPs
+at 90% until the queue is under 75%. Up at once; down one level at a time after 2 s below the level's entry
+threshold. `rcv-strict`: no levels 1-3 (lossless, or drop). CPU: the frame ring at 50% or more, or the average
+encode time over 80% of the frame budget *with the ring at 25% or more*, starts dropping (never NEAR: it costs
+more CPU) until the ring is under 25%. The ring guard on the encode-time rule is my addition: with an empty ring
+the host is keeping up, and dropping frames then would only lose video. A dropped frame is a DUP written by the
+next frame that gets through (or by the end-of-recording padding), counted as `dropped_rate`, shown as a DROP row in
+the telemetry; the summary has the seconds spent at each level (`seconds_at_rate_level`). W3101 on a level
+change, W3102 when a CPU overload starts (at most once a second, with the number suppressed), W3103 when one
+frame takes longer than the frame interval (same rate limit). The status line names the level.
+
+**D-096 — Fault injection** (plan §14.3), all `--debug-*` options of `launch` / `attach`, never in `rec.toml`
+(`Config::Debug`), and the console says "FAULT INJECTION" when any is on. Host side: `--debug-throttle-disk MB/s`
+and `--debug-write-stall MS EVERY_S` live in `DiskFile` (a simulated disk that is busy until bytes / speed after
+the write was submitted, so the writer, and through it the packet queue, behaves as with a real slow disk and the
+latencies it reports are the simulated ones), `--debug-encoder-delay MS` sleeps inside the timed part of the
+encode, `--debug-fill-disk` makes free space 8 GB minus 1 GB per second, `--debug-no-rate-control` switches the
+controller off (diagnosis, and tests that feed the ring in bursts). Hook side, through new `ControlBlock`
+fields set before the hook is injected: `--debug-drop-readback N` (one finished read-back in N is dropped and
+counted as W1201), `--debug-hook-throw` (a Windows exception inside the guard of the Present hook: E1107, hooks
+off, and the host is told capture failed so the recording is finished cleanly), `--debug-device-removed`
+(E1209 once, 2 s in; the backend drops everything on the device and makes it again), `--debug-kiero-fail
+d3d11|opengl` (E1105 for that API's lookup, the other group installs normally). Protocol version unchanged: the
+fields came out of the reserved words.
+
+**D-097 — Monitors** (`monitor.cpp`, once a second from the receiver thread). Free space on the output drive:
+W4103 below `log.low_space_gb` (once), E4104 below `log.critical_space_gb`, which stops the recording and
+finishes the file (reported to the console through `take_error` like a capture failure). Power: W6101 when AC /
+battery / battery saver changes. W6102 when the whole machine is over 95% for 3 s (game and rec shares in the
+message, at most every 10 s). W1203 (hook cost over `log.slow_hook_ms`) and W1210 (a gap between two frames over 4 T
+or 250 ms) are counted per frame and logged once a second. I6002 is the per-second line in the log. Not done:
+I4106 (file splitting) belongs to M7 with the FAT32 handling.

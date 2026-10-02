@@ -12,6 +12,8 @@
 #include <thread>
 
 #include "rec/convert.h"
+#include "rec/diskbench.h"
+#include "rec/doctor.h"
 #include "rec/frame_tools.h"
 #include "rec/log.h"
 #include "rec/options.h"
@@ -142,8 +144,12 @@ std::string RecordingSummary::text() const {
                 "queue %llu, encoder %llu)\n",
                 (unsigned long long)p.frames_i, (unsigned long long)p.frames_p, (unsigned long long)(p.dup_filled + p.dup_encoded),
                 (unsigned long long)p.dup_filled, (unsigned long long)p.dup_encoded,
-                (unsigned long long)(p.dropped_late + p.dropped_queue + p.dropped_error), (unsigned long long)p.dropped_late,
+                (unsigned long long)(p.dropped_late + p.dropped_queue + p.dropped_error + p.dropped_rate), (unsigned long long)p.dropped_late,
                 (unsigned long long)p.dropped_queue, (unsigned long long)p.dropped_error);
+    if (p.dropped_rate || p.seconds_at_level[1] + p.seconds_at_level[2] + p.seconds_at_level[3] + p.seconds_at_level[4] > 0)
+        t += format("  rate control: %llu frames dropped on purpose; seconds at lossless / NEAR 1 / NEAR 2 / NEAR 3 / dropping: %.1f / %.1f / %.1f / %.1f / %.1f\n",
+                    (unsigned long long)p.dropped_rate, p.seconds_at_level[0], p.seconds_at_level[1], p.seconds_at_level[2], p.seconds_at_level[3],
+                    p.seconds_at_level[4]);
     t += format("  compression: %.2f:1 on real frames, %.2f:1 overall; encode avg %.2f ms, p99 %.2f ms, max %.2f ms\n", p.ratio_real, p.ratio_overall,
                 p.encode_ms_avg, p.encode_ms_p99, p.encode_ms_max);
     t += format("  disk: %.1f MB/s average, %.1f MB/s best, %u slow writes (> limit), %u very slow, worst %.0f ms\n", p.disk.avg_mb_s(), p.disk.peak_mb_s,
@@ -191,8 +197,9 @@ std::string RecordingSummary::json() const {
     o << "  \"output\": {\"width\": " << plan.width << ", \"height\": " << plan.height << ", \"fps\": " << plan.fps << ", \"lock\": " << (lock ? "true" : "false") << "},\n";
     o << "  \"duration_s\": " << num(seconds) << ",\n";
     o << "  \"frames\": {\"output\": " << p.output_frames << ", \"I\": " << p.frames_i << ", \"P\": " << p.frames_p << ", \"DUP\": " << dups
-      << ", \"DUP_filled\": " << p.dup_filled << ", \"DUP_identical\": " << p.dup_encoded << ", \"dropped\": " << (p.dropped_late + p.dropped_queue + p.dropped_error)
-      << ", \"dropped_late\": " << p.dropped_late << ", \"dropped_queue\": " << p.dropped_queue << ", \"captured\": " << frames << "},\n";
+      << ", \"DUP_filled\": " << p.dup_filled << ", \"DUP_identical\": " << p.dup_encoded << ", \"dropped\": " << (p.dropped_late + p.dropped_queue + p.dropped_error + p.dropped_rate)
+      << ", \"dropped_late\": " << p.dropped_late << ", \"dropped_queue\": " << p.dropped_queue << ", \"dropped_rate\": " << p.dropped_rate
+      << ", \"captured\": " << frames << "},\n";
     o << "  \"game_fps\": {\"avg\": " << num(fps_avg) << ", \"low_1pct\": " << num(fps_low) << "},\n";
     o << "  \"hook_cost_ms\": {\"avg\": " << num(cost_avg_ms) << ", \"p50\": " << num(cost_p50_ms) << ", \"p99\": " << num(cost_p99_ms) << ", \"max\": " << num(cost_max_ms)
       << ", \"first_frame\": " << num(first_frame_cost_ms) << "},\n";
@@ -203,7 +210,8 @@ std::string RecordingSummary::json() const {
     o << "  \"bytes_written\": " << p.file_bytes << ",\n";
     o << "  \"write_mb_s\": {\"avg\": " << num(p.disk.avg_mb_s()) << ", \"peak\": " << num(p.disk.peak_mb_s) << "},\n";
     o << "  \"slow_writes\": " << p.disk.slow_writes << ",\n  \"very_slow_writes\": " << p.disk.very_slow_writes << ",\n";
-    o << "  \"seconds_at_rate_level\": [" << num(seconds) << ", 0, 0, 0, 0],\n";  // the rate controller arrives in M5: always lossless
+    o << "  \"seconds_at_rate_level\": [" << num(p.seconds_at_level[0]) << ", " << num(p.seconds_at_level[1]) << ", " << num(p.seconds_at_level[2]) << ", "
+      << num(p.seconds_at_level[3]) << ", " << num(p.seconds_at_level[4]) << "],\n";
     o << "  \"pacing\": {\"error_p50_ms\": " << num(pacing_error_p50_ms) << ", \"error_p99_ms\": " << num(pacing_error_p99_ms) << ", \"error_max_ms\": "
       << num(pacing_error_max_ms) << ", \"held_ms_total\": " << num(pacing_wait_total_ms) << "},\n";
     o << "  \"audio_discontinuities\": 0,\n  \"max_av_drift_ms\": null,\n";
@@ -279,6 +287,26 @@ bool RecordingSession::start(std::string* error) {
     if (!logging::open_session(log_, &log_error)) logging::get(Subsystem::Disk).warn("no session log: {}", log_error);
     for (size_t i = 0; i < kEventCount; ++i) events_before_[i] = logging::event_count(kEvents[i].id);
 
+    {
+        ResourceLimits lim;
+        lim.low_space_gb = config_.log.low_space_gb;
+        lim.critical_space_gb = config_.log.critical_space_gb;
+        monitor_.start(link_.game_pid(), dir, lim, config_.debug.fill_disk);
+        critical_space_ = false;
+        critical_reported_ = false;
+        last_tick_qpc_ = qpc_now();
+        sec_frames_ = sec_cost_sum_us_ = sec_game_sum_us_ = sec_game_n_ = 0;
+        sec_cost_max_us_ = sec_slow_hooks_ = sec_stalls_ = sec_stall_worst_ms_ = 0;
+        last_dup_filled_ = last_drops_ = 0;
+    }
+
+    // Startup check (§9): the drive's cached benchmark against what this recording needs.
+    {
+        const RateEstimate need = estimate_write_rate(int(plan_.width), int(plan_.height), int(plan_.fps), config_.record.format == "rgb");
+        const std::string slow = disk_may_be_too_slow(dir, need.required_mbps);
+        if (!slow.empty()) logging::event(Ev::DiskMayBeTooSlow, "{}", slow);
+    }
+
     // The encode pipeline: encoder, packet queue, AVI writer thread.
     PipelineConfig pc;
     pc.avi_path = avi_;
@@ -292,6 +320,14 @@ bool RecordingSession::start(std::string* error) {
     pc.software = std::string("rec ") + kVersionNumber;
     pc.queue_mb = uint32_t(config_.record.queue_mb);
     pc.above_normal = config_.record.encoder_priority == "above-normal";
+    for (size_t i = 0; i < 4 && i < config_.rate.levels.size(); ++i) pc.rate.levels[i] = config_.rate.levels[i];
+    pc.rate.step_down_after_ms = config_.rate.step_down_after_s * 1000;
+    pc.rate.strict = config_.record.encoder == "rcv-strict";
+    pc.rate_control = !config_.debug.no_rate_control;
+    pc.debug_encoder_delay_ms = config_.debug.encoder_delay_ms;
+    pc.debug_disk_mb_s = config_.debug.throttle_disk_mb_s;
+    pc.debug_stall_ms = config_.debug.write_stall_ms;
+    pc.debug_stall_every_s = config_.debug.write_stall_every_s;
     pc.slow_write_ms = config_.log.slow_write_ms;
     pc.very_slow_write_ms = config_.log.very_slow_write_ms;
     pipeline_ = std::make_unique<EncodePipeline>();
@@ -407,6 +443,13 @@ void RecordingSession::request_stop() {
 bool RecordingSession::take_error(std::string* message) {
     if (state_ != State::Recording || error_reported_) return false;
     proto::ControlBlock* ctl = link_.control();
+    if (critical_space_.load() && !critical_reported_) {
+        critical_reported_ = true;
+        error_reported_ = true;
+        *message = "less than " + std::to_string(config_.log.critical_space_gb) + " GB left on the output drive (E4104); stopping and closing the file";
+        request_stop();
+        return true;
+    }
     if (pipeline_ && pipeline_->failed()) {
         error_reported_ = true;
         *message = "the video file can't be written (" + pipeline_->error() + "); stopping";
@@ -448,6 +491,8 @@ LiveStats RecordingSession::live() const {
         s.dup_filled = pipeline_->dup_filled();
         s.encode_ms = pipeline_->encode_ms_recent();
         s.ratio = pipeline_->ratio_running();
+        s.rate_level = pipeline_->rate_level();
+        s.cpu_overloaded = pipeline_->cpu_overloaded();
         s.queue_pct = pipeline_->queue_fill_pct();
         s.write_mb_s = pipeline_->write_mb_s();
         s.file_mb = double(pipeline_->file_bytes()) / 1048576.0;
@@ -507,6 +552,19 @@ bool RecordingSession::consume_one() {
     pacing_error_ms_.push_back(slot->pacing_error_us / 1000.0);
     pacing_wait_total_ms_ += slot->pacing_wait_us / 1000.0;
     cost_sum_us_ += slot->hook_cost_us;
+    ++sec_frames_;
+    sec_cost_sum_us_ += slot->hook_cost_us;
+    sec_cost_max_us_ = (std::max)(sec_cost_max_us_, slot->hook_cost_us);
+    if (slot->hook_cost_us > uint32_t(config_.log.slow_hook_ms * 1000.0)) ++sec_slow_hooks_;  // W1203
+    if (slot->game_frame_time_us) {
+        sec_game_sum_us_ += slot->game_frame_time_us;
+        ++sec_game_n_;
+        const uint32_t stall_us = (std::max)(uint32_t(4000000u / plan_.fps), 250000u);  // W1210: over 4 T or 250 ms
+        if (slot->game_frame_time_us > stall_us) {
+            ++sec_stalls_;
+            sec_stall_worst_ms_ = (std::max)(sec_stall_worst_ms_, slot->game_frame_time_us / 1000);
+        }
+    }
 
     // Optional checks on the content (the test app's pattern); too costly to do on every recording.
     if (analyze_) {
@@ -565,6 +623,40 @@ bool RecordingSession::consume_one() {
     return true;
 }
 
+void RecordingSession::second_tick() {
+    const int64_t now = qpc_now();
+    const double elapsed = double(now - last_tick_qpc_) / double(qpc_freq());
+    last_tick_qpc_ = now;
+    if (sec_slow_hooks_)
+        logging::event(Ev::SlowHook, "{} frames over {} ms in the last second, worst {:.2f} ms", sec_slow_hooks_, config_.log.slow_hook_ms,
+                       sec_cost_max_us_ / 1000.0);
+    if (sec_stalls_)
+        logging::event(Ev::GameStall, "{} gaps between frames over {} ms in the last second, the longest {} ms", sec_stalls_,
+                       (std::max)(4000u / plan_.fps, 250u), sec_stall_worst_ms_);
+
+    const ResourceSample rs = monitor_.sample();
+    if (monitor_.evaluate(rs)) critical_space_ = true;
+
+    // I6002: one line a second for the log.
+    const double game_fps = sec_game_n_ ? 1e6 / (double(sec_game_sum_us_) / double(sec_game_n_)) : 0;
+    const double cost_avg_ms = sec_frames_ ? double(sec_cost_sum_us_) / double(sec_frames_) / 1000.0 : 0;
+    proto::ControlBlock* ctl = link_.control();
+    const uint64_t drops = (ctl->gpu_backlog_skips.load() - base_backlog_) + (ctl->ring_full_drops.load() - base_drops_);
+    static const char* const kLevel[] = {"lossless", "NEAR 1", "NEAR 2", "NEAR 3", "dropping"};
+    const int level = pipeline_->rate_level();
+    logging::event(Ev::SessionStats,
+                   "game {:.1f} fps | captured {:.1f} fps | DUP {} (+{}) | drops {} (+{}) | hook {:.2f}/{:.2f} ms | enc {:.1f} ms | ratio {:.1f} | {}{} | "
+                   "queue {}% | disk {:.0f} MB/s | free {:.1f} GB",
+                   game_fps, double(sec_frames_) / (elapsed > 0 ? elapsed : 1), pipeline_->dup_filled(), pipeline_->dup_filled() - last_dup_filled_, drops,
+                   drops - last_drops_, cost_avg_ms, sec_cost_max_us_ / 1000.0, pipeline_->encode_ms_recent(), pipeline_->ratio_running(),
+                   kLevel[level < 0 || level > 4 ? 0 : level], pipeline_->cpu_overloaded() ? " (CPU: dropping)" : "", pipeline_->queue_fill_pct(),
+                   pipeline_->write_mb_s(), rs.free_gb);
+    last_dup_filled_ = pipeline_->dup_filled();
+    last_drops_ = drops;
+    sec_frames_ = sec_cost_sum_us_ = sec_game_sum_us_ = sec_game_n_ = 0;
+    sec_cost_max_us_ = sec_slow_hooks_ = sec_stalls_ = sec_stall_worst_ms_ = 0;
+}
+
 void RecordingSession::receiver() {
     set_encoder_thread_priority(config_.record.encoder_priority == "above-normal");
     for (;;) {
@@ -572,7 +664,10 @@ void RecordingSession::receiver() {
         const bool last_pass = stop_receiver_.load();
         while (consume_one()) {
         }
-        if (!last_pass) pipeline_->on_idle(qpc_now());
+        if (!last_pass) {
+            pipeline_->on_idle(qpc_now());
+            if (qpc_now() - last_tick_qpc_ >= qpc_freq()) second_tick();
+        }
         if (last_pass) break;
     }
 }

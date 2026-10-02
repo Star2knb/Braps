@@ -101,7 +101,17 @@ struct alignas(64) ControlBlock {
     uint32_t rec_lock;                         // 1: hold the game to the tick grid (lock mode, §6.2), 0: capture what it presents
     uint32_t reserved0;
     std::atomic<uint64_t> grid0_qpc;           // lock mode: QPC time of tick 0 as the hook has the grid now (it follows the game's phase)
-    uint32_t reserved[72];
+    // Fault injection (recorder plan §14.3), set by the host from --debug-* options.
+    std::atomic<uint32_t> debug_flags;         // DebugFlag bits; a one-shot flag is cleared by the hook when it has acted
+    uint32_t debug_drop_readback;              // lose one finished read-back in this many (0 = off)
+    uint32_t debug_kiero_fail;                 // Api bits whose address lookup is made to fail (read when the hooks are installed)
+    uint32_t reserved1;
+    uint32_t reserved[68];
+};
+
+enum DebugFlag : uint32_t {
+    kDebugHookThrow = 1u << 0,      // throw inside the hook's guard (E1107; capture stops, the game does not)
+    kDebugDeviceRemoved = 1u << 1,  // act as if the device was removed, once (E1209; objects are made again)
 };
 
 // Host -> hook: what to do with Present.
@@ -259,6 +269,7 @@ static_assert(sizeof(ControlBlock) == 512);
 static_assert(offsetof(ControlBlock, host_state) == 120 && offsetof(ControlBlock, rec_t0_qpc) == 160);
 static_assert(offsetof(ControlBlock, frames_captured) == 168 && offsetof(ControlBlock, last_capture_tick) == 200);
 static_assert(offsetof(ControlBlock, rec_lock) == 208 && offsetof(ControlBlock, grid0_qpc) == 216);
+static_assert(offsetof(ControlBlock, debug_flags) == 224 && offsetof(ControlBlock, reserved) == 240);
 static_assert(offsetof(ControlBlock, qpc_frequency) == 16);
 static_assert(offsetof(ControlBlock, host_heartbeat_qpc) == 32);
 static_assert(offsetof(ControlBlock, present_count) == 64);

@@ -11,6 +11,7 @@
 // tick is the start of the video (there is nothing to repeat before it).
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -26,6 +27,7 @@
 #include "rcv/rcv.h"
 #include "rec/avi.h"
 #include "rec/disk_file.h"
+#include "rec/rate.h"
 
 namespace rec {
 
@@ -53,6 +55,12 @@ struct PipelineConfig {
     uint64_t avi_block_limit = 1ull << 30;
     uint32_t stall_ms = 250;              // no frame for this long: fill with DUPs (§6.3)
     uint32_t stall_margin_ms = 150;       // ... but only ticks older than this (frames arrive late)
+    RateSettings rate;                    // the rate controller (§9)
+    bool rate_control = true;
+    // Fault injection (§14.3).
+    int debug_encoder_delay_ms = 0;
+    double debug_disk_mb_s = 0;
+    int debug_stall_ms = 0, debug_stall_every_s = 0;
 };
 
 // What the hook told us about a frame.
@@ -72,6 +80,9 @@ struct PipelineStats {
     uint64_t dropped_late = 0;     // frames that arrived for a tick already filled (W2301)
     uint64_t dropped_queue = 0;    // frames dropped because the packet queue was full (W3104)
     uint64_t dropped_error = 0;    // frames the encoder refused
+    uint64_t dropped_rate = 0;     // frames turned into DUPs on purpose by the rate controller (W3101 level 4, W3102)
+    uint64_t slow_encodes = 0;     // frames that took longer than a frame interval to encode (W3103)
+    std::array<double, RateController::kLevels> seconds_at_level{};  // time at each rate level
     uint64_t output_frames = 0;    // chunks in the AVI
     uint64_t bytes_i = 0, bytes_p = 0, bytes_dup = 0;
     uint64_t first_tick = 0, last_tick = 0;
@@ -116,6 +127,8 @@ public:
     }
     double write_mb_s() const { return double(write_kbps_.load()) / 1024.0; }
     uint64_t dup_filled() const { return dup_filled_live_.load(); }
+    int rate_level() const { return rate_level_live_.load(); }          // 0 lossless, 1-3 NEAR, 4 dropping
+    bool cpu_overloaded() const { return cpu_overload_live_.load(); }
     const PipelineStats& stats() const { return stats_; }  // complete after finish()
     uint64_t base_tick() const { return base_tick_; }
 
@@ -150,6 +163,8 @@ private:
     void release(const Item& item);
     void writer_main();
     void emit_dup(uint64_t tick, bool stall);
+    void on_rate_level(int from, int to, const RateInputs& in);
+    void on_cpu_overload(bool started, const RateInputs& in);
     void push_drop(const FrameMeta& meta, const char* why);
     void write_row(const Row& row, double latency_ms);
     void finish_rows(double latency_ms);
@@ -162,6 +177,14 @@ private:
     rcv_encoder* enc_ = nullptr;
     rcv_encoder_config ecfg_{};
     size_t max_packet_ = 0;
+
+    // Rate control.
+    RateController rate_;
+    std::atomic<int> rate_level_live_{0};
+    std::atomic<bool> cpu_overload_live_{false};
+    int cur_near_ = 0;
+    int64_t last_overload_log_ms_ = -100000, last_slow_encode_log_ms_ = -100000;
+    uint32_t overload_suppressed_ = 0, slow_encode_suppressed_ = 0;
 
     // Timeline.
     bool started_ = false;

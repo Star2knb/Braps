@@ -261,3 +261,113 @@ TEST_CASE("pipeline: the packet queue wraps correctly over many frames") {
     for (bool k : keys) keyframes += k ? 1 : 0;
     CHECK(keyframes >= 2);
 }
+
+TEST_CASE("pipeline: a slow disk makes the rate controller compress harder, then drop frames, and the timeline stays whole") {
+    Fixture fx("pipe_rate_disk");
+    fx.cfg.debug_disk_mb_s = 1.0;  // a disk of 1 MB/s
+    fx.cfg.queue_mb = 1;
+    fx.cfg.disk_buffer_mb = 1;
+    EncodePipeline p;
+    std::string error;
+    REQUIRE(p.start(fx.cfg, &error));
+    constexpr int kFrames = 400;
+    std::vector<Nv12> sent;
+    for (int i = 0; i < kFrames; ++i) {
+        sent.push_back(make_frame(uint32_t(i + 1)));
+        FrameMeta m;
+        m.tick = uint64_t(i);
+        m.present_qpc = fx.tick_time(m.tick);
+        fx.now = m.present_qpc;
+        p.on_frame(m, sent.back().y.data(), kW, sent.back().uv.data(), kW);
+    }
+    fx.now = fx.tick_time(kFrames);
+    REQUIRE(p.finish(fx.now, &error));
+    const PipelineStats& s = p.stats();
+    CHECK(s.output_frames == kFrames);            // one frame (real or DUP) on every tick
+    CHECK(s.dropped_queue == 0);                  // the queue never overflowed: the controller acted first
+    CHECK(s.dropped_rate > 0);                    // frames were turned into DUPs on purpose
+    CHECK(s.dup_filled >= s.dropped_rate);
+    const double above_lossless = s.seconds_at_level[1] + s.seconds_at_level[2] + s.seconds_at_level[3] + s.seconds_at_level[4];
+    CHECK(above_lossless > 0);
+    CHECK(s.seconds_at_level[4] > 0);             // and it reached the top level
+    std::vector<Nv12> frames;
+    std::vector<int> types;
+    std::vector<bool> keys;
+    REQUIRE(decode_all(fx.cfg.avi_path, &frames, &types, &keys));
+    CHECK(frames.size() == size_t(kFrames));
+    CHECK(frames[0].y == sent[0].y);              // the first frames, before any pressure, are lossless
+}
+
+TEST_CASE("pipeline: a frame ring that fills up drops frames until it drains, and nothing else changes") {
+    Fixture fx("pipe_rate_cpu");
+    fx.cfg.queue_mb = 64;  // the disk is not what this test is about: the queue must stay empty even when frames arrive in a burst
+    EncodePipeline p;
+    std::string error;
+    REQUIRE(p.start(fx.cfg, &error));
+    constexpr int kFrames = 200;
+    std::vector<Nv12> sent;
+    for (int i = 0; i < kFrames; ++i) {
+        sent.push_back(make_frame(uint32_t(i + 1)));
+        FrameMeta m;
+        m.tick = uint64_t(i);
+        m.present_qpc = fx.tick_time(m.tick);
+        m.ring_fill_pct = (i >= 100 && i < 150) ? 60 : 10;  // the host is behind for 50 frames
+        fx.now = m.present_qpc;
+        p.on_frame(m, sent.back().y.data(), kW, sent.back().uv.data(), kW);
+    }
+    fx.now = fx.tick_time(kFrames);
+    REQUIRE(p.finish(fx.now, &error));
+    const PipelineStats& s = p.stats();
+    CHECK(s.dropped_rate == 50);
+    CHECK(s.dup_filled == 50);
+    CHECK(s.output_frames == kFrames);
+    CHECK(s.seconds_at_level[1] + s.seconds_at_level[2] + s.seconds_at_level[3] + s.seconds_at_level[4] == 0);  // the disk was fine
+    std::vector<Nv12> frames;
+    std::vector<int> types;
+    std::vector<bool> keys;
+    REQUIRE(decode_all(fx.cfg.avi_path, &frames, &types, &keys));
+    REQUIRE(frames.size() == size_t(kFrames));
+    CHECK(frames[99].y == sent[99].y);
+    CHECK(frames[120].y == sent[99].y);   // frozen on the last frame that got through
+    CHECK(frames[150].y == sent[150].y);  // and back to normal, lossless
+    CHECK(frames[199].uv == sent[199].uv);
+}
+
+TEST_CASE("pipeline: rcv-strict never goes near-lossless: it is lossless or it drops") {
+    Fixture fx("pipe_rate_strict");
+    fx.cfg.debug_disk_mb_s = 1.0;
+    fx.cfg.queue_mb = 1;
+    fx.cfg.disk_buffer_mb = 1;
+    fx.cfg.rate.strict = true;
+    EncodePipeline p;
+    std::string error;
+    REQUIRE(p.start(fx.cfg, &error));
+    constexpr int kFrames = 400;
+    std::vector<Nv12> sent;
+    for (int i = 0; i < kFrames; ++i) {
+        sent.push_back(make_frame(uint32_t(i + 1)));
+        FrameMeta m;
+        m.tick = uint64_t(i);
+        m.present_qpc = fx.tick_time(m.tick);
+        fx.now = m.present_qpc;
+        p.on_frame(m, sent.back().y.data(), kW, sent.back().uv.data(), kW);
+    }
+    fx.now = fx.tick_time(kFrames);
+    REQUIRE(p.finish(fx.now, &error));
+    const PipelineStats& s = p.stats();
+    CHECK(s.dropped_rate > 0);
+    CHECK(s.seconds_at_level[1] + s.seconds_at_level[2] + s.seconds_at_level[3] == 0);
+    std::vector<Nv12> frames;
+    std::vector<int> types;
+    std::vector<bool> keys;
+    REQUIRE(decode_all(fx.cfg.avi_path, &frames, &types, &keys));
+    REQUIRE(frames.size() == size_t(kFrames));
+    // Every frame that got through is exactly what was sent (a DUP shows the picture before it).
+    int wrong = 0;
+    for (int i = 0; i < kFrames; ++i) {
+        const bool exact = frames[i].y == sent[i].y && frames[i].uv == sent[i].uv;
+        const bool repeat = i > 0 && frames[i].y == frames[i - 1].y && frames[i].uv == frames[i - 1].uv;  // a DUP shows the picture before it
+        if (!exact && !repeat) ++wrong;
+    }
+    CHECK(wrong == 0);
+}

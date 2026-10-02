@@ -6,6 +6,10 @@
 namespace rec {
 
 std::filesystem::path app_data_dir() {
+    // REC_DATA_DIR replaces %LOCALAPPDATA%ec: tests and scripts that must not touch the user's own config, logs and cache.
+    wchar_t override_dir[MAX_PATH] = {};
+    const DWORD n = GetEnvironmentVariableW(L"REC_DATA_DIR", override_dir, MAX_PATH);
+    if (n > 0 && n < MAX_PATH) return std::filesystem::path(override_dir);
     PWSTR p = nullptr;
     std::filesystem::path dir;
     if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &p)) && p)

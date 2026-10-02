@@ -67,6 +67,22 @@ const char* end_text(rec::WatchEnd end) {
 }
 
 // Common tail of launch and attach: wait for the hook, then watch the game.
+// The fault-injection flags the hook has to know about (the others stay in the host). Written before the hook is injected,
+// so --debug-kiero-fail is in place when it installs.
+void apply_debug_to_hook(rec::HookLink& link, const rec::Config& cfg) {
+    rec::proto::ControlBlock* c = link.control();
+    const rec::Config::Debug& d = cfg.debug;
+    c->debug_drop_readback = uint32_t(d.drop_readback);
+    uint32_t flags = 0;
+    if (d.hook_throw) flags |= rec::proto::kDebugHookThrow;
+    if (d.device_removed) flags |= rec::proto::kDebugDeviceRemoved;
+    c->debug_flags.store(flags);
+    uint32_t kiero = 0;
+    if (d.kiero_fail == "d3d11") kiero = rec::proto::kApiD3D11 | rec::proto::kApiDXGI;
+    else if (d.kiero_fail == "opengl") kiero = rec::proto::kApiOpenGL;
+    c->debug_kiero_fail = kiero;
+}
+
 int hook_and_watch(const rec::Target& target, rec::HookLink& link, const rec::Config& cfg, const HookCommandOptions& options) {
     std::string error;
     if (!rec::wait_for_hook(link, target, 10000, &error)) return fail("rec: " + error);
@@ -161,6 +177,7 @@ int cmd_launch(const rec::Config& cfg, const std::string& exe, const std::vector
         game_process.terminate();
         return fail("rec launch: " + error);
     }
+    apply_debug_to_hook(*link, cfg);
     if (!rec::inject_dll(game_process.target, dll, &error)) {
         game_process.terminate();
         return fail("rec launch: couldn't hook " + game + ": " + error);
@@ -198,6 +215,7 @@ int cmd_attach(const rec::Config& cfg, std::optional<unsigned> pid_arg, const st
     bool took_over = false;
     std::unique_ptr<rec::HookLink> link = rec::HookLink::open_or_create(pid, &error, &took_over);
     if (!link) return fail("rec attach: " + error);
+    apply_debug_to_hook(*link, cfg);
     if (took_over) {
         // An earlier rec left its hook in the game. Don't take the game away from one that's still running.
         const uint32_t previous = link->previous_host_pid();

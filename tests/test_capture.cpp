@@ -162,6 +162,7 @@ TEST_CASE("recording session: frames through the real ring from a simulated hook
     Config cfg;
     cfg.record.size = "1280x720";
     cfg.record.out_dir = out.path().string();
+    cfg.debug.no_rate_control = true;  // the simulated hook fills the ring in a burst, which the rate controller would call a CPU overload
     RecordingSession session(*link, cfg, "rec_testapp.exe");
     CHECK(session.state() == RecordingSession::State::Idle);
     REQUIRE(session.start(&error));
@@ -319,6 +320,7 @@ TEST_CASE("recording session: OpenGL frames arrive as BGRA and are converted to 
     Config cfg;
     cfg.record.size = "1280x720";
     cfg.record.out_dir = out.path().string();
+    cfg.debug.no_rate_control = true;
     RecordingSession session(*link, cfg, "rec_testapp.exe");
     REQUIRE(session.start(&error));
 

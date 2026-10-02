@@ -71,6 +71,14 @@ public:
 
     const Stats& stats() const { return stats_; }
 
+    // Fault injection (--debug-throttle-disk, --debug-write-stall, recorder plan §14.3): the disk behaves as if it
+    // wrote at `mb_s` (0 = off), and every `every_s` seconds one write takes `stall_ms` longer.
+    void set_debug(double mb_s, int stall_ms, int every_s) {
+        debug_mb_s_ = mb_s;
+        debug_stall_ms_ = stall_ms;
+        debug_stall_every_s_ = every_s;
+    }
+
 private:
     struct Slot {
         uint8_t* data = nullptr;
@@ -106,6 +114,10 @@ private:
     std::string error_;
     bool compression_removed_ = false;
     bool encrypted_ = false;
+    double debug_mb_s_ = 0;
+    int debug_stall_ms_ = 0, debug_stall_every_s_ = 0;
+    uint64_t debug_disk_free_qpc_ = 0;  // when the simulated disk finishes what it has been given
+    uint64_t debug_next_stall_qpc_ = 0;
 };
 
 }  // namespace rec

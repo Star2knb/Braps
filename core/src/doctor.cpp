@@ -13,6 +13,7 @@
 #include <filesystem>
 
 #include "rcv/rcv.h"
+#include "rec/diskbench.h"
 #include "rec/options.h"
 #include "rec/paths.h"
 
@@ -224,11 +225,22 @@ std::vector<CheckResult> check_volume(const Config& cfg, const std::filesystem::
         else
             out.push_back(pass("Free space", d));
 
-        // No disk benchmark until `rec bench-disk` exists (recorder M5): state what the drive must sustain.
-        out.push_back(warn("Disk speed",
-                           fmt("not measured; %dx%d@%d needs ~%.0f MB/s (plan estimate; ~%.0f MB/s typical)",
-                               size.width, size.height, cfg.record.fps, r.required_mbps, r.typical_mbps),
-                           "measure it with rec bench-disk (arrives in recorder milestone M5)"));
+        DiskBenchResult bench;
+        if (!load_cached_bench(base, &bench)) {
+            out.push_back(warn("Disk speed",
+                               fmt("not measured; %dx%d@%d needs ~%.0f MB/s (plan estimate; ~%.0f MB/s typical)",
+                                   size.width, size.height, cfg.record.fps, r.required_mbps, r.typical_mbps),
+                               "measure it with: rec bench-disk"));
+        } else if (bench.sustained_mb_s < kBenchHeadroom * r.required_mbps) {
+            out.push_back(warn("Disk speed",
+                               fmt("%.0f MB/s measured %s; %dx%d@%d needs ~%.0f MB/s (plan estimate; ~%.0f MB/s typical)", bench.sustained_mb_s,
+                                   bench.when.c_str(), size.width, size.height, cfg.record.fps, r.required_mbps, r.typical_mbps),
+                               "under 1.2x the estimate: use --encoder hw, a smaller size or a lower frame rate"));
+        } else {
+            out.push_back(pass("Disk speed", fmt("%.0f MB/s measured %s; %dx%d@%d needs ~%.0f MB/s (plan estimate; ~%.0f MB/s typical)",
+                                                 bench.sustained_mb_s, bench.when.c_str(), size.width, size.height, cfg.record.fps, r.required_mbps,
+                                                 r.typical_mbps)));
+        }
     }
     return out;
 }

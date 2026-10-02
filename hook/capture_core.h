@@ -71,6 +71,7 @@ struct Core {
     uint64_t ph_setup = 0, ph_issue = 0, ph_begin = 0, ph_finish = 0;
     uint32_t ph_submits = 0, ph_reads = 0;
     uint32_t slow_logged = 0;
+    uint32_t debug_reads = 0;  // read-backs finished so far (--debug-drop-readback)
 
     // Rate-limited warnings.
     uint64_t last_warn_qpc = 0;

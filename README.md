@@ -24,6 +24,7 @@ unchanged in [legacy/](legacy/) for reference; it is not part of the V2 build.
 | Recorder | M2 — D3D11 capture (scale + NV12 shader, staging ring), shared frame ring, F9 hotkey and cue | done — [report](docs/reports/recorder-M2.md): 0.3 ms median hook time per captured frame, stop in 0.1–0.3 s |
 | Recorder | M3 — RCV1 encoder, timeline with DUP filling, lock/free pacing, AVI writer, `rec verify`, `rec convert` | done — [report](docs/reports/recorder-M3.md): lossless 720p60 recordings, 9.2:1 on the test app, nothing lost; Minecraft not yet tried |
 | Recorder | M4 — OpenGL backend (blit + PBO read-back), host BGRA→NV12 conversion | done — [report](docs/reports/recorder-M4.md): the OpenGL test app records losslessly (hook 0.2 ms median, host conversion 1 ms); recorded Geometry Dash too (PASS, nothing dropped) |
+| Recorder | M5 — rate controller (disk: NEAR levels then dropped frames; CPU: dropped frames), `rec bench-disk`, startup disk check, space/power/CPU monitors, fault-injection flags | done — [report](docs/reports/recorder-M5.md): every fault flag gives its codes, a throttled disk stays in step; I4106 file split is M7 |
 
 ## Build
 Requires Visual Studio (2022 or 2026) with "Desktop development with C++".
@@ -47,7 +48,8 @@ rec attach --pid N | --name X.exe    hook a running game
 rec detach [--pid N | --name X.exe]  remove the hook (default: from every game that has it)
 rec verify FILE.avi [--testapp]      check a recording: structure, indexes, every frame decoded
 rec convert FILE.avi [--to mp4|mkv] [--crf 16] [--out FILE]   decode and encode with FFmpeg (video only)
-rec --help                           all commands (repair, bench-disk, ... arrive with later milestones)
+rec bench-disk [--path P --size 2GB]  measure the drive with the recorder's writer; checked at the start of every recording
+rec --help                           all commands (repair, bench-overhead arrive with later milestones)
 ```
 `launch`/`attach` show the game's frame rate and the hook's own cost per frame. **F9 starts and stops
 recording** (hotkey and sound cue configurable with `--hotkey` / `--no-sound`). Each recording is a
@@ -70,6 +72,15 @@ busy scenes; `rec doctor` shows the drive and free space.
 threads run at above-normal priority and opt out of Windows power throttling (`record.encoder_priority =
 "normal"` turns the priority off).
 
+**Overload and faults.** If the disk is slower than the video, the packet queue fills; at 40/60/75% the recorder
+compresses harder (NEAR 1-3, `rcv-strict` never does), at 90% it drops frames (they become repeated frames) until
+the queue drains. If the CPU cannot keep up it drops frames too. The status line names the level, the summary
+lists the seconds spent at each. Recording also warns about low free space (stops below 1 GB and finishes the
+file), power-source changes and a saturated CPU. For testing, `launch`/`attach` take `--debug-throttle-disk MB/s`,
+`--debug-write-stall MS EVERY_S`, `--debug-encoder-delay MS`, `--debug-drop-readback N`, `--debug-hook-throw`,
+`--debug-fill-disk`, `--debug-device-removed`, `--debug-kiero-fail d3d11|opengl` and `--debug-no-rate-control`;
+`REC_DATA_DIR` moves the config, logs and disk-benchmark cache somewhere else.
+
 **Anti-cheat.** Injecting into a game protected by anti-cheat can get your account banned. `rec` looks
 for known anti-cheat components (the game's loaded modules, its folder, running processes, kernel
 drivers; your own list is `safety.anticheat_blocklist`) and refuses with E1004 if it finds any.
@@ -84,6 +95,7 @@ powershell -File tests\m1_attach_detach.ps1                       100 attach/det
 powershell -File tests\m1_robustness.ps1                          host killed, no-D3D process, Present1, anti-cheat
 powershell -File tests\m2_capture.ps1                             capture, F9 in a window and in fullscreen, leaks (presses F9!)
 powershell -File tests\m3_record.ps1 [-SoakMinutes 5]             recordings: nothing lost, freeze, slower game, verify, FFmpeg
+powershell -File tests\m5_faults.ps1                              rate controller, monitors, every --debug-* fault flag (close FRAPS first)
 powershell -File tests\m4_opengl.ps1                              OpenGL: SwapBuffers/wgl, core, multisample, letterbox, freeze, launch, cycles
 ```
 Logs: `%LOCALAPPDATA%\rec\logs\rec.log`.

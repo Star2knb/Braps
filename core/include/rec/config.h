@@ -50,6 +50,23 @@ struct Config {
     struct Safety {
         std::vector<std::string> anticheat_blocklist{"EasyAntiCheat", "BEService", "BEDaisy", "vgc", "vgk"};
     } safety;
+    // Fault injection (recorder plan §14.3): command-line only (--debug-*), never read from or written to rec.toml.
+    struct Debug {
+        double throttle_disk_mb_s = 0;  // the writer behaves like a disk of this speed
+        int write_stall_ms = 0;         // every write_stall_every_s seconds one write takes this much longer
+        int write_stall_every_s = 0;
+        int encoder_delay_ms = 0;       // every frame takes this much longer to encode
+        int drop_readback = 0;          // the hook loses one finished read-back in this many
+        bool hook_throw = false;        // the hook throws inside its guard
+        bool fill_disk = false;         // free space shrinks by 1 GB per second
+        bool device_removed = false;    // the backend behaves as if the device was removed, once
+        std::string kiero_fail;         // d3d11 | dxgi | opengl: that API's address lookup fails
+        bool no_rate_control = false;   // switch the rate controller off (diagnosis, and tests that feed the ring in bursts)
+        bool any() const {
+            return no_rate_control || throttle_disk_mb_s > 0 || write_stall_ms > 0 || encoder_delay_ms > 0 || drop_readback > 0 || hook_throw || fill_disk ||
+                   device_removed || !kiero_fail.empty();
+        }
+    } debug;
 };
 
 // Reads `path` over the defaults. A missing file leaves the defaults. Unknown keys, values of the

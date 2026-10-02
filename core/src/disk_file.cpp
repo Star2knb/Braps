@@ -25,6 +25,15 @@ double qpc_to_ms(uint64_t ticks) {
     return double(ticks) * 1000.0 / freq;
 }
 
+uint64_t qpc_ticks_per_second() {
+    static const uint64_t freq = [] {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        return uint64_t(f.QuadPart);
+    }();
+    return freq;
+}
+
 constexpr uint64_t kPreallocStep = 1ull << 30;  // 1 GiB (§11.2)
 
 size_t round_up(size_t v, size_t a) { return (v + a - 1) / a * a; }
@@ -126,6 +135,32 @@ bool DiskFile::wait_for(Slot& s) {
     WaitForSingleObject(s.event, INFINITE);
     UnregisterWaitEx(s.wait, INVALID_HANDLE_VALUE);  // waits for the completion callback, so done_qpc is set
     s.in_flight = false;
+    if (debug_mb_s_ > 0 || debug_stall_ms_ > 0) {
+        // A simulated slower disk: it starts a write when it is free and the write has been submitted, and
+        // needs bytes / speed. The caller waits for it, exactly as it would for a real slow disk.
+        uint64_t done = (std::max)(s.done_qpc.load(), uint64_t(s.submit_qpc));
+        if (debug_mb_s_ > 0) {
+            const uint64_t start = (std::max)(uint64_t(s.submit_qpc), debug_disk_free_qpc_);
+            done = (std::max)(done, start + uint64_t(double(s.bytes) / (debug_mb_s_ * 1048576.0) * double(qpc_ticks_per_second())));
+        }
+        if (debug_stall_ms_ > 0 && debug_stall_every_s_ > 0) {
+            const uint64_t now_q = qpc_now();
+            if (debug_next_stall_qpc_ == 0) debug_next_stall_qpc_ = now_q + uint64_t(debug_stall_every_s_) * qpc_ticks_per_second();
+            if (now_q >= debug_next_stall_qpc_) {
+                done += uint64_t(debug_stall_ms_) * qpc_ticks_per_second() / 1000;
+                debug_next_stall_qpc_ = now_q + uint64_t(debug_stall_every_s_) * qpc_ticks_per_second();
+            }
+        }
+        debug_disk_free_qpc_ = done;
+        for (;;) {
+            const uint64_t now_q = qpc_now();
+            if (now_q >= done) break;
+            const uint64_t left_ms = (done - now_q) * 1000 / qpc_ticks_per_second();
+            if (left_ms > 2) Sleep(DWORD(left_ms - 1));
+            else YieldProcessor();
+        }
+        s.done_qpc.store(done);
+    }
     DWORD got = 0;
     if (!GetOverlappedResult(file_, &s.ov, &got, FALSE)) return fail("write", GetLastError());
     if (got != s.bytes) return fail("short write", ERROR_WRITE_FAULT);

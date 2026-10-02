@@ -21,6 +21,7 @@
 #include "rec/events.h"
 #include "rec/frame_tools.h"
 #include "rec/hooklink.h"
+#include "rec/monitor.h"
 #include "rec/pipeline.h"
 
 namespace rec {
@@ -97,6 +98,8 @@ struct LiveStats {
     double encode_ms = 0, ratio = 0;
     int queue_pct = 0;
     double write_mb_s = 0, file_mb = 0, free_gb = -1;
+    int rate_level = 0;           // 0 lossless, 1-3 NEAR, 4 dropping frames (disk too slow)
+    bool cpu_overloaded = false;  // dropping frames because the CPU can't keep up
 };
 
 class RecordingSession {
@@ -167,6 +170,17 @@ private:
     std::atomic<bool> stop_receiver_{false};
     std::atomic<uint64_t> frames_{0};
     std::atomic<uint64_t> cost_sum_us_{0};
+
+    // Watching (receiver thread, once a second): resources, slow hooks, game stalls, the I6002 line.
+    void second_tick();
+    ResourceMonitor monitor_;
+    std::atomic<bool> critical_space_{false};
+    bool critical_reported_ = false;
+    int64_t last_tick_qpc_ = 0;
+    uint64_t sec_frames_ = 0, sec_cost_sum_us_ = 0, sec_game_sum_us_ = 0, sec_game_n_ = 0;
+    uint32_t sec_cost_max_us_ = 0, sec_slow_hooks_ = 0, sec_stalls_ = 0;
+    uint32_t sec_stall_worst_ms_ = 0;
+    uint64_t last_dup_filled_ = 0, last_drops_ = 0;
     mutable int64_t free_checked_qpc_ = 0;
     mutable double free_gb_ = -1;
 
