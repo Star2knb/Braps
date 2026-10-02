@@ -23,7 +23,7 @@ unchanged in [legacy/](legacy/) for reference; it is not part of the V2 build.
 | Recorder | M1 — test app, injection, kiero2 + MinHook `Present` hook (measuring only), `rec list` | done — [report](docs/reports/recorder-M1.md) |
 | Recorder | M2 — D3D11 capture (scale + NV12 shader, staging ring), shared frame ring, F9 hotkey and cue | done — [report](docs/reports/recorder-M2.md): 0.3 ms median hook time per captured frame, stop in 0.1–0.3 s |
 | Recorder | M3 — RCV1 encoder, timeline with DUP filling, lock/free pacing, AVI writer, `rec verify`, `rec convert` | done — [report](docs/reports/recorder-M3.md): lossless 720p60 recordings, 9.2:1 on the test app, nothing lost; Minecraft not yet tried |
-| Recorder | M4 — OpenGL backend (PBO read-back) and host BGRA→I420 conversion; overhead A/B against FRAPS | next |
+| Recorder | M4 — OpenGL backend (blit + PBO read-back), host BGRA→NV12 conversion | done — [report](docs/reports/recorder-M4.md): the OpenGL test app records losslessly (hook 0.2 ms median, host conversion 1 ms); recorded Geometry Dash too (PASS, nothing dropped) |
 
 ## Build
 Requires Visual Studio (2022 or 2026) with "Desktop development with C++".
@@ -53,13 +53,13 @@ rec --help                           all commands (repair, bench-disk, ... arriv
 recording** (hotkey and sound cue configurable with `--hotkey` / `--no-sound`). Each recording is a
 lossless RCV1 video in an AVI file, `<Game> YYYY-MM-DD HH-MM-SS-cc.avi` in `record.out_dir` (default
 `%USERPROFILE%\Videos\rec`, or `--out DIR`), with `.frames.csv` (one row per frame), `.summary.json` and
-`.log` beside it. Works with Direct3D 11 games, windowed or fullscreen, 64-bit. By default the game is
+`.log` beside it. Works with Direct3D 11 and OpenGL (3.0 or newer) games, windowed or fullscreen, 64-bit. By default the game is
 **locked** to the recording's frame rate (`--no-lock` lets it run free); frames the game didn't present
 on time become repeated frames, so the file always has a constant frame rate. Ctrl+C stops a running
 recording, removes the hook and exits; the game keeps running.
 Options: `--duration S` (detach and exit after S seconds), `--force` (see below), `--record-for S` (start
 a recording by itself, for scripts), `--save-frame file.png` (write one captured frame as a picture).
-No audio yet (M6), no OpenGL / D3D9 / D3D12 / Vulkan (M4, M8, M10), no 32-bit games (M7).
+No audio yet (M6), no D3D9 / D3D12 / Vulkan (M8, M10), no 32-bit games (M7).
 
 **Disk.** Recordings are written with large unbuffered writes and are already compressed, so `rec` creates
 them without NTFS compression even in a compressed folder (letting NTFS compress them again cut a drive's
@@ -78,13 +78,13 @@ Easy Anti-Cheat, BattlEye, Vanguard or Hyperion. Only 64-bit games for now; 32-b
 
 Test app and scripts (build first):
 ```
-build
-eleasein
-build\release\bin\rec_testapp.exe --vsync --seconds 60          a D3D11 window standing in for a game
+build.bat release
+build\release\bin\rec_testapp.exe --vsync --seconds 60          a D3D11 window standing in for a game (--gl: OpenGL)
 powershell -File tests\m1_attach_detach.ps1                       100 attach/detach cycles against it
 powershell -File tests\m1_robustness.ps1                          host killed, no-D3D process, Present1, anti-cheat
 powershell -File tests\m2_capture.ps1                             capture, F9 in a window and in fullscreen, leaks (presses F9!)
 powershell -File tests\m3_record.ps1 [-SoakMinutes 5]             recordings: nothing lost, freeze, slower game, verify, FFmpeg
+powershell -File tests\m4_opengl.ps1                              OpenGL: SwapBuffers/wgl, core, multisample, letterbox, freeze, launch, cycles
 ```
 Logs: `%LOCALAPPDATA%\rec\logs\rec.log`.
 

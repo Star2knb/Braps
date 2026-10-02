@@ -12,7 +12,9 @@
 #include <cwchar>
 
 #include "capture_d3d11.h"
+#include "capture_gl.h"
 #include "dxgi_hook.h"
+#include "gl_hook.h"
 #include "hlog.h"
 #include "hook_state.h"
 
@@ -55,7 +57,7 @@ bool name_is(const UnicodeString* s, const wchar_t* name) {
 }
 
 VOID CALLBACK on_dll_loaded(ULONG reason, const DllLoadedData* data, PVOID) {
-    if (reason == kReasonLoaded && data && (name_is(data->base_name, L"d3d11.dll") || name_is(data->base_name, L"dxgi.dll")))
+    if (reason == kReasonLoaded && data && (name_is(data->base_name, L"d3d11.dll") || name_is(data->base_name, L"dxgi.dll") || name_is(data->base_name, L"opengl32.dll")))
         SetEvent(g.dll_event);
 }
 
@@ -151,17 +153,29 @@ void log_overlays() {
 }
 
 // ---- Installing --------------------------------------------------------------------------------
-bool graphics_dlls_loaded() { return GetModuleHandleW(L"dxgi.dll") && GetModuleHandleW(L"d3d11.dll"); }
+// Each API group is hooked once its DLLs are loaded: Direct3D 10/11/12 through dxgi.dll + d3d11.dll,
+// OpenGL through opengl32.dll. A game uses one of them, so the other may never come; the loader
+// notification stays registered (it costs a few instructions per module load) so a late one is caught.
+bool dxgi_loaded() { return GetModuleHandleW(L"dxgi.dll") && GetModuleHandleW(L"d3d11.dll"); }
+bool gl_loaded() { return GetModuleHandleW(L"opengl32.dll") != nullptr; }
 
 proto::HookState g_installed_state = proto::HookState::Loading;  // what to show when the host is back
 
-void try_install(bool* installed, bool* waiting_logged) {
-    if (*installed) return;
-    if (!graphics_dlls_loaded()) {
-        if (!*waiting_logged) {
-            *waiting_logged = true;
+struct InstallProgress {
+    bool dxgi_done = false, gl_done = false;  // attempted (installed or failed)
+    bool any_hooked = false;
+    bool waiting_logged = false;
+};
+
+void try_install(InstallProgress* p) {
+    if (p->dxgi_done && p->gl_done) return;
+    const bool dxgi_ready = !p->dxgi_done && dxgi_loaded();
+    const bool gl_ready = !p->gl_done && gl_loaded();
+    if (!dxgi_ready && !gl_ready) {
+        if (!p->waiting_logged && !p->any_hooked) {
+            p->waiting_logged = true;
             const bool dxgi = GetModuleHandleW(L"dxgi.dll") != nullptr;
-            log_event(Ev::HookInstallDeferred, "waiting for %s", dxgi ? "d3d11.dll" : "dxgi.dll/d3d11.dll");
+            log_event(Ev::HookInstallDeferred, "waiting for %s", dxgi ? "d3d11.dll" : "dxgi.dll/d3d11.dll or opengl32.dll");
             register_notification();
             g_installed_state = proto::HookState::Waiting;
             set_state(proto::HookState::Waiting);
@@ -170,17 +184,36 @@ void try_install(bool* installed, bool* waiting_logged) {
     }
     // Launch mode: let the loader finish and the game's own device creation settle before we create a
     // throwaway device of our own (§4.1). With attach the DLLs were already there, no wait needed.
-    if (*waiting_logged) Sleep(50);
+    if (p->waiting_logged) Sleep(50);
 
-    unregister_notification();
-    *installed = true;
-    if (install_dxgi_hooks()) {
-        g.ctl->hooked_apis.fetch_or(proto::kApiDXGI);
+    bool failed_something = false;
+    if (dxgi_ready) {
+        p->dxgi_done = true;
+        if (install_dxgi_hooks()) {
+            g.ctl->hooked_apis.fetch_or(proto::kApiDXGI);
+            p->any_hooked = true;
+            log_text(Level::Info, "hooks installed (Present, Present1)");
+        } else {
+            failed_something = true;
+            g.ctl->error_code.store(event_number(Ev::LocateFailed));
+        }
+    }
+    if (gl_ready) {
+        p->gl_done = true;
+        if (install_gl_hooks()) {
+            g.ctl->hooked_apis.fetch_or(proto::kApiOpenGL);
+            p->any_hooked = true;
+            log_text(Level::Info, "hooks installed (wglSwapBuffers, SwapBuffers)");
+        } else {
+            failed_something = true;
+            g.ctl->error_code.store(event_number(Ev::LocateFailed));
+        }
+    }
+    if (p->any_hooked) {
         g_installed_state = proto::HookState::Hooked;
-        log_text(Level::Info, "hooks installed (Present, Present1)");
-    } else {
+        g.ctl->error_code.store(0);
+    } else if (failed_something) {
         g_installed_state = proto::HookState::Failed;
-        g.ctl->error_code.store(event_number(Ev::LocateFailed));
     }
     set_state(g_installed_state);
 }
@@ -189,6 +222,7 @@ void try_install(bool* installed, bool* waiting_logged) {
 [[noreturn]] void do_detach() {
     set_state(proto::HookState::Detaching);
     remove_dxgi_hooks();
+    remove_gl_hooks();
     // No thread may be inside a detour, and none may be on its way out of one: after the counter
     // reaches zero a thread still has to execute the detour's final instructions, which are in this
     // DLL. Hence the grace period and a second look.
@@ -204,6 +238,7 @@ void try_install(bool* installed, bool* waiting_logged) {
         ExitThread(0);
     }
     capture_shutdown();
+    capture_gl_shutdown();
     MH_Uninitialize();
     unregister_notification();
     log_text(Level::Info, "detached");
@@ -232,13 +267,13 @@ DWORD WINAPI control_thread(LPVOID) {
         set_state(proto::HookState::Failed);
     }
 
-    bool installed = mh != MH_OK || g.tls == TLS_OUT_OF_INDEXES;  // nothing to install if init failed
-    bool waiting_logged = false;
+    InstallProgress progress;
+    if (mh != MH_OK || g.tls == TLS_OUT_OF_INDEXES) progress.dxgi_done = progress.gl_done = true;  // nothing to install if init failed
     bool host_lost = false;
     const HANDLE wait_handles[2] = {g.cmd_event, g.dll_event};
 
     for (;;) {
-        try_install(&installed, &waiting_logged);
+        try_install(&progress);
 
         const uint64_t now = qpc();
         c->hook_heartbeat_qpc.store(now, std::memory_order_relaxed);

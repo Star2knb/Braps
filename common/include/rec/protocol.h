@@ -237,6 +237,11 @@ constexpr uint32_t nv12_y_offset() { return sizeof(SlotHeader); }
 constexpr uint32_t nv12_uv_offset(uint32_t w, uint32_t h) { return nv12_y_offset() + w * h; }
 constexpr uint32_t nv12_slot_bytes(uint32_t w, uint32_t h) { return align_up(nv12_uv_offset(w, h) + w * (h / 2), 4096); }
 
+// BGRA slot (OpenGL): header, then w x h pixels of 4 bytes (B, G, R, A), top row first; stride0 = 4 w.
+// The host converts them to NV12 before encoding (recorder plan §8.2).
+constexpr uint32_t bgra_offset() { return sizeof(SlotHeader); }
+constexpr uint32_t bgra_slot_bytes(uint32_t w, uint32_t h) { return align_up(bgra_offset() + w * h * 4, 4096); }
+
 inline SlotHeader* ring_slot(FrameRingHeader* ring, uint32_t index) {
     return reinterpret_cast<SlotHeader*>(reinterpret_cast<uint8_t*>(ring) + sizeof(FrameRingHeader) + size_t(index) * ring->slot_bytes);
 }

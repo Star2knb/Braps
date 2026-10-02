@@ -61,6 +61,7 @@ struct FrameMeta {
     int64_t present_qpc = 0;
     uint32_t game_frame_time_us = 0, hook_cost_us = 0, readback_frames = 0, pacing_wait_us = 0, pacing_error_us = 0;
     int ring_fill_pct = 0;
+    float convert_ms = 0;  // host time spent turning the frame into NV12 (OpenGL frames arrive as BGRA)
 };
 
 struct PipelineStats {
@@ -127,6 +128,7 @@ private:
         float game_ms = -1, pacing_wait_ms = -1, hook_ms = -1, pacing_error_ms = -1;
         int readback = -1, ring_fill = -1, queue_pct = -1;
         float encode_ms = -1;
+        float convert_ms = 0;
         uint32_t packet_bytes = 0;
         float ratio = -1;
         int near_level = 0;

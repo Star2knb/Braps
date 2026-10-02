@@ -72,7 +72,7 @@ std::string cost_text(double avg_us, double max_us) {
 std::string format_status_line(const std::string& exe_name, const HookStats& s, const std::string& hotkey) {
     char buf[256];
     if (s.state == proto::HookState::Waiting) {
-        std::snprintf(buf, sizeof(buf), "○ IDLE %s | hook installs when the game loads Direct3D 11", exe_name.c_str());
+        std::snprintf(buf, sizeof(buf), "○ IDLE %s | hook installs when the game loads Direct3D 11 or OpenGL", exe_name.c_str());
     } else if (!s.backend) {
         std::snprintf(buf, sizeof(buf), "○ IDLE %s | hooked, waiting for the first Present", exe_name.c_str());
     } else if (s.state == proto::HookState::Idle) {

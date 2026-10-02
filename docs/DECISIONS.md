@@ -606,3 +606,61 @@ priority and clock. Verified with the stress script (4 busy processes at above-n
 CPUs: encode avg 6.3 vs 5.5 ms unloaded, 0 frames filled). Not verified on the real game yet. If it is still
 not enough, the answer is the M5 rate controller: drop frames on purpose (as DUPs) when the CPU is
 overloaded, instead of losing them at random.
+
+**D-089 — Capture split into an API-independent core and a backend.** The ring, the lock-mode pacer, the
+copy worker and the failure handling moved out of `capture_d3d11.cpp` into `capture_core.cpp`
+(`core_on_present`, `core_acquire_slot`, `core_publish`, ...). A backend (`Backend` in `capture_core.h`) only
+issues the GPU work and moves finished read-backs along: `service()`, `submit()`, `pending()`, `release()`.
+Direct3D 11 and OpenGL are two such backends, so the pacing rules (D-079) exist once. The D3D11 path was
+re-verified after the move (35 unit tests, a 10 s test-app recording: pacing, hook cost and colours as
+before). One recording runs on one backend (`Core::owner`).
+
+**D-090 — OpenGL capture** (plan §5.2). Inside `wglSwapBuffers` / `SwapBuffers`, before the game's swap: save
+the state we touch, blit the default framebuffer into our own RGBA8 renderbuffer FBO at the output size
+(the blit scales with GL_LINEAR, letterboxes, and flips the rows, which also fixes GL's bottom-left origin),
+`glReadPixels` as BGRA into a pixel-pack buffer, `glFenceSync`, restore. The oldest buffer whose fence is
+signalled (timeout 0) is mapped and copied by the copy worker, unmapped and published one Present later: the
+same two-stage scheme as D3D11, nothing ever waits for the GPU. Details that matter:
+- The blit is made safe against the game's state: scissor test off, colour mask all on, GL_FRAMEBUFFER_SRGB
+  off (an sRGB default framebuffer would otherwise be decoded and darken the picture), pack store parameters
+  tight; all put back. A multisampled default framebuffer is resolved into a same-size renderbuffer first
+  (a multisampled source cannot be scaled in the same blit). The default framebuffer's sample count is
+  queried with both framebuffer bindings at 0 (it is the draw framebuffer's).
+- Renderbuffers, not textures: no texture-unit binding to disturb. The letterbox bars are cleared once, when
+  the target is made, with `glClearBufferfv` (does not touch the game's clear colour).
+- GL 3.0+ is decided by the functions being there (`wglGetProcAddress` / opengl32 exports), not by the version
+  string: some 2.1 contexts expose ARB_framebuffer_object. A missing function gives E1206 and capture stays off.
+- The hook never links opengl32.lib (that would load opengl32.dll into every Direct3D game): everything comes
+  from `GetProcAddress` / `wglGetProcAddress`. The source size is the window's client rectangle.
+- A different context current at a swap (I1207) abandons the old objects and makes new ones. At detach the
+  game's context is not current on our thread, so the objects are abandoned, not deleted (a few MB of GPU
+  memory until the process ends, once per recording that was running at detach).
+- Known cost: the first captured frame takes 16–34 ms (driver work for the renderbuffer and six 3.7 MB
+  pixel-pack buffers, 5.5 ms on D3D11): a one-frame hitch at the start of a recording.
+
+**D-091 — Hooks per API group, and which API wins.** `try_install` hooks Direct3D 10/11/12 when dxgi.dll and
+d3d11.dll are loaded and OpenGL when opengl32.dll is; each group once, polled every 100 ms (plus the loader
+notification for an early wake-up), so a game that loads its API late, or loads both, is covered. The hook
+state is Hooked as soon as one group is. When a process presents through both (a GL game with a D3D overlay),
+the first to present is the backend; another API takes over only if the owner has been silent for a second
+(`other_api_active`). `SwapBuffers` (gdi32) and `wglSwapBuffers` (opengl32) are both hooked because GLFW, SDL
+and LWJGL call the first and older code the second; the TLS depth counter makes a nested call count once.
+The statistics and cost accounting both hooks share are in `measure.cpp`.
+
+**D-092 — Host BGRA → NV12.** OpenGL slots are BGRA (`Layout::Bgra`, `bgra_slot_bytes`); the receiver converts
+each to NV12 into a preallocated buffer before the encoder (the codec's YUV mode takes I420 or NV12 only).
+`bgra_to_nv12` is integer arithmetic with 15-bit BT.601 full-range coefficients (the shader's formula), chroma
+from the sum of each 2x2 block, clamped; AVX2 with a scalar fallback that gives the same bytes (tested for
+equality on random data of several even sizes and against the float formula to within 1 level). 0.5 ms for
+1280x720 in a benchmark, ~1 ms in a recording (cold caches); the plan's target was 1.5 ms. The cost is in the
+`convert_ms` column of the telemetry and in the summary. `--format rgb` (codec GBR mode, no conversion) is
+still not implemented: the message now says so instead of pointing at M4.
+
+**D-093 — Test app and script.** `rec_testapp --gl` draws the same barcode and colour bars with
+`glScissor` + `glClear`; `--wgl`, `--core` (3.3 core profile), `--msaa N`, `--state-check` (sets unusual GL
+state just before every swap and exits with an error if the capture left any of it changed: scissor box, colour
+mask, pack parameters, framebuffer sRGB, the default framebuffer's read buffer, pack-buffer and framebuffer
+bindings) and `--offscreen` (a visible window parked at -20000,-20000 and never activated: the OpenGL tests
+need a real client area, a minimised window has none, and they must not disturb a game the user is playing).
+d3d11.dll, dxgi.dll and opengl32.dll are all delay-loaded, so a Direct3D run never loads opengl32.dll and an
+OpenGL run never loads Direct3D. `tests/m4_opengl.ps1` runs the checks.

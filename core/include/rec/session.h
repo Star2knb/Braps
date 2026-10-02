@@ -47,6 +47,9 @@ struct RecordingSummary {
     bool lock = false;
     uint32_t source_w = 0, source_h = 0;
     std::string game;
+    std::string backend;       // "D3D11", "OpenGL"
+    bool converted = false;    // frames arrived as BGRA and were converted to NV12 here (OpenGL)
+    double convert_p50_ms = 0, convert_p99_ms = 0, convert_max_ms = 0;
     std::filesystem::path avi, csv, json_file, log;
 
     // Frames from the hook.
@@ -148,6 +151,9 @@ private:
     proto::FrameRingHeader* ring_ = nullptr;
     uint32_t read_index_ = 0;
     uint32_t generation_ = 0;
+    proto::Layout layout_ = proto::Layout::Nv12;  // what the hook writes into the ring (D3D11: NV12, OpenGL: BGRA)
+    std::vector<uint8_t> convert_y_, convert_uv_;  // BGRA frames are converted into these
+    std::vector<double> convert_ms_;
 
     std::unique_ptr<EncodePipeline> pipeline_;
     std::filesystem::path avi_, csv_, json_, log_;

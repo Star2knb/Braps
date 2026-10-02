@@ -11,6 +11,7 @@
 #include <sstream>
 #include <thread>
 
+#include "rec/convert.h"
 #include "rec/frame_tools.h"
 #include "rec/log.h"
 #include "rec/options.h"
@@ -149,6 +150,8 @@ std::string RecordingSummary::text() const {
                 p.disk.slow_writes, p.disk.very_slow_writes, p.disk.max_latency_ms);
     t += format("  hook time per captured frame: p50 %.3f ms, p99 %.3f ms, max %.3f ms (first frame, which creates the GPU objects: %.2f ms)\n",
                 cost_p50_ms, cost_p99_ms, cost_max_ms, first_frame_cost_ms);
+    if (converted)
+        t += format("  host conversion BGRA to NV12 (OpenGL frames): p50 %.2f ms, p99 %.2f ms, max %.2f ms\n", convert_p50_ms, convert_p99_ms, convert_max_ms);
     t += format("  Present to frame in the host: p50 %.1f ms, p99 %.1f ms; GPU read-back lag p50 %.0f Presents; game frame p50 %.2f ms, p99 %.2f ms\n",
                 latency_p50_ms, latency_p99_ms, readback_p50_frames, game_frame_p50_ms, game_frame_p99_ms);
     t += format("  captured frames received: %llu; ticks without one: %llu, ticks with two: %llu, lost between hook and host: %llu\n", (unsigned long long)frames,
@@ -182,6 +185,7 @@ std::string RecordingSummary::json() const {
     o << "  \"status\": \"" << (file_ok && error.empty() ? "OK" : "stopped by error: " + json_escape(error)) << "\",\n";
     o << "  \"software\": \"rec " << kVersionNumber << "\",\n";
     o << "  \"game\": \"" << json_escape(game) << "\",\n";
+    o << "  \"backend\": \"" << backend << "\",\n";
     o << "  \"file\": \"" << json_escape(to_utf8(avi.wstring())) << "\",\n";
     o << "  \"source\": {\"width\": " << source_w << ", \"height\": " << source_h << "},\n";
     o << "  \"output\": {\"width\": " << plan.width << ", \"height\": " << plan.height << ", \"fps\": " << plan.fps << ", \"lock\": " << (lock ? "true" : "false") << "},\n";
@@ -192,6 +196,8 @@ std::string RecordingSummary::json() const {
     o << "  \"game_fps\": {\"avg\": " << num(fps_avg) << ", \"low_1pct\": " << num(fps_low) << "},\n";
     o << "  \"hook_cost_ms\": {\"avg\": " << num(cost_avg_ms) << ", \"p50\": " << num(cost_p50_ms) << ", \"p99\": " << num(cost_p99_ms) << ", \"max\": " << num(cost_max_ms)
       << ", \"first_frame\": " << num(first_frame_cost_ms) << "},\n";
+    if (converted)
+        o << "  \"convert_ms\": {\"p50\": " << num(convert_p50_ms) << ", \"p99\": " << num(convert_p99_ms) << ", \"max\": " << num(convert_max_ms) << "},\n";
     o << "  \"encode_ms\": {\"avg\": " << num(p.encode_ms_avg) << ", \"p99\": " << num(p.encode_ms_p99) << ", \"max\": " << num(p.encode_ms_max) << "},\n";
     o << "  \"compression_ratio\": {\"real_frames\": " << num(p.ratio_real) << ", \"overall\": " << num(p.ratio_overall) << "},\n";
     o << "  \"bytes_written\": " << p.file_bytes << ",\n";
@@ -237,16 +243,17 @@ bool RecordingSession::start(std::string* error) {
         *error = "the hook is not active";
         return false;
     }
-    if (backend != proto::kApiD3D11) {
-        *error = backend ? "capture works with Direct3D 11 games for now" : "the game has not presented a frame yet";
+    if (backend != proto::kApiD3D11 && backend != proto::kApiOpenGL) {
+        *error = backend ? "capture works with Direct3D 11 and OpenGL games for now" : "the game has not presented a frame yet";
         return false;
     }
+    layout_ = backend == proto::kApiOpenGL ? proto::Layout::Bgra : proto::Layout::Nv12;
     if (config_.record.encoder == "hw") {
         *error = "the hardware encoder arrives in recorder milestone M9; use --encoder rcv";
         return false;
     }
     if (config_.record.format == "rgb") {
-        *error = "lossless RGB recording needs the OpenGL backend (recorder milestone M4); use --format yuv420";
+        *error = "lossless RGB recording is not implemented yet; use --format yuv420";
         return false;
     }
     source_w_ = ctl->backbuffer_width.load();
@@ -296,7 +303,7 @@ bool RecordingSession::start(std::string* error) {
 
     // The frame ring.
     const uint32_t slots = uint32_t(config_.record.frame_slots);
-    const uint32_t slot_bytes = proto::nv12_slot_bytes(plan_.width, plan_.height);
+    const uint32_t slot_bytes = layout_ == proto::Layout::Bgra ? proto::bgra_slot_bytes(plan_.width, plan_.height) : proto::nv12_slot_bytes(plan_.width, plan_.height);
     generation_ = ctl->rec_generation.load() + 1;
     wchar_t name[64];
     proto::frame_ring_name(name, 64, link_.game_pid(), generation_, false);
@@ -332,7 +339,13 @@ bool RecordingSession::start(std::string* error) {
     ring_->slot_bytes = slot_bytes;
     ring_->out_w = plan_.width;
     ring_->out_h = plan_.height;
-    ring_->layout = uint32_t(proto::Layout::Nv12);
+    ring_->layout = uint32_t(layout_);
+    convert_ms_.clear();
+    if (layout_ == proto::Layout::Bgra) {
+        convert_ms_.reserve(1 << 16);
+        convert_y_.assign(size_t(plan_.width) * plan_.height, 0);
+        convert_uv_.assign(size_t(plan_.width) * plan_.height / 2, 128);
+    }
     read_index_ = 0;
 
     // Reset what the receiver collects.
@@ -460,6 +473,17 @@ bool RecordingSession::consume_one() {
     const uint32_t w = slot->width, h = slot->height;
     const uint8_t* y = base + proto::nv12_y_offset();
     const uint8_t* uv = base + proto::nv12_uv_offset(w, h);
+    uint32_t y_stride = slot->stride0, uv_stride = slot->stride1;
+    double convert_ms = 0;
+    if (slot->layout == uint8_t(proto::Layout::Bgra)) {  // OpenGL: the hook reads back BGRA, the encoder takes NV12
+        const int64_t c0 = qpc_now();
+        bgra_to_nv12(base + proto::bgra_offset(), slot->stride0, w, h, convert_y_.data(), w, convert_uv_.data(), w);
+        convert_ms = double(qpc_now() - c0) * to_ms;
+        convert_ms_.push_back(convert_ms);
+        y = convert_y_.data();
+        uv = convert_uv_.data();
+        y_stride = uv_stride = w;
+    }
 
     // Timing and loss.
     if (last_seq_ && slot->seq != last_seq_ + 1) seq_gaps_ += (slot->seq > last_seq_) ? slot->seq - last_seq_ - 1 : 1;
@@ -486,11 +510,11 @@ bool RecordingSession::consume_one() {
 
     // Optional checks on the content (the test app's pattern); too costly to do on every recording.
     if (analyze_) {
-        const uint64_t h1 = hash_bytes(y, size_t(slot->stride0) * h);
-        const uint64_t h2 = hash_bytes(uv, size_t(slot->stride1) * (h / 2), h1);
+        const uint64_t h1 = hash_bytes(y, size_t(y_stride) * h);
+        const uint64_t h2 = hash_bytes(uv, size_t(uv_stride) * (h / 2), h1);
         checksum_ = (checksum_ << 7 | checksum_ >> 57) ^ h2;
         uint32_t value = 0;
-        if (decode_barcode(y, slot->stride0, w, h, source_w_, source_h_, &value)) {
+        if (decode_barcode(y, y_stride, w, h, source_w_, source_h_, &value)) {
             ++barcode_read_;
             if (!have_barcode_value_) {
                 have_barcode_value_ = true;
@@ -501,14 +525,14 @@ bool RecordingSession::consume_one() {
                 barcode_skipped_ += value - last_barcode_ - 1;
             }
             last_barcode_ = value;
-            if (check_testapp_colors(y, slot->stride0, uv, slot->stride1, w, h, source_w_, source_h_, value, &color_error_)) ++color_checked_;
+            if (check_testapp_colors(y, y_stride, uv, uv_stride, w, h, source_w_, source_h_, value, &color_error_)) ++color_checked_;
         } else {
             ++barcode_unreadable_;
         }
     }
     if (!save_path_.empty() && index == save_index_) {
         std::vector<uint8_t> rgb;
-        nv12_to_rgb(y, slot->stride0, uv, slot->stride1, w, h, &rgb);
+        nv12_to_rgb(y, y_stride, uv, uv_stride, w, h, &rgb);
         if (!write_png_rgb(save_path_, w, h, rgb.data()))
             logging::get(Subsystem::Transport).warn("can't write {}", to_utf8(save_path_.wstring()));
         else
@@ -524,6 +548,7 @@ bool RecordingSession::consume_one() {
     meta.readback_frames = slot->readback_frames;
     meta.pacing_wait_us = slot->pacing_wait_us;
     meta.pacing_error_us = slot->pacing_error_us;
+    meta.convert_ms = float(convert_ms);
     int ready = 0;
     for (uint32_t i = 0; i < ring_->slot_count; ++i)
         if (proto::ring_slot(ring_, i)->state.load(std::memory_order_relaxed) == uint32_t(proto::SlotState::Ready)) ++ready;
@@ -532,7 +557,7 @@ bool RecordingSession::consume_one() {
         const int64_t grid0 = int64_t(link_.control()->grid0_qpc.load(std::memory_order_acquire));
         if (grid0) pipeline_->set_t0(grid0);
     }
-    pipeline_->on_frame(meta, y, slot->stride0, uv, slot->stride1);  // encodes straight from the ring slot
+    pipeline_->on_frame(meta, y, y_stride, uv, uv_stride);  // encodes straight from the ring slot
 
     frames_.fetch_add(1);
     slot->state.store(uint32_t(proto::SlotState::Free), std::memory_order_release);
@@ -569,6 +594,11 @@ void RecordingSession::finish() {
     s.source_w = source_w_;
     s.source_h = source_h_;
     s.game = game_;
+    s.backend = layout_ == proto::Layout::Bgra ? "OpenGL" : "D3D11";
+    s.converted = layout_ == proto::Layout::Bgra;
+    s.convert_p50_ms = percentile(convert_ms_, 50);
+    s.convert_p99_ms = percentile(convert_ms_, 99);
+    s.convert_max_ms = convert_ms_.empty() ? 0 : *std::max_element(convert_ms_.begin(), convert_ms_.end());
     s.avi = avi_;
     s.csv = csv_;
     s.json_file = json_;

@@ -38,7 +38,11 @@ add_library(${REC_HOOK_NAME} SHARED
     hlog.cpp
     locate.cpp
     dxgi_hook.cpp
+    capture_core.cpp
     capture_d3d11.cpp
+    capture_gl.cpp
+    gl_hook.cpp
+    measure.cpp
     ${REC_SHADER_HEADERS}
 )
 target_link_libraries(${REC_HOOK_NAME} PRIVATE rec_common_headers minhook kiero psapi user32)

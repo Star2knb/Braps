@@ -12,6 +12,7 @@
 #include "hlog.h"
 #include "hook_state.h"
 #include "locate.h"
+#include "measure.h"
 
 namespace rec::hook {
 namespace {
@@ -57,19 +58,13 @@ uint32_t api_of(IDXGISwapChain* sc, const char** name) {
 uint32_t refresh_rate_of(const DXGI_SWAP_CHAIN_DESC& desc) {
     if (!desc.Windowed && desc.BufferDesc.RefreshRate.Denominator)
         return uint32_t(double(desc.BufferDesc.RefreshRate.Numerator) / double(desc.BufferDesc.RefreshRate.Denominator) + 0.5);
-    HMONITOR monitor = MonitorFromWindow(desc.OutputWindow, MONITOR_DEFAULTTONEAREST);
-    MONITORINFOEXW info{};
-    info.cbSize = sizeof(info);
-    if (!monitor || !GetMonitorInfoW(monitor, &info)) return 0;
-    DEVMODEW mode{};
-    mode.dmSize = sizeof(mode);
-    if (!EnumDisplaySettingsW(info.szDevice, ENUM_CURRENT_SETTINGS, &mode)) return 0;
-    return mode.dmDisplayFrequency > 1 ? mode.dmDisplayFrequency : 0;
+    return window_refresh_hz(desc.OutputWindow);
 }
 
 // Decides whether `sc` is (now) the swap chain to measure. If it is, publishes its description.
 bool adopt_swapchain(IDXGISwapChain* sc, uint64_t now) {
     if (sc == g_rejected) return false;
+    if (other_api_active(false, now)) return false;  // an OpenGL surface is being measured
     IDXGISwapChain* current = g_main.load(std::memory_order_acquire);
     // Another chain only takes over when the measured one has been silent for a second (the game
     // recreated its swap chain, e.g. when switching between windowed and fullscreen).
@@ -106,13 +101,12 @@ uint64_t measure_inner(IDXGISwapChain* sc, uint64_t now) {
         c->present_ignored.fetch_add(1, std::memory_order_relaxed);
         return 0;
     }
-    const uint64_t previous = c->last_present_qpc.exchange(now, std::memory_order_relaxed);
-    uint32_t frame_time_us = 0;
-    if (previous) {
-        frame_time_us = uint32_t((now - previous) * 1000000ull / uint64_t(g.qpc_freq));
-        c->frame_time_us.store(frame_time_us, std::memory_order_relaxed);
+    if (c->backend.load(std::memory_order_relaxed) == proto::kApiOpenGL) {  // OpenGL took over (this chain was silent)
+        c->present_ignored.fetch_add(1, std::memory_order_relaxed);
+        return 0;
     }
-    const uint64_t count = c->present_count.fetch_add(1, std::memory_order_relaxed) + 1;
+    const uint32_t frame_time_us = note_present(now);
+    const uint64_t count = c->present_count.load(std::memory_order_relaxed);
     // The back buffer's size changes with the window and with fullscreen switches: keep it current for the host.
     if ((count & 31) == 0) {
         DXGI_SWAP_CHAIN_DESC desc{};
@@ -126,32 +120,17 @@ uint64_t measure_inner(IDXGISwapChain* sc, uint64_t now) {
     return 0;
 }
 
-// An exception in our code disables measuring for good and the game carries on (§13.2).
-void on_exception(DWORD code) {
-    g.enabled.store(false, std::memory_order_release);
-    capture_on_exception();
-    g.ctl->error_code.store(event_number(Ev::HookException), std::memory_order_relaxed);
-    log_event(Ev::HookException, "exception 0x%08lX in Present", code);
-}
-
 void measure(IDXGISwapChain* sc) {
     const uint64_t t0 = qpc();
     uint64_t held = 0;  // the deliberate wait of lock mode
     __try {
         held = measure_inner(sc, t0);
     } __except (EXCEPTION_EXECUTE_HANDLER) {
-        on_exception(GetExceptionCode());
+        note_exception(GetExceptionCode());
         return;
     }
     // Our own cost: entry to just before the original Present. (The part after it is a decrement.)
-    const uint64_t spent = qpc() - t0;
-    const uint32_t cost_ns = uint32_t((spent > held ? spent - held : 0) * 1000000000ull / uint64_t(g.qpc_freq));
-    proto::ControlBlock* c = g.ctl;
-    c->hook_cost_ns.store(cost_ns, std::memory_order_relaxed);
-    c->hook_cost_total_ns.fetch_add(cost_ns, std::memory_order_relaxed);
-    uint32_t seen = c->hook_cost_max_ns.load(std::memory_order_relaxed);
-    while (cost_ns > seen && !c->hook_cost_max_ns.compare_exchange_weak(seen, cost_ns, std::memory_order_relaxed)) {
-    }
+    note_cost(t0, held);
 }
 
 // Entry and exit of every detour. The depth counter makes nested calls (Present calling Present1

@@ -298,8 +298,101 @@ TEST_CASE("recording session: refuses what the game can't give") {
     CHECK(!session.start(&error));  // hook not active yet
     ctl->hook_state.store(uint32_t(proto::HookState::Hooked));
     CHECK(!session.start(&error));  // nothing presented
-    ctl->backend.store(proto::kApiOpenGL);
+    ctl->backend.store(proto::kApiVulkan);
     CHECK(!session.start(&error));
-    CHECK(error.find("Direct3D 11") != std::string::npos);
+    CHECK(error.find("Direct3D 11 and OpenGL") != std::string::npos);
     CHECK(session.state() == RecordingSession::State::Idle);
+}
+
+TEST_CASE("recording session: OpenGL frames arrive as BGRA and are converted to NV12 for the encoder") {
+    const rt::TempDir out("session_gl");
+    std::string error;
+    auto link = HookLink::open_or_create(kFakePid + 2, &error);
+    REQUIRE(link != nullptr);
+    proto::ControlBlock* ctl = link->control();
+    ctl->hook_state.store(uint32_t(proto::HookState::Hooked));
+    ctl->backend.store(proto::kApiOpenGL);
+    ctl->backbuffer_width.store(1280);
+    ctl->backbuffer_height.store(720);
+    ctl->display_refresh_hz.store(60);
+
+    Config cfg;
+    cfg.record.size = "1280x720";
+    cfg.record.out_dir = out.path().string();
+    RecordingSession session(*link, cfg, "rec_testapp.exe");
+    REQUIRE(session.start(&error));
+
+    const uint32_t gen = ctl->rec_generation.load();
+    wchar_t name[64];
+    proto::frame_ring_name(name, 64, kFakePid + 2, gen, false);
+    HANDLE map = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, name);
+    REQUIRE(map != nullptr);
+    auto* ring = static_cast<proto::FrameRingHeader*>(MapViewOfFile(map, FILE_MAP_ALL_ACCESS, 0, 0, 0));
+    REQUIRE(ring != nullptr);
+    CHECK(ring->layout == uint32_t(proto::Layout::Bgra));
+    CHECK(ring->slot_bytes == proto::bgra_slot_bytes(1280, 720));
+    CHECK(ctl->rec_slot_bytes == proto::bgra_slot_bytes(1280, 720));
+    proto::frame_ring_name(name, 64, kFakePid + 2, gen, true);
+    HANDLE sem = OpenSemaphoreW(SEMAPHORE_MODIFY_STATE | SYNCHRONIZE, FALSE, name);
+    REQUIRE(sem != nullptr);
+    ctl->capture_state.store(uint32_t(proto::CaptureState::Capturing));
+
+    const uint32_t w = 1280, h = 720, frames = 10;
+    uint32_t next = 0;
+    for (uint32_t i = 0; i < frames; ++i) {
+        proto::SlotHeader* slot = proto::ring_slot(ring, next);
+        for (int spin = 0; spin < 2000 && slot->state.load() != uint32_t(proto::SlotState::Free); ++spin) Sleep(1);
+        REQUIRE(slot->state.load() == uint32_t(proto::SlotState::Free));
+        slot->state.store(uint32_t(proto::SlotState::Writing));
+        uint8_t* px = reinterpret_cast<uint8_t*>(slot) + proto::bgra_offset();
+        for (uint32_t row = 0; row < h; ++row)
+            for (uint32_t col = 0; col < w; ++col) {
+                uint8_t v = 100;  // grey picture, the barcode in the top sixth
+                if (row < h / 6) v = ((2000 + i) >> (31 - col * 32 / w)) & 1u ? 255 : 0;
+                uint8_t* p = px + (size_t(row) * w + col) * 4;
+                p[0] = p[1] = p[2] = v;
+                p[3] = 255;
+            }
+        slot->seq = i + 1;
+        slot->tick = i;
+        LARGE_INTEGER q;
+        QueryPerformanceCounter(&q);
+        slot->present_qpc = slot->capture_done_qpc = uint64_t(q.QuadPart);
+        slot->width = uint16_t(w);
+        slot->height = uint16_t(h);
+        slot->layout = uint8_t(proto::Layout::Bgra);
+        slot->stride0 = w * 4;
+        slot->stride1 = 0;
+        slot->game_frame_time_us = 16667;
+        slot->hook_cost_us = 400;
+        slot->state.store(uint32_t(proto::SlotState::Ready));
+        ReleaseSemaphore(sem, 1, nullptr);
+        ctl->frames_captured.fetch_add(1);
+        next = (next + 1) % ring->slot_count;
+    }
+    for (int i = 0; i < 500 && session.live().frames < frames; ++i) Sleep(2);
+    CHECK(session.live().frames == frames);
+
+    session.request_stop();
+    ctl->capture_state.store(uint32_t(proto::CaptureState::Off));
+    bool finished = false;
+    for (int i = 0; i < 200 && !finished; ++i) finished = session.poll();
+    REQUIRE(finished);
+
+    const RecordingSummary& s = session.summary();
+    REQUIRE(s.valid);
+    CHECK(s.file_ok);
+    CHECK(s.converted);
+    CHECK(s.backend == "OpenGL");
+    CHECK(s.convert_p50_ms > 0 && s.convert_p50_ms < 20);
+    CHECK(s.barcode_read == frames);  // the converted frames carry the barcode
+    CHECK(s.barcode_unreadable == 0 && s.barcode_out_of_order == 0);
+    CHECK(s.barcode_first == 2000 && s.barcode_last == 2000 + frames - 1);
+    CHECK(s.text().find("host conversion BGRA to NV12") != std::string::npos);
+    CHECK(rt::read_file(s.json_file).find("\"backend\": \"OpenGL\"") != std::string::npos);
+    CHECK(s.pipeline.output_frames >= frames);
+
+    UnmapViewOfFile(ring);
+    CloseHandle(map);
+    CloseHandle(sem);
 }

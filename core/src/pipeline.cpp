@@ -286,6 +286,7 @@ void EncodePipeline::on_frame(const FrameMeta& meta, const uint8_t* y, uint32_t 
     row.readback = int(meta.readback_frames);
     row.ring_fill = meta.ring_fill_pct;
     row.encode_ms = float(encode_ms);
+    row.convert_ms = meta.convert_ms;
     row.packet_bytes = info.packet_size;
     row.ratio = info.packet_size ? float(double(cfg_.width) * cfg_.height * 1.5 / info.packet_size) : -1.0f;
     row.near_level = cfg_.near_level;
@@ -427,16 +428,17 @@ void EncodePipeline::write_row(const Row& r, double latency_ms) {
     num(ratio, sizeof(ratio), r.ratio, "%.2f");
     num(skipped, sizeof(skipped), r.skipped_pct, "%.1f");
     const char* type = r.type == 'I' ? "I" : r.type == 'P' ? "P" : r.type == 'D' ? "DUP" : "DROP";
-    char readback[16] = "", ring[16] = "", queue[16] = "";
+    char readback[16] = "", ring[16] = "", queue[16] = "", convert[24] = "0";
+    if (r.convert_ms > 0) std::snprintf(convert, sizeof(convert), "%.3f", r.convert_ms);
     if (r.readback >= 0) std::snprintf(readback, sizeof(readback), "%d", r.readback);
     if (r.ring_fill >= 0) std::snprintf(ring, sizeof(ring), "%d", r.ring_fill);
     if (r.queue_pct >= 0) std::snprintf(queue, sizeof(queue), "%d", r.queue_pct);
     // out_index, type, tick, present_qpc_us, game_frame_ms, pacing_wait_ms, hook_cost_ms, readback_latency_frames,
-    // map_copy_ms (not measured: empty), ring_fill_pct, convert_ms (NV12 needs none: 0), encode_ms, packet_bytes, ratio,
+    // map_copy_ms (not measured: empty), ring_fill_pct, convert_ms (0 for NV12 input), encode_ms, packet_bytes, ratio,
     // near, blocks_skipped_pct, packet_queue_pct, write_latency_ms, audio_drift_ms (audio arrives in M6: empty),
     // pacing_error_ms (added: how late after its tick the capture began, lock mode)
-    std::snprintf(line, sizeof(line), "%s,%s,%llu,%s,%s,%s,%s,%s,,%s,0,%s,%u,%s,%d,%s,%s,%.2f,,%s\n", idx, type, (unsigned long long)r.tick, present, game,
-                  wait, hook, readback, ring, enc, r.packet_bytes, ratio, r.near_level, skipped, queue, latency_ms, perr);
+    std::snprintf(line, sizeof(line), "%s,%s,%llu,%s,%s,%s,%s,%s,,%s,%s,%s,%u,%s,%d,%s,%s,%.2f,,%s\n", idx, type, (unsigned long long)r.tick, present, game,
+                  wait, hook, readback, ring, convert, enc, r.packet_bytes, ratio, r.near_level, skipped, queue, latency_ms, perr);
     csv_buffer_ += line;
     if (csv_buffer_.size() >= (1u << 16)) {
         std::fwrite(csv_buffer_.data(), 1, csv_buffer_.size(), csv_);
